@@ -1,0 +1,28 @@
+# === IDE ===
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.user
+*.userprefs
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# === Unreal Engine (artefactos generados, no versionar) ===
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+*.xcodeproj/
+*.xcworkspace/
+
+# NOTA: NO se ignora Content/ (los .uasset van por Git LFS, ver .gitattributes),
+# ni Config/ (configuración del proyecto), ni Source/ (código).
+
+# === Sistema operativo ===
+.DS_Store
+Thumbs.db
