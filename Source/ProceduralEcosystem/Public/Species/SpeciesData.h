@@ -9,6 +9,11 @@
  * población (Fase 2) los referencia por índice/id, no los copia por agente.
  * Se editan en el editor como assets. Nombres alineados con FSpeciesParams
  * del documento de diseño técnico.
+ *
+ * Nota sobre los ClampMin: varios de estos parámetros se usan como DIVISORES
+ * en las fórmulas de la Fase 2 (MaxBiomass, Longevity, WaterDemand,
+ * NutrientDemand). Por eso su mínimo es un positivo pequeño, no 0: un asset
+ * con 0 produciría NaN/Inf en cuanto arranque la simulación.
  */
 UCLASS(BlueprintType)
 class PROCEDURALECOSYSTEM_API USpeciesData : public UPrimaryDataAsset
@@ -28,11 +33,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
     float GrowthRate = 0.25f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
+    /** Divisor en el crecimiento logístico (B/MaxBiomass): debe ser > 0. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0.01"))
     float MaxBiomass = 100.f;
 
-    /** Longevidad en años simulados. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
+    /** Longevidad en años simulados. Divisor en la mortalidad por edad: debe ser > 0. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0.01"))
     float Longevity = 200.f;
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
@@ -43,10 +49,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0", ClampMax = "1"))
     float ShadeTolerance = 0.5f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0"))
+    /** Divisor en el factor de agua (W/WaterDemand): debe ser > 0. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0.001"))
     float WaterDemand = 1.f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0"))
+    /** Divisor en el factor de nutrientes (N/NutrientDemand): debe ser > 0. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0.001"))
     float NutrientDemand = 1.f;
 
     /** Radio de raíz en metros; escala con la biomasa en el consumo (Fase 2). */
@@ -65,4 +73,9 @@ public:
     {
         return FPrimaryAssetId(TEXT("Species"), GetFName());
     }
+
+#if WITH_EDITOR
+    /** Validación de datos: avisa de configuraciones incoherentes al editar el asset. */
+    virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
+#endif
 };

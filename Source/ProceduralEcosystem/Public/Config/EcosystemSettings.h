@@ -53,6 +53,60 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0"))
     float HeightScaleCm = 30000.f; // amplitud vertical
 
+    // --- Recursos: agua (Fase 1) ---
+    /** Rango de salida del TWI. Debe casar con NutrientOutputMax para que el vigor
+        (Monod) reciba agua y nutrientes en escalas comparables. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Agua", meta = (ClampMin = "0.001"))
+    float WaterOutputMax = 10.f;
+
+    /** Rellena depresiones (priority-flood) antes del D8. Off = ablación. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Agua")
+    bool bFillWaterSinks = true;
+
+    // --- Recursos: nutrientes (Fase 1) ---
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Nutrientes", meta = (ClampMin = "0.001"))
+    float NutrientOutputMax = 10.f;
+
+    /** Frecuencia base del Perlin parcheado: más baja = parches más grandes. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Nutrientes", meta = (ClampMin = "0.0"))
+    double NutrientPatchFrequency = 0.00015;
+
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Nutrientes", meta = (ClampMin = "1"))
+    int32 NutrientOctaves = 3;
+
+    // --- Recursos: luz gruesa (Fase 1) ---
+    /** cm por voxel horizontal de la rejilla de luz (varios metros). */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "1"))
+    float LightCellSizeXYCm = 400.f;
+
+    /** cm por voxel vertical de la rejilla de luz. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "1"))
+    float LightCellSizeZCm = 400.f;
+
+    /** Margen de altura (cm) por encima del relieve para alojar las copas. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "0"))
+    float LightCanopyHeadroomCm = 8000.f;
+
+    // --- Vigor (acoplamiento, Fase 1) ---
+    /** Semisaturación de luz de una heliófila. Kl = KlMax*(1-ShadeTolerance).
+        Más alto = la luz limita antes (heliófilas más exigentes). */
+    UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0.0001"))
+    float KlMax = 0.35f;
+
+    /** Especie por defecto para el heatmap de idoneidad (índice en Species). */
+    UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0"))
+    int32 HeatmapSpeciesIndex = 0;
+
+    // --- Árboles de prueba (Eco.AddTree): copa que deposita sombra ---
+    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "1"))
+    float TestTreeCanopyRadiusCm = 1200.f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "1"))
+    float TestTreeCanopyDepthCm = 6000.f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "0", ClampMax = "1"))
+    float TestTreeCanopyDensity = 0.9f;
+
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")
     TArray<TSoftObjectPtr<USpeciesData>> Species;
