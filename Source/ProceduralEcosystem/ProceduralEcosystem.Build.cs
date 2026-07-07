@@ -8,7 +8,17 @@ public class ProceduralEcosystem : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "Landscape" });
+        PublicDependencyModuleNames.AddRange(new string[]
+         {
+            "Core",
+            "CoreUObject",
+            "Engine",
+            "InputCore",
+            "DeveloperSettings",
+            "RenderCore",
+            "RHI",
+            "Landscape"
+        });
 
         PrivateDependencyModuleNames.AddRange(new string[] {  });
 
