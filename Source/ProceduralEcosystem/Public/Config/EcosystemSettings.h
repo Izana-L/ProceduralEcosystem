@@ -106,6 +106,76 @@ public:
 
     UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "0", ClampMax = "1"))
     float TestTreeCanopyDensity = 0.9f;
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0.01"))
+    float LightHalfSaturationMax = 5.f;
+
+    /** S_THRESH: vigor por debajo del cual se acumula estrés. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float StressVigorThreshold = 0.3f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float StressAccumulationRate = 1.f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float StressRecoveryRate = 0.5f;
+
+    /** Peso del estrés acumulado en la probabilidad de morir por tick. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float StressMortalityWeight = 0.2f;
+
+    /** Semillas por unidad de biomasa y año simulado (media de la Poisson). */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float SeedRatePerBiomass = 0.1f;
+
+    /** Multiplicador de germinación: prob = VigorEnDestino * GerminationRate. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float GerminationRate = 0.5f;
+
+    /** Luz mínima en el punto de caída para considerarlo "sitio seguro". */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float MinLightForGermination = 0.5f;
+
+    /** Fracción de la biomasa que vuelve como pulso de nutrientes al morir. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float NutrientDecompositionFactor = 0.3f;
+
+    // --- Ecología (Fase 2): regeneración de campos ---
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float WaterRechargeRate = 0.3f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float WaterDiffusionRate = 0.1f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float NutrientRechargeRate = 0.15f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float NutrientDiffusionRate = 0.2f;
+
+    // --- Ecología (Fase 2): grid de luz grueso (FLightFieldCoarse) ---
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "50"))
+    float LightCoarseCellSizeCm = 400.f;
+
+    /** Nº de voxels verticales. Layers * LightCoarseCellSizeCm debe cubrir HeightScaleCm + el arbol mas alto posible. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
+    int32 LightCoarseLayers = 32;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float MinGerminationSpacingCm = 100.f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "50"))
+    float SpatialHashCellSizeCm = 500.f;
+
+    /**
+     * Nº de arboles por tarea del ParallelFor del tick. El nº de chunks se
+     * deriva de este valor (ceil(Poblacion / Grain)), NO del nº de hilos de la
+     * maquina: eso es lo que garantiza que la reduccion de deltas sea bit a bit
+     * identica en cualquier CPU (ver nota de determinismo en SimulateTick).
+     * Mas pequeno = mas paralelismo pero mas coste de reduccion; 512 es un
+     * punto medio razonable para poblaciones de miles-decenas de miles.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
+    int32 TickChunkGrainSize = 512;
 
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")

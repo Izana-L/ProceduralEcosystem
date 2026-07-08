@@ -28,9 +28,7 @@ namespace EcoVigor
         // los bloques del vecino-mas-cercano; el diseno lo recomienda justo para
         // la funcion de vigor. Si la rejilla de luz no es valida, asume cielo
         // despejado (Q=1): asi el heatmap funciona aunque aun no haya arboles.
-        const float Q = Light.IsValid()
-            ? Light.SampleLightSmooth(WorldPos)
-            : FLightFieldCoarse::FullSunlight;
+        const float Q = Light.IsValid() ? Light.SampleLightSmooth(WorldPos) : FLightFieldCoarse::FullSunlight;
 
         const float fL = LightFactor(Q, Species.ShadeTolerance, KlMax);
         const float fW = WaterFactor(W, Species.WaterDemand);

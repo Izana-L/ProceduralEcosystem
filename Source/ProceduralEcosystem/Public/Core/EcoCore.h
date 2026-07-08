@@ -50,8 +50,60 @@ namespace EcoRand
         return Min + static_cast<int32>(NextU32(State) % Span);
     }
 
-    // NOTA Fase 2: aquí vivirán los helpers de dominio (PoissonInt para el nº de
-    // semillas, kernel de dispersión, etc.), todos derivados de un uint32& State.
+    // --- Helpers de dominio de la Fase 2 (todos derivados de un uint32& State) ---
+
+    /**
+     * Nº de eventos ~ Poisson(Lambda). Lo usa ComputeSeedCount para el nº de
+     * semillas por árbol y tick.
+     *
+     * Dos regímenes para no pagar O(Lambda):
+     *   - Lambda pequeña: algoritmo de Knuth (multiplica uniformes). Exacto.
+     *   - Lambda grande (>= 30): aproximación normal (Box-Muller) redondeada.
+     *     Con biomasa alta y SeedRate alto, Knuth haría cientos de iteraciones
+     *     por árbol; aquí es coste constante. El sesgo de la aproximación es
+     *     despreciable a estas escalas.
+     *
+     * Determinista: sólo consume del State que se le pasa.
+     */
+    FORCEINLINE int32 PoissonInt(uint32& State, float Lambda)
+    {
+        if (Lambda <= 0.f)
+        {
+            return 0;
+        }
+
+        if (Lambda < 30.f)
+        {
+            const float L = FMath::Exp(-Lambda);
+            int32 k = 0;
+            float p = 1.f;
+            do
+            {
+                ++k;
+                p *= NextUnit(State);
+            } while (p > L);
+            return k - 1;
+        }
+
+        // Aproximación normal para Lambda grande: N(Lambda, Lambda).
+        const float u1 = FMath::Max(NextUnit(State), 1e-7f); // evita log(0)
+        const float u2 = NextUnit(State);
+        const float z = FMath::Sqrt(-2.f * FMath::Loge(u1)) * FMath::Cos(2.f * PI * u2);
+        return FMath::Max(0, FMath::RoundToInt(Lambda + FMath::Sqrt(Lambda) * z));
+    }
+
+    /**
+     * Distancia (cm) de dispersión de una semilla dentro de un disco de radio
+     * MaxRadiusCm. Se usa r = R*sqrt(U) para que la densidad sea UNIFORME por
+     * área (sin apelmazar semillas junto al tronco, que es el artefacto de usar
+     * r = R*U directamente). Si en el futuro quieres un kernel decreciente con
+     * la distancia (más realista ecológicamente), sustituye esta línea por,
+     * p.ej., una exponencial acotada: no afecta a nada más.
+     */
+    FORCEINLINE float SampleDispersalDistance(uint32& State, float MaxRadiusCm)
+    {
+        return MaxRadiusCm * FMath::Sqrt(NextUnit(State));
+    }
 
     /** Mezcla de bits (finalizer estilo Murmur3): deriva semillas hijas estables. */
     FORCEINLINE uint32 Hash32(uint32 x)

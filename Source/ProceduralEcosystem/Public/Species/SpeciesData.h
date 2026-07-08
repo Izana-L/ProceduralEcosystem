@@ -44,6 +44,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
     float MaturityAge = 20.f;
 
+    /** Altura (cm) de un arbol adulto (Biomass == MaxBiomass). Escala de HeightFromBiomass. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "1"))
+    float MaxHeightCm = 2000.f; // 20 m por defecto
+
     // --- Recursos (Fase 1/2) ---
     /** 0 = heliófila (necesita mucha luz), 1 = tolerante a la sombra. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0", ClampMax = "1"))

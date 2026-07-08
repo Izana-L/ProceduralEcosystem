@@ -2,13 +2,16 @@
 #include "Config/EcosystemSettings.h"
 #include "Debug/FieldVisualizer.h"
 #include "Species/SpeciesData.h"
-#include "Ecology/Vigor.h"
+#include "Ecology/EcologyRules.h"
+#include "Ecology/TickScratch.h"
 
 #include "Engine/World.h"
 #include "Engine/DecalActor.h"
 #include "Components/DecalComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "DrawDebugHelpers.h"
+#include "Async/ParallelFor.h"
+#include "Async/TaskGraphInterfaces.h"
 
 // Categoría de log local a este .cpp (declara y define en un solo sitio).
 // Evita meter DECLARE_LOG_CATEGORY_EXTERN en una cabecera reflejada por UHT.
@@ -49,65 +52,52 @@ static FAutoConsoleCommandWithWorld GEcoAddAgent(
 
 static FAutoConsoleCommandWithWorld GEcoClear(
     TEXT("Eco.ClearAgents"),
-    TEXT("Borra todos los agentes de debug (no toca los arboles de prueba)."),
+    TEXT("Borra todos los agentes de debug."),
     FConsoleCommandWithWorldDelegate::CreateStatic(
         [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearDebugAgents(); }));
 
 static FAutoConsoleCommandWithWorld GEcoPaint(
     TEXT("Eco.PaintTestField"),
-    TEXT("Genera y pinta un campo de prueba (la altura) como heatmap sobre el terreno."),
+    TEXT("Genera y pinta un campo de prueba como heatmap sobre el terreno."),
     FConsoleCommandWithWorldDelegate::CreateStatic(
         [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintTestField(); }));
 
-static FAutoConsoleCommandWithWorldAndArgs GEcoPaintResource(
-    TEXT("Eco.PaintResource"),
-    TEXT("Pinta un campo de recurso: 0=agua, 1=nutrientes, 2=luz. Uso: Eco.PaintResource [0-2]"),
+static FAutoConsoleCommandWithWorld GEcoPaintWater(
+    TEXT("Eco.PaintWater"),
+    TEXT("Pinta el heatmap del agua disponible actual (pool, no el base)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic(
+        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintWaterField(); }));
+
+static FAutoConsoleCommandWithWorld GEcoPaintNutrients(
+    TEXT("Eco.PaintNutrients"),
+    TEXT("Pinta el heatmap de nutrientes disponibles actuales (pool, no el base)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic(
+        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintNutrientField(); }));
+
+static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(
+    TEXT("Eco.SeedForest"),
+    TEXT("Siembra N plantulas aleatorias sobre el terreno (por defecto 200). Uso: Eco.SeedForest [N]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* World)
         {
             if (UEcosystemSubsystem* S = GetEco(World))
             {
-                const int32 Which = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 0;
-                S->PaintResourceField(Which);
+                const int32 N = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 200;
+                S->SeedInitialPopulation(N);
             }
         }));
-
-static FAutoConsoleCommandWithWorldAndArgs GEcoPaintVigor(
-    TEXT("Eco.PaintVigor"),
-    TEXT("Pinta la idoneidad (vigor Liebig) de una especie. Uso: Eco.PaintVigor [indice]"),
-    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
-        [](const TArray<FString>& Args, UWorld* World)
-        {
-            if (UEcosystemSubsystem* S = GetEco(World))
-            {
-                const int32 Idx = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : -1;
-                S->PaintVigor(Idx);
-            }
-        }));
-
-static FAutoConsoleCommandWithWorld GEcoAddTree(
-    TEXT("Eco.AddTree"),
-    TEXT("Anade un arbol de prueba que proyecta sombra; el heatmap de vigor se actualiza."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->AddRandomTestTree(); }));
-
-static FAutoConsoleCommandWithWorld GEcoClearTrees(
-    TEXT("Eco.ClearTrees"),
-    TEXT("Quita todos los arboles de prueba y su sombra; el heatmap de vigor se actualiza."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearTestTrees(); }));
 
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
 // ---------------------------------------------------------------------------
 static TAutoConsoleVariable<int32> CVarDebugAgents(
-    TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug como esferas."));
+    TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug (Fase 0) como esferas."));
+static TAutoConsoleVariable<int32> CVarDebugPopulation(
+    TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
 static TAutoConsoleVariable<int32> CVarDebugTerrain(
     TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
 static TAutoConsoleVariable<int32> CVarDebugHeatmap(
     TEXT("Eco.Debug.Heatmap"), 1, TEXT("Muestra (1) u oculta (0) el decal de heatmap."));
-static TAutoConsoleVariable<int32> CVarDebugTrees(
-    TEXT("Eco.Debug.Trees"), 1, TEXT("Dibuja los arboles de prueba como esferas de copa."));
 
 // ---------------------------------------------------------------------------
 //  UWorldSubsystem
@@ -127,7 +117,6 @@ void UEcosystemSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     YearsPerTick = S->YearsPerTick;
     MaxStepsPerFrame = S->MaxStepsPerFrame;
     bPaused = S->bStartPaused;
-    ActiveSpeciesIndex = S->HeatmapSpeciesIndex;
 }
 
 void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
@@ -136,7 +125,7 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
-    // 1) Generar el relieve: fuente de verdad de la simulacion.
+    // 1) Relieve: fuente de verdad de la simulacion.
     HeightField.GenerateFractalNoise(
         S->HeightfieldResolution, S->HeightfieldResolution,
         S->HeightfieldCellSizeCm, static_cast<uint32>(S->MasterSeed),
@@ -152,11 +141,36 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
         HeightField.Field.Width, HeightField.Field.Height,
         HeightField.Field.Width * HeightField.Field.CellSize / 100.0, S->MasterSeed);
 
-    // 2) Campos de recursos de la Fase 1 (se hornean una vez).
-    BakeResourceFields();
-    EnsureLightGrid();
+    // 2) Campos base (Fase 1): potencial del terreno, calculado una sola vez.
+    //    Ambos comparten geometria con HeightField (mismo Width/Height/CellSize/Origin),
+    //    asi que WaterPool y NutrientPool acaban con el mismo numero de celdas.
+    WaterBase.BakeFromHeightField(HeightField);
+    NutrientBase.GeneratePatchyBase(
+        HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
+        HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed));
 
-    // 3) Visualizador de campos (heatmap).
+    // 3) Estado runtime (Fase 2): los pools arrancan llenos al nivel del base.
+    WaterPool.InitFromBase(WaterBase.Field);
+    NutrientPool.InitFromBase(NutrientBase.Field);
+
+    // 4) Grid de luz grueso: geometria derivada del relieve + settings.
+    const FBox2D Bounds = HeightField.GetWorldBounds();
+    const int32 LightW = FMath::Max(1, FMath::CeilToInt((Bounds.Max.X - Bounds.Min.X) / S->LightCoarseCellSizeCm));
+    const int32 LightH = FMath::Max(1, FMath::CeilToInt((Bounds.Max.Y - Bounds.Min.Y) / S->LightCoarseCellSizeCm));
+    LightCoarse.Init(LightW, LightH, S->LightCoarseLayers,
+        S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min, /*BaseZ*/ 0.0);
+
+    // 5) Spatial hash de agentes: geometria fijada una vez; se repuebla cada tick con Build().
+    Hash.Init(Bounds, S->SpatialHashCellSizeCm);
+
+    // 6) Cache de especies (una LoadSynchronous por especie, no por arbol/tick).
+    ResolvedSpecies.Reset();
+    for (const TSoftObjectPtr<USpeciesData>& SoftSp : S->Species)
+    {
+        ResolvedSpecies.Add(SoftSp.LoadSynchronous());
+    }
+
+    // 7) Visualizador de campos (heatmap).
     FieldViz = NewObject<UFieldVisualizer>(this);
     FieldViz->Initialize(HeightField.Field.Width, HeightField.Field.Height);
 
@@ -172,56 +186,6 @@ void UEcosystemSubsystem::Deinitialize()
         HeatmapDecal = nullptr;
     }
     Super::Deinitialize();
-}
-
-// ---------------------------------------------------------------------------
-//  Fase 1: generación de los campos de recursos
-// ---------------------------------------------------------------------------
-void UEcosystemSubsystem::BakeResourceFields()
-{
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-
-    // Agua: TWI causal derivado del relieve.
-    WaterField.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);
-
-    // Nutrientes: Perlin parcheado, con semilla desligada del relieve. Comparte
-    // geometria (mismo Width/Height/CellSize/Origin) para que los tres campos se
-    // muestreen en las mismas coordenadas de mundo.
-    const FField2D& G = HeightField.Field;
-    NutrientField.GeneratePatchyBase(
-        G.Width, G.Height, G.CellSize, G.Origin,
-        static_cast<uint32>(S->MasterSeed),
-        S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Campos de recursos horneados: agua (TWI) y nutrientes (Perlin)."));
-}
-
-void UEcosystemSubsystem::EnsureLightGrid()
-{
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const FBox2D B = HeightField.GetWorldBounds();
-
-    const double SpanX = B.Max.X - B.Min.X;
-    const double SpanY = B.Max.Y - B.Min.Y;
-
-    const int32 Wv = FMath::Max(1, FMath::CeilToInt(SpanX / S->LightCellSizeXYCm) + 1);
-    const int32 Hv = FMath::Max(1, FMath::CeilToInt(SpanY / S->LightCellSizeXYCm) + 1);
-
-    // Z: desde el suelo (BaseZ=0; el relieve esta normalizado a [0, HeightScale])
-    // hasta la cima del relieve mas el margen para las copas.
-    const double BaseZ = 0.0;
-    const double TopZ = S->HeightScaleCm + S->LightCanopyHeadroomCm;
-    const int32  Lv = FMath::Max(1, FMath::CeilToInt((TopZ - BaseZ) / S->LightCellSizeZCm) + 1);
-
-    LightField.Init(Wv, Hv, Lv,
-        S->LightCellSizeXYCm, S->LightCellSizeZCm,
-        B.Min, BaseZ);
-
-    // Sin arboles todavia: cielo despejado (sombra = 0 en todo el volumen).
-    LightField.ClearShadow();
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Rejilla de luz %dx%dx%d voxels (%.0f cm XY, %.0f cm Z)."),
-        Wv, Hv, Lv, S->LightCellSizeXYCm, S->LightCellSizeZCm);
 }
 
 // ---------------------------------------------------------------------------
@@ -271,18 +235,358 @@ float UEcosystemSubsystem::GetInterpolationAlpha() const
         : 0.f;
 }
 
+// ---------------------------------------------------------------------------
+//  Bucle de tick (Fase 2)
+// ---------------------------------------------------------------------------
+
+// Factores de forma de la copa hasta que la Fase 3 aporte geometria real.
+// Aqui como constantes con nombre (antes eran literales sueltos en el bucle);
+// si en el futuro varian por especie, muevelos a USpeciesData.
+static constexpr float kCanopyRadiusFraction = 0.30f; // radio de copa = 30% de la altura
+static constexpr float kCanopyShadowDensity = 0.80f; // opacidad de la copa [0,1]
+static constexpr float kGerminationBiomassFraction = 0.01f; // plantula nueva = 1% de MaxBiomass
+
+// Tope de tareas del ParallelFor del tick. Constante (no depende de la maquina)
+// para que la particion en chunks -y por tanto el orden de la reduccion de
+// deltas- sea identica en cualquier CPU. Ver nota de determinismo en SimulateTick.
+static constexpr int32 kMaxTickChunks = 32;
+
+/** Reparte [0, PopulationNum) en NumChunks tramos contiguos, deterministas. */
+static void GetChunkRange(int32 ChunkIndex, int32 NumChunks, int32 PopulationNum,
+    int32& OutBegin, int32& OutEnd)
+{
+    OutBegin = static_cast<int32>((int64)ChunkIndex * PopulationNum / NumChunks);
+    OutEnd = static_cast<int32>((int64)(ChunkIndex + 1) * PopulationNum / NumChunks);
+}
+
 void UEcosystemSubsystem::SimulateTick(float DtYears)
 {
-    // ===============================================================
-    //  FASE 0/1: intencionadamente vacio.
-    //  Aqui entrara el bucle de la Fase 2 (crecimiento, mortalidad,
-    //  dispersion...) que CONSUME los campos y la funcion de vigor.
-    // ===============================================================
-    (void)DtYears;
+    const UEcosystemSettings* Settings = UEcosystemSettings::Get();
+
+    // ================================================================
+    // PRE (serial): estructuras derivadas del snapshot de lectura.
+    // ================================================================
+    Hash.Build(Agents_Read.Position, Agents_Read.Num());
+    // NOTA: el hash queda listo para consultas de vecindad, pero esta
+    // primera version de la Fase 2 resuelve la competencia enteramente a
+    // traves de los campos compartidos (consumo de agua/nutrientes + sombra
+    // de luz), no con consultas punto-a-punto. Se consumira directamente en
+    // la Fase 3 (busqueda de puntos de atraccion del SCA) y esta disponible
+    // ya para cualquier extension futura (p.ej. densidad local en germinacion).
+
+    LightCoarse.ClearShadow();
+    for (int32 i = 0; i < Agents_Read.Num(); ++i)
+    {
+        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+        const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
+        if (!Sp) { continue; }
+
+        const float H = Agents_Read.Height[i];
+        const FVector Apex = Agents_Read.Position[i] + FVector(0.f, 0.f, H);
+        // Radio/profundidad de copa: aproximacion hasta que la Fase 3 aporte
+        // geometria real (ver constantes kCanopy* arriba).
+        LightCoarse.DepositCanopyShadow(Apex, H * kCanopyRadiusFraction, H, kCanopyShadowDensity);
+    }
+
+    Agents_Write.CopyFrom(Agents_Read);
+    WaterPool.BeginTick();
+    NutrientPool.BeginTick();
+
+    // -----------------------------------------------------------------
+    // DETERMINISMO: el nº de chunks se deriva SOLO de la poblacion y de un
+    // grain fijo (settings), NUNCA del nº de hilos de la maquina. Si dependiera
+    // de GetNumWorkerThreads(), la particion en chunks -y con ella el ORDEN en
+    // que ReduceScratchInto suma los deltas de cada celda- cambiaria segun la
+    // CPU; como la suma en float NO es asociativa, dos maquinas con distinto nº
+    // de nucleos divergirian celda a celda y, tick a tick, acabarian en bosques
+    // distintos pese a la misma semilla. Con un recuento fijo: misma poblacion
+    // -> misma particion -> misma reduccion bit a bit en cualquier maquina.
+    // ParallelFor reparte estas NumChunks tareas entre los hilos disponibles,
+    // asi que seguimos aprovechando todos los nucleos.
+    // -----------------------------------------------------------------
+    const int32 PopNum = Agents_Read.Num();
+    const int32 GrainSize = FMath::Max(1, Settings->TickChunkGrainSize);
+    const int32 NumChunks = FMath::Clamp(FMath::DivideAndRoundUp(PopNum, GrainSize), 1, kMaxTickChunks);
+    const int32 NumCells = WaterPool.Current.Num();
+
+    // Scratch PERSISTENTE (miembro): se dimensiona a NumChunks reutilizando la
+    // memoria de ticks anteriores. Cada contexto se pone a cero (ResetForNextTick)
+    // o se crea a tamano de campo la primera vez / si NumChunks crecio. Antes se
+    // reasignaban NumChunks arrays del tamano del campo EN CADA tick (cientos de
+    // KB-MB de churn de heap por tick); ahora es cero asignaciones en regimen.
+    TickContexts.SetNum(NumChunks);
+    for (FTickScratch& Ctx : TickContexts)
+    {
+        if (Ctx.WaterDeltas.Num() != NumCells)
+        {
+            Ctx.InitFromFieldSize(NumCells);
+        }
+        else
+        {
+            Ctx.ResetForNextTick();
+        }
+    }
+
+    // ================================================================
+    // PASO 2 (paralelo): cada chunk SOLO lee del snapshot (Agents_Read,
+    // WaterPool.Current, NutrientPool.Current, LightCoarse) y SOLO escribe
+    // en su porcion de Agents_Write y en su propio FTickScratch.
+    // ================================================================
+    ParallelFor(NumChunks, [&](int32 ChunkIndex)
+        {
+            int32 Begin, End;
+            GetChunkRange(ChunkIndex, NumChunks, PopNum, Begin, End);
+            FTickScratch& Ctx = TickContexts[ChunkIndex];
+
+            for (int32 i = Begin; i < End; ++i)
+            {
+                if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+
+                const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
+                if (!Sp) { continue; }
+
+                const FVector P = Agents_Read.Position[i];
+                const float ReadHeight = Agents_Read.Height[i];
+                uint32& RngState = Agents_Write.RngState[i]; // stream propio -> determinista
+
+                // 2a) recursos locales
+                const float W = WaterPool.SampleCurrent(P.X, P.Y);
+                const float N = NutrientPool.SampleCurrent(P.X, P.Y);
+                const float Q = LightCoarse.SampleLightSmooth(P + FVector(0, 0, ReadHeight));
+
+                // 2b) factores + vigor (Liebig)
+                const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
+                const float fW = EcologyRules::DemandFactor(W, Sp->WaterDemand);
+                const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
+                const float VigorValue = EcologyRules::Vigor(fL, fW, fN);
+
+                // 2c) crecimiento + altura + edad + estado (Mature vs Sapling)
+                const float NewBiomass = EcologyRules::GrowBiomassLogistic(
+                    Agents_Read.Biomass[i], VigorValue, Sp->GrowthRate, Sp->MaxBiomass, DtYears);
+                Agents_Write.Biomass[i] = NewBiomass;
+                Agents_Write.Height[i] = EcologyRules::HeightFromBiomass(NewBiomass, Sp->MaxBiomass, Sp->MaxHeightCm);
+                Agents_Write.Age[i] = Agents_Read.Age[i] + DtYears;
+                Agents_Write.State[i] = (Agents_Write.Age[i] >= Sp->MaturityAge) ? ETreeState::Mature : ETreeState::Sapling;
+
+                // 2d) estres
+                Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
+                    Settings->StressVigorThreshold, Settings->StressAccumulationRate,
+                    Settings->StressRecoveryRate, DtYears);
+
+                // 2e) consumo -> SOLO al scratch de este chunk
+                const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, NewBiomass, Sp->MaxBiomass);
+                EcologyRules::DepositKernel(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
+                    -NewBiomass * Sp->WaterDemand * DtYears);
+                EcologyRules::DepositKernel(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
+                    -NewBiomass * Sp->NutrientDemand * DtYears);
+
+                // 2f) mortalidad (probabilistica, con el RNG propio del arbol)
+                const float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
+                    Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
+
+                if (EcoRand::NextUnit(RngState) < pDeath)
+                {
+                    Agents_Write.State[i] = ETreeState::Dead;
+
+                    FPendingDeathPulse Pulse;
+                    Pulse.Position = P;
+                    Pulse.RadiusCm = RootRadiusCm;
+                    Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings->NutrientDecompositionFactor);
+                    Ctx.DeathPulses.Add(Pulse);
+                }
+                else if (Agents_Write.State[i] == ETreeState::Mature)
+                {
+                    // 2g) semillas (solo si sigue vivo y es maduro)
+                    const int32 NumSeeds = EcologyRules::ComputeSeedCount(Settings->SeedRatePerBiomass, NewBiomass, DtYears, RngState);
+                    const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
+
+                    for (int32 s = 0; s < NumSeeds; ++s)
+                    {
+                        const FVector2D Offset = EcologyRules::SampleSeedOffsetCm(DispersalRadiusCm, RngState);
+
+                        FPendingSeed Seed;
+                        Seed.Position = P + FVector(Offset.X, Offset.Y, 0.f);
+                        Seed.SpeciesId = Agents_Read.SpeciesId[i];
+                        Seed.RngSeed = EcoRand::SeedForIndex(RngState, s);
+                        Ctx.Seeds.Add(Seed);
+                    }
+                }
+            }
+        });
+
+    // ================================================================
+    // PASO 3 (serial): reduccion -> regeneracion -> pulsos de muerte -> germinacion.
+    // ================================================================
+    TArray<FPendingSeed> PendingSeeds;
+    TArray<FPendingDeathPulse> PendingDeaths;
+    EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+
+    WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
+    NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
+
+    for (const FPendingDeathPulse& Pulse : PendingDeaths)
+    {
+        EcologyRules::DepositKernel(NutrientBase.Field, NutrientPool.Next.Data, Pulse.Position, Pulse.RadiusCm, Pulse.Amount);
+    }
+
+    // Reserva una sola vez: PendingSeeds.Num() es la cota superior de germinaciones.
+    // Evita realojos de los 8 arrays SoA durante los Add() de abajo.
+    Agents_Write.Reserve(Agents_Write.Num() + PendingSeeds.Num());
+
+    const FBox2D WorldBounds = HeightField.GetWorldBounds();
+    const double MinSpacingSq = FMath::Square((double)Settings->MinGerminationSpacingCm);
+
+    for (const FPendingSeed& Seed : PendingSeeds)
+    {
+        const USpeciesData* Sp = ResolveSpecies(Seed.SpeciesId);
+        if (!Sp) { continue; }
+
+        // Semilla dispersada fuera del terreno simulado: se descarta en vez de
+        // germinar en el borde (SampleHeight/SampleLight harian clamp y
+        // apelmazarian plantulas en el limite del mapa).
+        if (Seed.Position.X < WorldBounds.Min.X || Seed.Position.X > WorldBounds.Max.X ||
+            Seed.Position.Y < WorldBounds.Min.Y || Seed.Position.Y > WorldBounds.Max.Y)
+        {
+            continue;
+        }
+
+        FVector GerminationPos = Seed.Position;
+        GerminationPos.Z = HeightField.SampleHeight(GerminationPos.X, GerminationPos.Y);
+
+        // Espaciado minimo: no germinar pegada a un arbol ya vivo. Aqui es donde
+        // el spatial hash (que se reconstruye cada tick pero hasta ahora no tenia
+        // consumidor) empieza a ganarse el coste. El hash indexa Agents_Read;
+        // consultamos Agents_Write.State para NO dejar que un arbol muerto ESTE
+        // tick bloquee el hueco que acaba de liberar. El booleano no depende del
+        // orden de visita -> sigue siendo determinista.
+        bool bTooClose = false;
+        Hash.ForEachNeighbor(GerminationPos, Settings->MinGerminationSpacingCm,
+            [&](int32 NeighborIdx)
+            {
+                if (bTooClose) { return; }
+                if (Agents_Write.State[NeighborIdx] == ETreeState::Dead) { return; }
+                const FVector& NP = Agents_Read.Position[NeighborIdx];
+                const double dx = NP.X - GerminationPos.X;
+                const double dy = NP.Y - GerminationPos.Y;
+                if (dx * dx + dy * dy < MinSpacingSq)
+                {
+                    bTooClose = true;
+                }
+            });
+        if (bTooClose) { continue; }
+
+        const float LightHere = LightCoarse.SampleLightSmooth(GerminationPos);
+        if (!EcologyRules::IsSafeGerminationSite(LightHere, Settings->MinLightForGermination))
+        {
+            continue; // sitio no seguro: la semilla no prospera, se descarta
+        }
+
+        const float WHere = WaterPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
+        const float NHere = NutrientPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
+        const float fL = EcologyRules::LightFactor(LightHere, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
+        const float fW = EcologyRules::DemandFactor(WHere, Sp->WaterDemand);
+        const float fN = EcologyRules::DemandFactor(NHere, Sp->NutrientDemand);
+        const float VigorHere = EcologyRules::Vigor(fL, fW, fN);
+
+        uint32 SeedRng = Seed.RngSeed;
+        const float pGerm = EcologyRules::GerminationProbability(VigorHere, Settings->GerminationRate);
+        if (EcoRand::NextUnit(SeedRng) < pGerm)
+        {
+            Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * kGerminationBiomassFraction);
+        }
+    }
+
+    // ================================================================
+    // PASO 4: compactar muertos e intercambiar buffers (agentes y campos).
+    // ================================================================
+    Agents_Write.CompactDead();
+
+    Swap(Agents_Read, Agents_Write);
+    WaterPool.SwapBuffers();
+    NutrientPool.SwapBuffers();
+
+    if ((TickCount % 20) == 0)
+    {
+        LogPopulationStats();
+    }
+}
+
+const USpeciesData* UEcosystemSubsystem::ResolveSpecies(uint16 SpeciesId) const
+{
+    return ResolvedSpecies.IsValidIndex(SpeciesId) ? ResolvedSpecies[SpeciesId] : nullptr;
 }
 
 // ---------------------------------------------------------------------------
-//  Debug agents
+//  Poblacion (Fase 2)
+// ---------------------------------------------------------------------------
+void UEcosystemSubsystem::SeedInitialPopulation(int32 Count)
+{
+    if (!HeightField.IsValid())
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco] SeedInitialPopulation: el relieve aun no esta listo."));
+        return;
+    }
+    if (ResolvedSpecies.Num() == 0)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco] SeedInitialPopulation: no hay especies en Project Settings -> Procedural Ecosystem."));
+        return;
+    }
+
+    const FBox2D Bounds = HeightField.GetWorldBounds();
+    Agents_Read.Reserve(Agents_Read.Num() + Count);
+
+    for (int32 i = 0; i < Count; ++i)
+    {
+        // Stream Colonization (Fase 0): coloca el bosque inicial sin tocar
+        // los streams de mortalidad/dispersion/morfologia de la simulacion.
+        const double X = FMath::Lerp(Bounds.Min.X, Bounds.Max.X, (double)Rng.Unit(EEcoRngStream::Colonization));
+        const double Y = FMath::Lerp(Bounds.Min.Y, Bounds.Max.Y, (double)Rng.Unit(EEcoRngStream::Colonization));
+        const float  Z = HeightField.SampleHeight(X, Y);
+
+        const int32 SpeciesIdx = Rng.RangeI(EEcoRngStream::Colonization, 0, ResolvedSpecies.Num() - 1);
+        const USpeciesData* Sp = ResolvedSpecies[SpeciesIdx];
+        if (!Sp) { continue; }
+
+        const uint32 AgentSeed = Rng.U32(EEcoRngStream::Colonization);
+        const float InitialBiomass = Sp->MaxBiomass * Rng.RangeF(EEcoRngStream::Colonization, 0.005f, 0.03f);
+
+        Agents_Read.Add(FVector(X, Y, Z), static_cast<uint16>(SpeciesIdx), AgentSeed, /*Age*/ 0.f, InitialBiomass);
+    }
+
+    UE_LOG(LogEco, Log, TEXT("[Eco] Sembradas %d plantulas (poblacion total: %d)."), Count, Agents_Read.Num());
+}
+
+void UEcosystemSubsystem::LogPopulationStats() const
+{
+    if (Agents_Read.Num() == 0)
+    {
+        UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion: 0 arboles."), TickCount);
+        return;
+    }
+
+    TArray<int32> CountBySpecies;
+    CountBySpecies.SetNumZeroed(ResolvedSpecies.Num());
+    for (int32 i = 0; i < Agents_Read.Num(); ++i)
+    {
+        if (Agents_Read.SpeciesId[i] < CountBySpecies.Num())
+        {
+            ++CountBySpecies[Agents_Read.SpeciesId[i]];
+        }
+    }
+
+    FString Breakdown;
+    for (int32 s = 0; s < CountBySpecies.Num(); ++s)
+    {
+        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(s));
+        Breakdown += FString::Printf(TEXT("%s=%d "), Sp ? *Sp->SpeciesName.ToString() : TEXT("?"), CountBySpecies[s]);
+    }
+
+    UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion total: %d | %s"),
+        TickCount, Agents_Read.Num(), *Breakdown);
+}
+
+// ---------------------------------------------------------------------------
+//  Debug agents (Fase 0)
 // ---------------------------------------------------------------------------
 void UEcosystemSubsystem::AddDebugAgent(const FVector& WorldPos, const FColor& Color, float Radius)
 {
@@ -301,7 +605,8 @@ void UEcosystemSubsystem::AddRandomDebugAgent()
         return;
     }
 
-    // Stream Debug: las herramientas de depuracion NO perturban la reproducibilidad.
+    // IMPORTANTE: usamos el stream Debug, no los de la simulacion, para que las
+    // herramientas de depuracion NO perturben la reproducibilidad del bosque.
     const FBox2D B = HeightField.GetWorldBounds();
     const float u = Rng.Unit(EEcoRngStream::Debug);
     const float v = Rng.Unit(EEcoRngStream::Debug);
@@ -341,203 +646,6 @@ void UEcosystemSubsystem::ClearDebugAgents()
 }
 
 // ---------------------------------------------------------------------------
-//  Árboles de prueba: depositan sombra en el grid de luz -> cambian el vigor.
-//  (Es el HITO de la Fase 1: un heatmap de idoneidad que reacciona a añadir/
-//   quitar árboles.)
-// ---------------------------------------------------------------------------
-void UEcosystemSubsystem::AddRandomTestTree()
-{
-    if (!HeightField.IsValid() || !LightField.IsValid())
-    {
-        UE_LOG(LogEco, Warning, TEXT("[Eco] AddRandomTestTree: relieve o rejilla de luz no listos."));
-        return;
-    }
-
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const FBox2D B = HeightField.GetWorldBounds();
-
-    const float u = Rng.Unit(EEcoRngStream::Debug);
-    const float v = Rng.Unit(EEcoRngStream::Debug);
-    const double x = FMath::Lerp(B.Min.X, B.Max.X, (double)u);
-    const double y = FMath::Lerp(B.Min.Y, B.Max.Y, (double)v);
-    const double GroundZ = HeightField.SampleHeight(x, y);
-
-    // Ápice de la copa por encima del suelo: colocado a CanopyDepth sobre el
-    // terreno para que la piramide de sombra llegue justo hasta el suelo.
-    const FVector Apex(x, y, GroundZ + S->TestTreeCanopyDepthCm);
-    TestTreeApex.Add(Apex);
-
-    // Marca visual (esfera verde a la altura de la copa).
-    AddDebugAgent(Apex, FColor(30, 160, 40, 255), S->TestTreeCanopyRadiusCm * 0.5f);
-
-    RebuildLightShadows();
-    RepaintActiveHeatmap();
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Arbol de prueba #%d en (%.0f, %.0f). Sombra re-depositada."),
-        TestTreeApex.Num(), x, y);
-}
-
-void UEcosystemSubsystem::ClearTestTrees()
-{
-    TestTreeApex.Reset();
-
-    // Los árboles de prueba se dibujan como agentes de debug: no distinguimos
-    // aquí cuáles eran árboles, así que limpiamos también los agentes para no
-    // dejar esferas huérfanas. (En Fase 2 los árboles serán agentes reales.)
-    DebugAgents.Reset();
-
-    RebuildLightShadows();
-    RepaintActiveHeatmap();
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Arboles de prueba eliminados; cielo despejado."));
-}
-
-void UEcosystemSubsystem::RebuildLightShadows()
-{
-    if (!LightField.IsValid()) { return; }
-
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-
-    // Borrón y cuenta nueva: limpiar y re-depositar TODAS las copas garantiza
-    // que quitar un árbol deshaga su sombra (mismo patrón que usará la Fase 2
-    // cada tick al re-depositar la sombra de toda la población).
-    LightField.ClearShadow();
-    for (const FVector& Apex : TestTreeApex)
-    {
-        LightField.DepositCanopyShadow(
-            Apex, S->TestTreeCanopyRadiusCm, S->TestTreeCanopyDepthCm, S->TestTreeCanopyDensity);
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  Heatmaps
-// ---------------------------------------------------------------------------
-void UEcosystemSubsystem::PaintTestField()
-{
-    if (!FieldViz || !HeightField.IsValid()) { return; }
-
-    FieldViz->UpdateFromField(HeightField.Field.Data);
-    ActiveHeatmap = EActiveHeatmap::TestField;
-    EnsureHeatmapDecal();
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Campo de prueba (altura) pintado."));
-}
-
-void UEcosystemSubsystem::PaintResourceField(int32 Which)
-{
-    if (!FieldViz || !HeightField.IsValid()) { return; }
-
-    const FField2D& G = HeightField.Field;
-
-    switch (Which)
-    {
-    case 0: // agua
-        if (!WaterField.IsValid()) { return; }
-        FieldViz->UpdateFromField(WaterField.Field.Data);
-        ActiveHeatmap = EActiveHeatmap::Water;
-        UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap: AGUA (TWI)."));
-        break;
-
-    case 1: // nutrientes
-        if (!NutrientField.IsValid()) { return; }
-        FieldViz->UpdateFromField(NutrientField.Field.Data);
-        ActiveHeatmap = EActiveHeatmap::Nutrient;
-        UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap: NUTRIENTES."));
-        break;
-
-    case 2: // luz a ras de suelo (Q en [0,1]); refleja la sombra de los árboles
-    {
-        TArray<float> Q;
-        Q.SetNumUninitialized(G.Width * G.Height);
-        for (int32 y = 0; y < G.Height; ++y)
-        {
-            for (int32 x = 0; x < G.Width; ++x)
-            {
-                const double Xcm = G.Origin.X + x * G.CellSize;
-                const double Ycm = G.Origin.Y + y * G.CellSize;
-                const double Zcm = HeightField.SampleHeight(Xcm, Ycm);
-                Q[y * G.Width + x] = LightField.IsValid()
-                    ? LightField.SampleLightSmooth(FVector(Xcm, Ycm, Zcm))
-                    : FLightFieldCoarse::FullSunlight;
-            }
-        }
-        FieldViz->UpdateFromField(Q, 0.f, 1.f); // rango fijo: comparables entre repintados
-        ActiveHeatmap = EActiveHeatmap::Light;
-        UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap: LUZ a ras de suelo."));
-        break;
-    }
-
-    default:
-        UE_LOG(LogEco, Warning, TEXT("[Eco] PaintResource: indice %d fuera de rango (0=agua,1=nutri,2=luz)."), Which);
-        return;
-    }
-
-    EnsureHeatmapDecal();
-}
-
-void UEcosystemSubsystem::PaintVigor(int32 SpeciesIndex)
-{
-    if (!FieldViz || !HeightField.IsValid()) { return; }
-
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-
-    if (S->Species.Num() == 0)
-    {
-        UE_LOG(LogEco, Warning,
-            TEXT("[Eco] PaintVigor: no hay especies en Project Settings; anade al menos una."));
-        return;
-    }
-
-    const int32 Idx = (SpeciesIndex >= 0) ? SpeciesIndex : ActiveSpeciesIndex;
-    const int32 Clamped = FMath::Clamp(Idx, 0, S->Species.Num() - 1);
-    if (Clamped != Idx)
-    {
-        UE_LOG(LogEco, Warning, TEXT("[Eco] PaintVigor: indice %d fuera de rango; usando %d."), Idx, Clamped);
-    }
-
-    const USpeciesData* Sp = S->Species[Clamped].LoadSynchronous();
-    if (!Sp)
-    {
-        UE_LOG(LogEco, Warning, TEXT("[Eco] PaintVigor: no se pudo cargar la especie %d."), Clamped);
-        return;
-    }
-
-    // El corazón de la Fase 1: combinar los tres campos con Liebig, por nodo.
-    EcoVigor::BakeSuitabilityField(
-        HeightField, WaterField, NutrientField, LightField,
-        *Sp, S->KlMax, VigorField);
-
-    if (!VigorField.IsValid())
-    {
-        UE_LOG(LogEco, Warning, TEXT("[Eco] PaintVigor: el campo de vigor salio invalido."));
-        return;
-    }
-
-    // Rango FIJO [0,1]: así el color significa lo mismo entre especies y entre
-    // repintados (añadir un árbol baja el vigor a la sombra y se ve al instante).
-    FieldViz->UpdateFromField(VigorField.Data, 0.f, 1.f);
-    ActiveHeatmap = EActiveHeatmap::Vigor;
-    ActiveSpeciesIndex = Clamped;
-    EnsureHeatmapDecal();
-
-    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap: VIGOR (idoneidad) de '%s' [especie %d]."),
-        *Sp->SpeciesName.ToString(), Clamped);
-}
-
-void UEcosystemSubsystem::RepaintActiveHeatmap()
-{
-    switch (ActiveHeatmap)
-    {
-    case EActiveHeatmap::TestField: PaintTestField();          break;
-    case EActiveHeatmap::Water:     PaintResourceField(0);     break;
-    case EActiveHeatmap::Nutrient:  PaintResourceField(1);     break;
-    case EActiveHeatmap::Light:     PaintResourceField(2);     break;
-    case EActiveHeatmap::Vigor:     PaintVigor(ActiveSpeciesIndex); break;
-    default: break; // None: nada que repintar todavía
-    }
-}
-
-// ---------------------------------------------------------------------------
 //  Dibujo de debug (cada frame, gobernado por CVars)
 // ---------------------------------------------------------------------------
 void UEcosystemSubsystem::DrawDebug()
@@ -558,20 +666,25 @@ void UEcosystemSubsystem::DrawDebug()
         }
     }
 
-    if (CVarDebugTrees.GetValueOnGameThread() != 0)
+    if (CVarDebugPopulation.GetValueOnGameThread() != 0)
     {
-        const UEcosystemSettings* S = UEcosystemSettings::Get();
-        for (const FVector& Apex : TestTreeApex)
+        for (int32 i = 0; i < Agents_Read.Num(); ++i)
         {
-            DrawDebugSphere(World, Apex, S->TestTreeCanopyRadiusCm, 12,
-                FColor(20, 120, 30, 255), false, -1.f, 0, 2.f);
+            if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+
+            const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
+            const FColor Color = Sp ? Sp->DebugColor : FColor::White;
+            const float  H = Agents_Read.Height[i];
+            const FVector Center = Agents_Read.Position[i] + FVector(0.f, 0.f, H * 0.5f);
+            const float  Radius = FMath::Max(30.f, H * 0.3f);
+
+            DrawDebugSphere(World, Center, Radius, 8, Color, false, -1.f, 0, 2.f);
         }
     }
 
     if (CVarDebugTerrain.GetValueOnGameThread() != 0 && HeightField.IsValid())
     {
         const FBox2D B = HeightField.GetWorldBounds();
-
         const int32 N = 24;
         for (int32 j = 0; j <= N; ++j)
         {
@@ -589,8 +702,32 @@ void UEcosystemSubsystem::DrawDebug()
 }
 
 // ---------------------------------------------------------------------------
-//  Decal del heatmap
+//  Heatmaps
 // ---------------------------------------------------------------------------
+void UEcosystemSubsystem::PaintTestField()
+{
+    if (!FieldViz || !HeightField.IsValid()) return;
+    FieldViz->UpdateFromField(HeightField.Field.Data);
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco] Campo de prueba pintado."));
+}
+
+void UEcosystemSubsystem::PaintWaterField()
+{
+    if (!FieldViz || !WaterPool.Current.IsValid()) return;
+    FieldViz->UpdateFromField(WaterPool.Current.Data);
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de agua (pool actual) pintado."));
+}
+
+void UEcosystemSubsystem::PaintNutrientField()
+{
+    if (!FieldViz || !NutrientPool.Current.IsValid()) return;
+    FieldViz->UpdateFromField(NutrientPool.Current.Data);
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de nutrientes (pool actual) pintado."));
+}
+
 void UEcosystemSubsystem::EnsureHeatmapDecal()
 {
     UWorld* World = GetWorld();
