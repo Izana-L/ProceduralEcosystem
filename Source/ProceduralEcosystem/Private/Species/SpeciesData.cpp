@@ -39,6 +39,26 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             TEXT("MaturityAge >= Longevity: la especie moriría (casi) antes de poder reproducirse.")));
         // Es un aviso, no un error: puede ser intencionado para pruebas.
     }
+    if (!(KillRadiusDk < StepLengthD && StepLengthD < InfluenceRadiusDi))
+    {
+        Context.AddError(FText::FromString(
+            TEXT("Debe cumplirse d_k < D < d_i (KillRadiusDk < StepLengthD < InfluenceRadiusDi); "
+                "si no, el SCA no ramifica o los atractores no se consumen (doc. §3.1).")));
+        Fail();
+    }
+
+    if (CrownRadiusCm <= 0.f || CrownHeightCm <= 0.f)
+    {
+        Context.AddError(FText::FromString(
+            TEXT("CrownRadiusCm y CrownHeightCm deben ser > 0: definen la envolvente donde se siembran los atractores.")));
+        Fail();
+    }
+
+    if (StepLengthD > CrownHeightCm)
+    {
+        Context.AddWarning(FText::FromString(
+            TEXT("StepLengthD > CrownHeightCm: cada paso de crecimiento supera la copa entera; sube MaxIter o baja D.")));
+    }
 
     return Result;
 }

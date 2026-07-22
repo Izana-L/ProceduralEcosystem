@@ -4,6 +4,7 @@
 #include "Species/SpeciesData.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TickScratch.h"
+#include "Geometry/HeroTreeActor.h"
 
 #include "Engine/World.h"
 #include "Engine/DecalActor.h"
@@ -86,7 +87,32 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(
                 S->SeedInitialPopulation(N);
             }
         }));
+static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(
+    TEXT("Eco.GrowHeroTree"),
+    TEXT("Genera un hero tree (SCA) con la luz actual del ecosistema. "
+        "Uso: Eco.GrowHeroTree [SpeciesIndex] [Seed] [X] [Y] (X,Y en cm; por defecto, centro del terreno)."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+        [](const TArray<FString>& Args, UWorld* World)
+        {
+            if (UEcosystemSubsystem* S = GetEco(World))
+            {
+                const int32 SpeciesIndex = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 0;
+                const uint32 Seed = Args.Num() > 1 ? (uint32)FCString::Atoi64(*Args[1]) : 12345u;
 
+                const FBox2D B = S->GetHeightField().GetWorldBounds();
+                const double X = Args.Num() > 2 ? FCString::Atod(*Args[2]) : 0.5 * (B.Min.X + B.Max.X);
+                const double Y = Args.Num() > 3 ? FCString::Atod(*Args[3]) : 0.5 * (B.Min.Y + B.Max.Y);
+                const float  Z = S->GetHeightField().SampleHeight(X, Y);
+
+                S->SpawnHeroTree(FVector(X, Y, Z), SpeciesIndex, Seed);
+            }
+        }));
+
+static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(
+    TEXT("Eco.ClearHeroTrees"),
+    TEXT("Destruye todos los hero trees generados."),
+    FConsoleCommandWithWorldDelegate::CreateStatic(
+        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearHeroTrees(); }));
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
 // ---------------------------------------------------------------------------
@@ -180,6 +206,8 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 void UEcosystemSubsystem::Deinitialize()
 {
+    ClearHeroTrees();
+
     if (HeatmapDecal)
     {
         HeatmapDecal->Destroy();
@@ -554,6 +582,61 @@ void UEcosystemSubsystem::SeedInitialPopulation(int32 Count)
     }
 
     UE_LOG(LogEco, Log, TEXT("[Eco] Sembradas %d plantulas (poblacion total: %d)."), Count, Agents_Read.Num());
+}
+// ---------------------------------------------------------------------------
+//  Hero trees (Fase 3)
+// ---------------------------------------------------------------------------
+AHeroTreeActor* UEcosystemSubsystem::SpawnHeroTree(const FVector& WorldPos, int32 SpeciesIndex, uint32 Seed)
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return nullptr;
+    }
+    if (!HeightField.IsValid())
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco] GrowHeroTree: el relieve aun no esta listo."));
+        return nullptr;
+    }
+    if (ResolvedSpecies.Num() == 0)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco] GrowHeroTree: no hay especies en Project Settings -> Procedural Ecosystem."));
+        return nullptr;
+    }
+
+    const int32 Idx = FMath::Clamp(SpeciesIndex, 0, ResolvedSpecies.Num() - 1);
+    const USpeciesData* Sp = ResolvedSpecies[Idx];
+    if (!Sp)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco] GrowHeroTree: la especie %d es nula."), Idx);
+        return nullptr;
+    }
+
+    AHeroTreeActor* Actor = World->SpawnActor<AHeroTreeActor>(WorldPos, FRotator::ZeroRotator);
+    if (!Actor)
+    {
+        return nullptr;
+    }
+
+    // La luz gruesa da el contexto de vecinos (sombra) para el SCA.
+    Actor->Generate(Sp, Seed, &LightCoarse, WorldPos);
+    HeroTrees.Add(Actor);
+
+    UE_LOG(LogEco, Log, TEXT("[Eco] Hero tree '%s' generado en (%.0f, %.0f) con semilla %u | %d nodos."),
+        *Sp->SpeciesName.ToString(), WorldPos.X, WorldPos.Y, Seed, Actor->GetNodeCount());
+    return Actor;
+}
+
+void UEcosystemSubsystem::ClearHeroTrees()
+{
+    for (const TObjectPtr<AHeroTreeActor>& A : HeroTrees)
+    {
+        if (A)
+        {
+            A->Destroy();
+        }
+    }
+    HeroTrees.Reset();
 }
 
 void UEcosystemSubsystem::LogPopulationStats() const

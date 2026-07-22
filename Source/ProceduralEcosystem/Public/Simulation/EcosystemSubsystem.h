@@ -17,6 +17,7 @@ class UFieldVisualizer;
 class ADecalActor;
 class UMaterialInstanceDynamic;
 class USpeciesData;
+class AHeroTreeActor;
 
 /**
  * Motor de la simulacion de ecosistema.
@@ -55,6 +56,10 @@ public:
 
     // --- Terreno ---
     const FHeightField& GetHeightField() const { return HeightField; }
+    // --- Luz gruesa (Fase 3): la lee el hero tree para sembrar su rejilla fina
+    //     con la sombra de los vecinos (conexion micro<-macro). Se rellena en
+    //     cada SimulateTick, asi que refleja el estado del ultimo tick corrido. ---
+    const FLightFieldCoarse& GetLightCoarse() const { return LightCoarse; }
 
     // --- Debug agents (Fase 0: sondas manuales, no forman parte de la simulacion) ---
     void AddDebugAgent(const FVector& WorldPos, const FColor& Color, float Radius);
@@ -73,6 +78,14 @@ public:
     /** Nº de arboles vivos actualmente (para HUD/consola/tests). */
     int32 GetLivePopulationCount() const { return Agents_Read.Num(); }
 
+    // --- Hero trees (Fase 3): geometria SCA en vivo ---
+    /** Genera un hero tree en WorldPos con la especie SpeciesIndex (indice en
+        Species) y semilla Seed, usando la luz gruesa actual como contexto de
+        vecinos. Devuelve el actor creado (o nullptr si falla). */
+    AHeroTreeActor* SpawnHeroTree(const FVector& WorldPos, int32 SpeciesIndex, uint32 Seed);
+
+    /** Destruye todos los hero trees generados. */
+    void ClearHeroTrees();
 private:
     void SimulateTick(float DtYears);
     void DrawDebug();
@@ -126,6 +139,10 @@ private:
     // --- Debug agents (Fase 0) ---
     UPROPERTY(Transient)
     TArray<FEcoDebugAgent> DebugAgents;
+
+    // --- Hero trees generados (Fase 3) ---
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<AHeroTreeActor>> HeroTrees;
 
     // --- Heatmap ---
     UPROPERTY(Transient)

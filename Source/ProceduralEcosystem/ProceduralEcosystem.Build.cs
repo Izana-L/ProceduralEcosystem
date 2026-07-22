@@ -17,7 +17,8 @@ public class ProceduralEcosystem : ModuleRules
             "DeveloperSettings",
             "RenderCore",
             "RHI",
-            "Landscape"
+            "Landscape",
+            "ProceduralMeshComponent"
         });
 
         PrivateDependencyModuleNames.AddRange(new string[] {  });
