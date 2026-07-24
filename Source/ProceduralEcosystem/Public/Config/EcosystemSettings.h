@@ -87,11 +87,6 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "0"))
     float LightCanopyHeadroomCm = 8000.f;
 
-    // --- Vigor (acoplamiento, Fase 1) ---
-    /** Semisaturación de luz de una heliófila. Kl = KlMax*(1-ShadeTolerance).
-        Más alto = la luz limita antes (heliófilas más exigentes). */
-    UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0.0001"))
-    float KlMax = 0.35f;
 
     /** Especie por defecto para el heatmap de idoneidad (índice en Species). */
     UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0"))

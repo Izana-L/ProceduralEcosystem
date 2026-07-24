@@ -70,7 +70,7 @@ public:
     void PaintTestField();
     void PaintWaterField();
     void PaintNutrientField();
-
+    void PaintVigorField();
     // --- Poblacion (Fase 2) ---
     /** Siembra Count plantulas aleatorias sobre el terreno (consola: Eco.SeedForest). */
     void SeedInitialPopulation(int32 Count);

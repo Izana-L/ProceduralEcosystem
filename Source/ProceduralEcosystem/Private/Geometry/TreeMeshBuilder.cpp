@@ -85,7 +85,8 @@ namespace TreeMeshBuilder
 
         // --- MADERA: un anillo de K vertices por nodo ---
         FTreeMeshBuffers& W = OutMesh.Wood;
-        const int32 VertCount = N * K;
+        const int32 RingVerts = K + 1;          // <-- +1: vertice de costura (duplicado en u=1)
+        const int32 VertCount = N * RingVerts;
         W.Vertices.SetNumUninitialized(VertCount);
         W.Normals.SetNumUninitialized(VertCount);
         W.UVs.SetNumUninitialized(VertCount);
@@ -99,18 +100,18 @@ namespace TreeMeshBuilder
             const float Radius = FMath::Max(Node.Radius, MinBranchRadiusCm);
             const float V = AlongLen[i] * UvAlongScale;
 
-            for (int32 k = 0; k < K; ++k)
+            for (int32 k = 0; k <= K; ++k)                       
             {
-                const float Ang = 2.f * PI * (float)k / (float)K;
+                const float Ang = 2.f * PI * (float)k / (float)K; 
                 const float C = FMath::Cos(Ang);
                 const float S = FMath::Sin(Ang);
-                const FVector Off = C * Nrm + S * Bin; // radial hacia fuera, unitario
+                const FVector Off = C * Nrm + S * Bin;
 
-                const int32 Vi = i * K + k;
+                const int32 Vi = i * RingVerts + k;             
                 W.Vertices[Vi] = Node.Pos + Radius * Off;
-                W.Normals[Vi] = Off;                       // normal exterior
-                W.UVs[Vi] = FVector2D((float)k / (float)K, V);
-                W.Tangents[Vi] = (-S * Nrm + C * Bin);      // direccion U (alrededor del tronco)
+                W.Normals[Vi] = Off;
+                W.UVs[Vi] = FVector2D((float)k / (float)K, V); 
+                W.Tangents[Vi] = (-S * Nrm + C * Bin);
             }
         }
 
@@ -123,14 +124,12 @@ namespace TreeMeshBuilder
             const int32 P = Skeleton.Nodes[i].Parent;
             if (P < 0) { continue; }
 
-            const int32 BaseI = i * K;
-            const int32 BaseP = P * K;
-            for (int32 k = 0; k < K; ++k)
+            const int32 BaseI = i * RingVerts;   // <-- paso RingVerts, no K
+            const int32 BaseP = P * RingVerts;
+            for (int32 k = 0; k < K; ++k)        // K quads; k+1 nunca se sale (hay K+1 vertices)
             {
-                const int32 K2 = (k + 1) % K;
-
-                W.Triangles.Add(BaseP + k);  W.Triangles.Add(BaseI + k);  W.Triangles.Add(BaseP + K2);
-                W.Triangles.Add(BaseP + K2); W.Triangles.Add(BaseI + k);  W.Triangles.Add(BaseI + K2);
+                W.Triangles.Add(BaseP + k);     W.Triangles.Add(BaseI + k);     W.Triangles.Add(BaseP + k + 1);
+                W.Triangles.Add(BaseP + k + 1); W.Triangles.Add(BaseI + k);     W.Triangles.Add(BaseI + k + 1);
             }
         }
 

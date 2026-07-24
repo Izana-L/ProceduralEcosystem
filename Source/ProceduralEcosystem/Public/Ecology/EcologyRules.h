@@ -4,6 +4,7 @@
 #include "Core/EcoCore.h"
 #include "Terrain/Field2D.h"
 #include "Ecology/TickScratch.h"
+#include "Ecology/Vigor.h"
 /**
  * Formulas puras del nucleo biologico (doc. Fase 2, seccion 2.6). Cada
  * funcion es un paso nombrado del pseudocodigo del documento: se pueden
@@ -16,11 +17,10 @@
  */
 namespace EcologyRules
 {
-    /** fL = Q / (Q + Kl), Kl = KlMax*(1-ShadeTolerance). Curva de saturacion (Monod). */
+    /** fL = Q / (Q + Kl), Kl = LightHalfSaturationMax*(1-ShadeTolerance). Curva de saturacion (Monod). */
     FORCEINLINE float LightFactor(float Q, float ShadeTolerance, float LightHalfSaturationMax)
     {
-        const float Kl = LightHalfSaturationMax * (1.f - ShadeTolerance);
-        return Q / (Q + Kl + 1e-4f); // +epsilon: evita 0/0 si Q=Kl=0
+        return EcoVigor::LightFactor(Q, ShadeTolerance, LightHalfSaturationMax);
     }
 
     /**

@@ -46,7 +46,14 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
                 "si no, el SCA no ramifica o los atractores no se consumen (doc. §3.1).")));
         Fail();
     }
-
+    const float TrunkGap = CrownHeightCm * FMath::Clamp(TrunkFraction, 0.f, 0.95f) / (1.f - FMath::Clamp(TrunkFraction, 0.f, 0.95f));
+    if (InfluenceRadiusDi <= TrunkGap)
+    {
+        Context.AddError(FText::FromString(FString::Printf(
+            TEXT("InfluenceRadiusDi (%.0f) <= hueco de tronco (%.0f cm): el SCA no arrancara (ningun atractor en rango del nodo base)."),
+            InfluenceRadiusDi, TrunkGap)));
+        Result = EDataValidationResult::Invalid;
+    }
     if (CrownRadiusCm <= 0.f || CrownHeightCm <= 0.f)
     {
         Context.AddError(FText::FromString(

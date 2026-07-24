@@ -4,6 +4,7 @@
 #include "Species/SpeciesData.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TickScratch.h"
+#include "Ecology/Vigor.h"
 #include "Geometry/HeroTreeActor.h"
 
 #include "Engine/World.h"
@@ -26,8 +27,7 @@ static UEcosystemSubsystem* GetEco(UWorld* World)
     return World ? World->GetSubsystem<UEcosystemSubsystem>() : nullptr;
 }
 
-static FAutoConsoleCommandWithWorldAndArgs GEcoStep(
-    TEXT("Eco.Step"),
+static FAutoConsoleCommandWithWorldAndArgs GEcoStep( TEXT("Eco.Step"),
     TEXT("Avanza N ticks de simulacion (por defecto 1). Uso: Eco.Step [N]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* World)
@@ -38,45 +38,38 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoStep(
                 S->StepN(N);
             }
         }));
+   
 
-static FAutoConsoleCommandWithWorld GEcoTogglePause(
-    TEXT("Eco.TogglePause"),
+static FAutoConsoleCommandWithWorld GEcoTogglePause(TEXT("Eco.TogglePause"),
     TEXT("Pausa/reanuda el avance automatico de la simulacion."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->SetPaused(!S->IsPaused()); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->SetPaused(!S->IsPaused()); }));
 
-static FAutoConsoleCommandWithWorld GEcoAddAgent(
-    TEXT("Eco.AddAgent"),
+static FAutoConsoleCommandWithWorld GEcoAddAgent(TEXT("Eco.AddAgent"),
     TEXT("Anade un agente de debug aleatorio sobre el terreno."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->AddRandomDebugAgent(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->AddRandomDebugAgent(); }));
 
-static FAutoConsoleCommandWithWorld GEcoClear(
-    TEXT("Eco.ClearAgents"),
+static FAutoConsoleCommandWithWorld GEcoClear(TEXT("Eco.ClearAgents"),
     TEXT("Borra todos los agentes de debug."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearDebugAgents(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearDebugAgents(); }));  
 
-static FAutoConsoleCommandWithWorld GEcoPaint(
-    TEXT("Eco.PaintTestField"),
+static FAutoConsoleCommandWithWorld GEcoPaint(TEXT("Eco.PaintTestField"),
     TEXT("Genera y pinta un campo de prueba como heatmap sobre el terreno."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintTestField(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic( [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintTestField(); }));
 
-static FAutoConsoleCommandWithWorld GEcoPaintWater(
-    TEXT("Eco.PaintWater"),
+static FAutoConsoleCommandWithWorld GEcoPaintWater(TEXT("Eco.PaintWater"),
     TEXT("Pinta el heatmap del agua disponible actual (pool, no el base)."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintWaterField(); }));
-
-static FAutoConsoleCommandWithWorld GEcoPaintNutrients(
-    TEXT("Eco.PaintNutrients"),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintWaterField(); }));
+        
+static FAutoConsoleCommandWithWorld GEcoPaintNutrients(TEXT("Eco.PaintNutrients"),
     TEXT("Pinta el heatmap de nutrientes disponibles actuales (pool, no el base)."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintNutrientField(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintNutrientField(); }));
 
-static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(
-    TEXT("Eco.SeedForest"),
+static FAutoConsoleCommandWithWorld GEcoPaintVigor(TEXT("Eco.PaintVigor"),
+    TEXT("Pinta el heatmap de idoneidad (vigor de Liebig) de la especie HeatmapSpeciesIndex."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintVigorField(); }));
+    
+
+static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(TEXT("Eco.SeedForest"),
     TEXT("Siembra N plantulas aleatorias sobre el terreno (por defecto 200). Uso: Eco.SeedForest [N]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* World)
@@ -87,8 +80,8 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(
                 S->SeedInitialPopulation(N);
             }
         }));
-static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(
-    TEXT("Eco.GrowHeroTree"),
+    
+static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(TEXT("Eco.GrowHeroTree"),
     TEXT("Genera un hero tree (SCA) con la luz actual del ecosistema. "
         "Uso: Eco.GrowHeroTree [SpeciesIndex] [Seed] [X] [Y] (X,Y en cm; por defecto, centro del terreno)."),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
@@ -107,23 +100,24 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(
                 S->SpawnHeroTree(FVector(X, Y, Z), SpeciesIndex, Seed);
             }
         }));
+    
 
-static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(
-    TEXT("Eco.ClearHeroTrees"),
+static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(TEXT("Eco.ClearHeroTrees"),
     TEXT("Destruye todos los hero trees generados."),
-    FConsoleCommandWithWorldDelegate::CreateStatic(
-        [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearHeroTrees(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearHeroTrees(); }));
+        
+    
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
 // ---------------------------------------------------------------------------
-static TAutoConsoleVariable<int32> CVarDebugAgents(
-    TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug (Fase 0) como esferas."));
-static TAutoConsoleVariable<int32> CVarDebugPopulation(
-    TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
-static TAutoConsoleVariable<int32> CVarDebugTerrain(
-    TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
-static TAutoConsoleVariable<int32> CVarDebugHeatmap(
-    TEXT("Eco.Debug.Heatmap"), 1, TEXT("Muestra (1) u oculta (0) el decal de heatmap."));
+static TAutoConsoleVariable<int32> CVarDebugAgents(TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug (Fase 0) como esferas."));
+    
+static TAutoConsoleVariable<int32> CVarDebugPopulation( TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
+   
+static TAutoConsoleVariable<int32> CVarDebugTerrain( TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
+   
+static TAutoConsoleVariable<int32> CVarDebugHeatmap(TEXT("Eco.Debug.Heatmap"), 1, TEXT("Muestra (1) u oculta (0) el decal de heatmap."));
+    
 
 // ---------------------------------------------------------------------------
 //  UWorldSubsystem
@@ -170,10 +164,11 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     // 2) Campos base (Fase 1): potencial del terreno, calculado una sola vez.
     //    Ambos comparten geometria con HeightField (mismo Width/Height/CellSize/Origin),
     //    asi que WaterPool y NutrientPool acaban con el mismo numero de celdas.
-    WaterBase.BakeFromHeightField(HeightField);
-    NutrientBase.GeneratePatchyBase(
-        HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
-        HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed));
+    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);     
+    
+    NutrientBase.GeneratePatchyBase(HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
+        HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed),S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);   
+      
 
     // 3) Estado runtime (Fase 2): los pools arrancan llenos al nivel del base.
     WaterPool.InitFromBase(WaterBase.Field);
@@ -181,10 +176,12 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     // 4) Grid de luz grueso: geometria derivada del relieve + settings.
     const FBox2D Bounds = HeightField.GetWorldBounds();
-    const int32 LightW = FMath::Max(1, FMath::CeilToInt((Bounds.Max.X - Bounds.Min.X) / S->LightCoarseCellSizeCm));
-    const int32 LightH = FMath::Max(1, FMath::CeilToInt((Bounds.Max.Y - Bounds.Min.Y) / S->LightCoarseCellSizeCm));
-    LightCoarse.Init(LightW, LightH, S->LightCoarseLayers,
-        S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min, /*BaseZ*/ 0.0);
+    const int32 LightW = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.X - Bounds.Min.X) / S->LightCoarseCellSizeCm));
+    const int32 LightH = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.Y - Bounds.Min.Y) / S->LightCoarseCellSizeCm));
+    // Cubrir toda la altura del relieve + margen de copas (usa el setting antes muerto).
+    const double LightSpanZ = S->HeightScaleCm + S->LightCanopyHeadroomCm;
+    const int32  LightLayers = FMath::Max(1, FMath::CeilToInt32(LightSpanZ / S->LightCoarseCellSizeCm));
+    LightCoarse.Init(LightW, LightH, LightLayers, S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min, /*BaseZ*/ 0.0);
 
     // 5) Spatial hash de agentes: geometria fijada una vez; se repuebla cada tick con Build().
     Hash.Init(Bounds, S->SpatialHashCellSizeCm);
@@ -374,13 +371,12 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 if (!Sp) { continue; }
 
                 const FVector P = Agents_Read.Position[i];
-                const float ReadHeight = Agents_Read.Height[i];
                 uint32& RngState = Agents_Write.RngState[i]; // stream propio -> determinista
 
                 // 2a) recursos locales
                 const float W = WaterPool.SampleCurrent(P.X, P.Y);
                 const float N = NutrientPool.SampleCurrent(P.X, P.Y);
-                const float Q = LightCoarse.SampleLightSmooth(P + FVector(0, 0, ReadHeight));
+                const float Q = LightCoarse.SampleLightSmooth(P);
 
                 // 2b) factores + vigor (Liebig)
                 const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
@@ -809,6 +805,23 @@ void UEcosystemSubsystem::PaintNutrientField()
     FieldViz->UpdateFromField(NutrientPool.Current.Data);
     EnsureHeatmapDecal();
     UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de nutrientes (pool actual) pintado."));
+}
+
+void UEcosystemSubsystem::PaintVigorField()
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    const USpeciesData* Sp = ResolveSpecies((uint16)FMath::Max(0, S->HeatmapSpeciesIndex));
+    if (!FieldViz || !Sp || !HeightField.IsValid()) { return; }
+
+    FField2D Suitability;
+    EcoVigor::BakeSuitabilityField(
+        HeightField, WaterBase, NutrientBase, LightCoarse, *Sp,
+        S->LightHalfSaturationMax,   // <-- el MISMO Kl que usa el tick (no KlMax)
+        Suitability);
+
+    FieldViz->UpdateFromField(Suitability.Data);
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de vigor (%s) pintado."), *Sp->SpeciesName.ToString());
 }
 
 void UEcosystemSubsystem::EnsureHeatmapDecal()
