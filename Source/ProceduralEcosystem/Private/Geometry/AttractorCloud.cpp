@@ -103,9 +103,9 @@ void FAttractorCloud::BuildIndex(float InCellSize)
     GridOrigin = Bounds.Min;
 
     const FVector Size = (Bounds.Max - Bounds.Min).ComponentMax(FVector(CellSize)); // >=1 celda/eje
-    GridW = FMath::Max(1, FMath::CeilToInt(Size.X / CellSize));
-    GridH = FMath::Max(1, FMath::CeilToInt(Size.Y / CellSize));
-    GridD = FMath::Max(1, FMath::CeilToInt(Size.Z / CellSize));
+    GridW = FMath::Max(1, FMath::CeilToInt32(Size.X / CellSize));
+    GridH = FMath::Max(1, FMath::CeilToInt32(Size.Y / CellSize));
+    GridD = FMath::Max(1, FMath::CeilToInt32(Size.Z / CellSize));
 
     // Counting sort (CSR): contar, prefijo acumulado, volcar. O(N). Orden fijo.
     const int32 NC = GridW * GridH * GridD;

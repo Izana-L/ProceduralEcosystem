@@ -49,8 +49,9 @@ namespace EcologyRules
     FORCEINLINE float GrowBiomassLogistic(float Biomass, float VigorValue, float GrowthRate,
         float MaxBiomass, float DtYears)
     {
-        const float dB = GrowthRate * VigorValue * Biomass * (1.f - Biomass / MaxBiomass) * DtYears;
-        return FMath::Max(0.f, Biomass + dB);
+        const float SafeMax = FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER);
+        const float dB = GrowthRate * VigorValue * Biomass * (1.f - Biomass / SafeMax) * DtYears;
+        return FMath::Clamp(Biomass + dB, 0.f, SafeMax);
     }
 
     /**
@@ -63,7 +64,7 @@ namespace EcologyRules
      */
     FORCEINLINE float HeightFromBiomass(float Biomass, float MaxBiomass, float MaxHeightCm)
     {
-        const float Ratio = FMath::Clamp(Biomass / MaxBiomass, 0.f, 1.f);
+        const float Ratio = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
         return MaxHeightCm * FMath::Pow(Ratio, 1.f / 3.f);
     }
 
@@ -97,7 +98,7 @@ namespace EcologyRules
         const float AgeRatio = Age / FMath::Max(Longevity, KINDA_SMALL_NUMBER);
         const float pAge = DtYears * FMath::Pow(AgeRatio, 4.f);
         const float pStress = DtYears * Stress * StressMortalityWeight;
-        return 1.f - (1.f - pAge) * (1.f - pStress);
+        return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
     }
 
     /** Nº de semillas emitidas este tick (Poisson de media SeedRate*Biomass*dt). */

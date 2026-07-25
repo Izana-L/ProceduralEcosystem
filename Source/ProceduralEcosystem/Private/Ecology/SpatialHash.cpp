@@ -6,8 +6,8 @@ void FSpatialHash::Init(const FBox2D& WorldBounds, double InCellSize)
     Origin = WorldBounds.Min;
 
     const FVector2D Size = WorldBounds.Max - WorldBounds.Min;
-    GridW = FMath::Max(1, FMath::CeilToInt(Size.X / CellSize));
-    GridH = FMath::Max(1, FMath::CeilToInt(Size.Y / CellSize));
+    GridW = FMath::Max(1, FMath::CeilToInt32(Size.X / CellSize));
+    GridH = FMath::Max(1, FMath::CeilToInt32(Size.Y / CellSize));
 
     CellStart.Reset();
     SortedIdx.Reset();

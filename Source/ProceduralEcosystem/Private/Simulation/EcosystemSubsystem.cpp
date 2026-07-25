@@ -26,6 +26,8 @@ static UEcosystemSubsystem* GetEco(UWorld* World)
 {
     return World ? World->GetSubsystem<UEcosystemSubsystem>() : nullptr;
 }
+static TAutoConsoleVariable<int32> CVarForceST(
+    TEXT("Eco.ForceSingleThread"), 0, TEXT("1 = tick en un solo hilo (validar determinismo)."));
 
 static FAutoConsoleCommandWithWorldAndArgs GEcoStep( TEXT("Eco.Step"),
     TEXT("Avanza N ticks de simulacion (por defecto 1). Uso: Eco.Step [N]"),
@@ -105,8 +107,42 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(TEXT("Eco.GrowHeroTr
 static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(TEXT("Eco.ClearHeroTrees"),
     TEXT("Destruye todos los hero trees generados."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearHeroTrees(); }));
-        
-    
+
+static FAutoConsoleCommandWithWorld GEcoFingerprint( TEXT("Eco.Fingerprint"), TEXT("Loguea un hash del estado completo del bosque."),
+    FConsoleCommandWithWorldDelegate::CreateStatic( [](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogStateFingerprint(); }));
+   
+       
+
+void UEcosystemSubsystem::LogStateFingerprint() const
+{
+    uint32 H = 0;
+    auto Mix = [&H](const void* D, int32 Bytes) { if (Bytes > 0) H = FCrc::MemCrc32(D, Bytes, H); };
+    const FTreePopulation& P = Agents_Read;
+    Mix(P.Position.GetData(), P.Position.Num() * sizeof(FVector));
+    Mix(P.SpeciesId.GetData(), P.SpeciesId.Num() * sizeof(uint16));
+    Mix(P.Age.GetData(), P.Age.Num() * sizeof(float));
+    Mix(P.Biomass.GetData(), P.Biomass.Num() * sizeof(float));
+    Mix(P.Height.GetData(), P.Height.Num() * sizeof(float));
+    Mix(P.Stress.GetData(), P.Stress.Num() * sizeof(float));
+    Mix(P.State.GetData(), P.State.Num() * sizeof(ETreeState));
+    Mix(P.RngState.GetData(), P.RngState.Num() * sizeof(uint32));
+    Mix(WaterPool.Current.Data.GetData(), WaterPool.Current.Data.Num() * sizeof(float));
+    Mix(NutrientPool.Current.Data.GetData(), NutrientPool.Current.Data.Num() * sizeof(float));
+    UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Fingerprint 0x%08X | Pop %d"), TickCount, H, Agents_Read.Num());
+}
+void UEcosystemSubsystem::LogFiniteCheck() const
+{
+    int32 Bad = 0;
+    auto Scan = [&Bad](const TArray<float>& A, const TCHAR* N) {
+        for (int32 i = 0; i < A.Num(); ++i) if (!FMath::IsFinite(A[i])) {
+            UE_LOG(LogEco, Error, TEXT("[Eco] NO-FINITO en %s[%d]=%f"), N, i, A[i]); ++Bad; break;
+        } };
+    Scan(Agents_Read.Biomass, TEXT("Biomass")); Scan(Agents_Read.Height, TEXT("Height"));
+    Scan(Agents_Read.Stress, TEXT("Stress"));
+    Scan(WaterPool.Current.Data, TEXT("Water")); Scan(NutrientPool.Current.Data, TEXT("Nutrient"));
+    Scan(LightCoarse.Shadow, TEXT("LightShadow"));
+    if (!Bad) UE_LOG(LogEco, Log, TEXT("[Eco] CheckFinite OK (0 no-finitos)."));
+}
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
 // ---------------------------------------------------------------------------
@@ -164,8 +200,14 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     // 2) Campos base (Fase 1): potencial del terreno, calculado una sola vez.
     //    Ambos comparten geometria con HeightField (mismo Width/Height/CellSize/Origin),
     //    asi que WaterPool y NutrientPool acaban con el mismo numero de celdas.
-    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);     
-    
+    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);  
+
+    auto LogRange = [](const FField2D& F, const TCHAR* N){
+    float Mn=TNumericLimits<float>::Max(), Mx=-Mn;
+    for (float V : F.Data){ Mn=FMath::Min(Mn,V); Mx=FMath::Max(Mx,V); }
+    UE_LOG(LogEco, Log, TEXT("[Eco] Campo %s: min=%.3f max=%.3f (%d celdas)"), N, Mn, Mx, F.Data.Num()); };
+    LogRange(WaterBase.Field, TEXT("Agua"));  LogRange(NutrientBase.Field, TEXT("Nutrientes"));
+
     NutrientBase.GeneratePatchyBase(HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
         HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed),S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);   
       
@@ -357,6 +399,8 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // WaterPool.Current, NutrientPool.Current, LightCoarse) y SOLO escribe
     // en su porcion de Agents_Write y en su propio FTickScratch.
     // ================================================================
+    const EParallelForFlags Flags = CVarForceST.GetValueOnGameThread()
+        ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None;
     ParallelFor(NumChunks, [&](int32 ChunkIndex)
         {
             int32 Begin, End;
@@ -436,7 +480,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     }
                 }
             }
-        });
+        }, Flags);
 
     // ================================================================
     // PASO 3 (serial): reduccion -> regeneracion -> pulsos de muerte -> germinacion.
@@ -811,19 +855,28 @@ void UEcosystemSubsystem::PaintVigorField()
 {
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     const USpeciesData* Sp = ResolveSpecies((uint16)FMath::Max(0, S->HeatmapSpeciesIndex));
-    if (!FieldViz || !Sp || !HeightField.IsValid()) { return; }
-
-    FField2D Suitability;
-    EcoVigor::BakeSuitabilityField(
-        HeightField, WaterBase, NutrientBase, LightCoarse, *Sp,
-        S->LightHalfSaturationMax,   // <-- el MISMO Kl que usa el tick (no KlMax)
-        Suitability);
-
-    FieldViz->UpdateFromField(Suitability.Data);
+    if (!FieldViz || !Sp || !HeightField.IsValid()) return;
+    FField2D Suit;
+    EcoVigor::BakeSuitabilityField(HeightField, WaterBase, NutrientBase, LightCoarse,
+        *Sp, S->LightHalfSaturationMax /* el mismo Kl que el tick */, Suit);
+    FieldViz->UpdateFromField(Suit.Data);
     EnsureHeatmapDecal();
     UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de vigor (%s) pintado."), *Sp->SpeciesName.ToString());
 }
-
+void UEcosystemSubsystem::PaintLightField()
+{
+    if (!FieldViz || !HeightField.IsValid()) return;
+    const FField2D& R = HeightField.Field;
+    TArray<float> L; L.SetNumUninitialized(R.Width * R.Height);
+    for (int32 y = 0; y < R.Height; ++y) for (int32 x = 0; x < R.Width; ++x) {
+        const double Xc = R.Origin.X + x * R.CellSize, Yc = R.Origin.Y + y * R.CellSize;
+        const float  Z = HeightField.SampleHeight(Xc, Yc);
+        L[y * R.Width + x] = LightCoarse.SampleLightSmooth(FVector(Xc, Yc, Z));
+    }
+    FieldViz->UpdateFromField(L);
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de luz (ras de suelo) pintado."));
+}
 void UEcosystemSubsystem::EnsureHeatmapDecal()
 {
     UWorld* World = GetWorld();

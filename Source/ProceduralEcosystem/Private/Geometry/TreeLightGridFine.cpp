@@ -28,9 +28,9 @@ void FTreeLightGridFine::InitForBounds(const FBox& WorldBounds, float InVoxelSiz
     const FVector Size = (Max - Min).ComponentMax(FVector(VoxelSizeCm)); // al menos 1 voxel por eje
 
     OriginWorld = Min;
-    Width = FMath::Clamp(FMath::CeilToInt(Size.X / VoxelSizeCm), 1, MaxVoxelsPerAxis);
-    Height = FMath::Clamp(FMath::CeilToInt(Size.Y / VoxelSizeCm), 1, MaxVoxelsPerAxis);
-    Layers = FMath::Clamp(FMath::CeilToInt(Size.Z / VoxelSizeCm), 1, MaxVoxelsPerAxis);
+    Width = FMath::Clamp(FMath::CeilToInt32(Size.X / VoxelSizeCm), 1, MaxVoxelsPerAxis);
+    Height = FMath::Clamp(FMath::CeilToInt32(Size.Y / VoxelSizeCm), 1, MaxVoxelsPerAxis);
+    Layers = FMath::Clamp(FMath::CeilToInt32(Size.Z / VoxelSizeCm), 1, MaxVoxelsPerAxis);
 
     Shadow.Reset();
     Shadow.SetNumZeroed(Width * Height * Layers);
@@ -121,9 +121,9 @@ void FTreeLightGridFine::DepositLeafShadow(const FTreeSkeleton& Skeleton, float 
 
 void FTreeLightGridFine::WorldToVoxelClamped(const FVector& WorldPos, int32& OutIx, int32& OutIy, int32& OutIz) const
 {
-    OutIx = FMath::Clamp(FMath::FloorToInt((WorldPos.X - OriginWorld.X) / VoxelSizeCm), 0, Width - 1);
-    OutIy = FMath::Clamp(FMath::FloorToInt((WorldPos.Y - OriginWorld.Y) / VoxelSizeCm), 0, Height - 1);
-    OutIz = FMath::Clamp(FMath::FloorToInt((WorldPos.Z - OriginWorld.Z) / VoxelSizeCm), 0, Layers - 1);
+    OutIx = FMath::Clamp(FMath::FloorToInt32((WorldPos.X - OriginWorld.X) / VoxelSizeCm), 0, Width - 1);
+    OutIy = FMath::Clamp(FMath::FloorToInt32((WorldPos.Y - OriginWorld.Y) / VoxelSizeCm), 0, Height - 1);
+    OutIz = FMath::Clamp(FMath::FloorToInt32((WorldPos.Z - OriginWorld.Z) / VoxelSizeCm), 0, Layers - 1);
 }
 
 float FTreeLightGridFine::SampleShadowNearest(const FVector& WorldPos) const

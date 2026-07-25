@@ -65,12 +65,14 @@ public:
     void AddDebugAgent(const FVector& WorldPos, const FColor& Color, float Radius);
     void AddRandomDebugAgent();
     void ClearDebugAgents();
-
+    void LogStateFingerprint() const;
+    void LogFiniteCheck() const;
     // --- Heatmaps ---
     void PaintTestField();
     void PaintWaterField();
     void PaintNutrientField();
     void PaintVigorField();
+    void PaintLightField();
     // --- Poblacion (Fase 2) ---
     /** Siembra Count plantulas aleatorias sobre el terreno (consola: Eco.SeedForest). */
     void SeedInitialPopulation(int32 Count);
@@ -91,6 +93,7 @@ private:
     void DrawDebug();
     void EnsureHeatmapDecal();
     void LogPopulationStats() const;
+   
     const USpeciesData* ResolveSpecies(uint16 SpeciesId) const;
 
     // --- Estado de tiempo ---

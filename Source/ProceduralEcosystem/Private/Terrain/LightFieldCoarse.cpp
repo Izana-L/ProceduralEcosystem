@@ -6,7 +6,7 @@ void FLightFieldCoarse::Init(int32 InWidth, int32 InHeight, int32 InLayers,
 {
     Width = FMath::Max(1, InWidth);
     Height = FMath::Max(1, InHeight);
-    Layers = FMath::Max(1, InLayers);
+    Layers = FMath::Clamp(InLayers, 1, 512);
     CellSizeXY = InCellSizeXY;
     CellSizeZ = InCellSizeZ;
     Origin = InOrigin;
@@ -26,9 +26,9 @@ void FLightFieldCoarse::ClearShadow()
 
 void FLightFieldCoarse::WorldToVoxelClamped(const FVector& WorldPos, int32& OutIx, int32& OutIy, int32& OutIz) const
 {
-    const int32 ix = FMath::FloorToInt((WorldPos.X - Origin.X) / CellSizeXY);
-    const int32 iy = FMath::FloorToInt((WorldPos.Y - Origin.Y) / CellSizeXY);
-    const int32 iz = FMath::FloorToInt((WorldPos.Z - BaseZ) / CellSizeZ);
+    const int32 ix = FMath::FloorToInt32((WorldPos.X - Origin.X) / CellSizeXY);
+    const int32 iy = FMath::FloorToInt32((WorldPos.Y - Origin.Y) / CellSizeXY);
+    const int32 iz = FMath::FloorToInt32((WorldPos.Z - BaseZ) / CellSizeZ);
 
     OutIx = FMath::Clamp(ix, 0, Width - 1);
     OutIy = FMath::Clamp(iy, 0, Height - 1);
@@ -42,18 +42,18 @@ void FLightFieldCoarse::DepositCanopyShadow(const FVector& ApexWorldPos, float C
 
     // Rango de capas Z afectadas: desde la capa de la copa hasta CanopyDepthCm
     // por debajo. Fuera de ese rango, la sombra de esta copa es 0.
-    const int32 izTop = FMath::Clamp(
-        FMath::FloorToInt((ApexWorldPos.Z - BaseZ) / CellSizeZ), 0, Layers - 1);
-    const int32 izBottom = FMath::Clamp(
-        FMath::FloorToInt((ApexWorldPos.Z - CanopyDepthCm - BaseZ) / CellSizeZ), 0, Layers - 1);
+    const int32 izTop = FMath::Clamp(FMath::FloorToInt32((ApexWorldPos.Z - BaseZ) / CellSizeZ), 0, Layers - 1);
+       
+    const int32 izBottom = FMath::Clamp(FMath::FloorToInt32((ApexWorldPos.Z - CanopyDepthCm - BaseZ) / CellSizeZ), 0, Layers - 1);
+        
 
     // El radio maximo posible (en el fondo del rango) acota que columnas
     // ix/iy merece la pena visitar, para no recorrer toda la rejilla.
     const float MaxRadiusCm = CanopyRadiusCm * 2.f; // ensanchamiento maximo (ver bucle)
-    const int32 ixMin = FMath::Clamp(FMath::FloorToInt((ApexWorldPos.X - MaxRadiusCm - Origin.X) / CellSizeXY), 0, Width - 1);
-    const int32 ixMax = FMath::Clamp(FMath::CeilToInt((ApexWorldPos.X + MaxRadiusCm - Origin.X) / CellSizeXY), 0, Width - 1);
-    const int32 iyMin = FMath::Clamp(FMath::FloorToInt((ApexWorldPos.Y - MaxRadiusCm - Origin.Y) / CellSizeXY), 0, Height - 1);
-    const int32 iyMax = FMath::Clamp(FMath::CeilToInt((ApexWorldPos.Y + MaxRadiusCm - Origin.Y) / CellSizeXY), 0, Height - 1);
+    const int32 ixMin = FMath::Clamp(FMath::FloorToInt32((ApexWorldPos.X - MaxRadiusCm - Origin.X) / CellSizeXY), 0, Width - 1);
+    const int32 ixMax = FMath::Clamp(FMath::CeilToInt32((ApexWorldPos.X + MaxRadiusCm - Origin.X) / CellSizeXY), 0, Width - 1);
+    const int32 iyMin = FMath::Clamp(FMath::FloorToInt32((ApexWorldPos.Y - MaxRadiusCm - Origin.Y) / CellSizeXY), 0, Height - 1);
+    const int32 iyMax = FMath::Clamp(FMath::CeilToInt32((ApexWorldPos.Y + MaxRadiusCm - Origin.Y) / CellSizeXY), 0, Height - 1);
 
     for (int32 iz = izTop; iz >= izBottom; --iz)
     {
@@ -109,9 +109,9 @@ float FLightFieldCoarse::SampleLightSmooth(const FVector& WorldPos) const
     const double v = (WorldPos.Y - Origin.Y) / CellSizeXY - 0.5;
     const double w = (WorldPos.Z - BaseZ) / CellSizeZ - 0.5;
 
-    const int32 x0 = FMath::FloorToInt(u);
-    const int32 y0 = FMath::FloorToInt(v);
-    const int32 z0 = FMath::FloorToInt(w);
+    const int32 x0 = FMath::FloorToInt32(u);
+    const int32 y0 = FMath::FloorToInt32(v);
+    const int32 z0 = FMath::FloorToInt32(w);
     const float fx = static_cast<float>(u - x0);
     const float fy = static_cast<float>(v - y0);
     const float fz = static_cast<float>(w - z0);

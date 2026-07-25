@@ -87,9 +87,9 @@ struct PROCEDURALECOSYSTEM_API FAttractorCloud
             return;
         }
 
-        const int32 Cx = FMath::FloorToInt((P.X - GridOrigin.X) / CellSize);
-        const int32 Cy = FMath::FloorToInt((P.Y - GridOrigin.Y) / CellSize);
-        const int32 Cz = FMath::FloorToInt((P.Z - GridOrigin.Z) / CellSize);
+        const int32 Cx = FMath::FloorToInt32((P.X - GridOrigin.X) / CellSize);
+        const int32 Cy = FMath::FloorToInt32((P.Y - GridOrigin.Y) / CellSize);
+        const int32 Cz = FMath::FloorToInt32((P.Z - GridOrigin.Z) / CellSize);
         const int32 R = FMath::CeilToInt(Radius / CellSize);
 
         for (int32 Dz = -R; Dz <= R; ++Dz)

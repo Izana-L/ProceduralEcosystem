@@ -118,11 +118,11 @@ namespace SpaceColonization
         OutSkeleton.Reset();
         OutSkeleton.Reserve(OutAttractors.Num() * 2 + 16);
         OutSkeleton.InitRoot(TrunkBaseWorld, FVector::UpVector);
-        // Tronco desnudo: encadena nodos hacia arriba hasta la base de la copa, para
-        // que el nodo mas alto ya "vea" los atractores mas bajos dentro de d_i.
+        // Tronco desnudo: encadena nodos hacia arriba hasta la base de la copa,
+        // para que el nodo mas alto ya vea los atractores mas bajos dentro de d_i.
         const float TrunkFrac = FMath::Clamp(Species.TrunkFraction, 0.f, 0.95f);
         const float CrownBaseZ = TrunkBaseWorld.Z + Species.CrownHeightCm * TrunkFrac / (1.f - TrunkFrac);
-        int32 TrunkTip = 0; // el nodo raiz
+        int32 TrunkTip = 0;
         while (OutSkeleton.Nodes[TrunkTip].Pos.Z + D < CrownBaseZ)
         {
             const FVector NextPos = OutSkeleton.Nodes[TrunkTip].Pos + FVector(0.f, 0.f, D);

@@ -62,8 +62,8 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
     /** Celda (cx,cy) -> indice lineal, con clamp a los bordes del grid. */
     FORCEINLINE int32 CellOf(const FVector& P) const
     {
-        const int32 Cx = FMath::Clamp(FMath::FloorToInt((P.X - Origin.X) / CellSize), 0, GridW - 1);
-        const int32 Cy = FMath::Clamp(FMath::FloorToInt((P.Y - Origin.Y) / CellSize), 0, GridH - 1);
+        const int32 Cx = FMath::Clamp(FMath::CeilToInt32((P.X - Origin.X) / CellSize), 0, GridW - 1);
+        const int32 Cy = FMath::Clamp(FMath::CeilToInt32((P.Y - Origin.Y) / CellSize), 0, GridH - 1);
         return Cy * GridW + Cx;
     }
 
@@ -90,9 +90,9 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
             return;
         }
 
-        const int32 Cx = FMath::FloorToInt((P.X - Origin.X) / CellSize);
-        const int32 Cy = FMath::FloorToInt((P.Y - Origin.Y) / CellSize);
-        const int32 R = FMath::CeilToInt(Radius / CellSize);
+        const int32 Cx = FMath::FloorToInt32((P.X - Origin.X) / CellSize);
+        const int32 Cy = FMath::FloorToInt32((P.Y - Origin.Y) / CellSize);
+        const int32 R = FMath::CeilToInt32(Radius / CellSize);
 
         for (int32 Dy = -R; Dy <= R; ++Dy)
         {
