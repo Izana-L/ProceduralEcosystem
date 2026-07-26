@@ -101,11 +101,12 @@ void FAttractorCloud::BuildIndex(float InCellSize)
         Bounds += A.Pos;
     }
     GridOrigin = Bounds.Min;
-
+    constexpr int32 MaxCellsPerAxis = 256;
     const FVector Size = (Bounds.Max - Bounds.Min).ComponentMax(FVector(CellSize)); // >=1 celda/eje
-    GridW = FMath::Max(1, FMath::CeilToInt32(Size.X / CellSize));
-    GridH = FMath::Max(1, FMath::CeilToInt32(Size.Y / CellSize));
-    GridD = FMath::Max(1, FMath::CeilToInt32(Size.Z / CellSize));
+    
+    GridW = FMath::Clamp(FMath::CeilToInt32(Size.X / CellSize), 1, MaxCellsPerAxis);
+    GridH = FMath::Clamp(FMath::CeilToInt32(Size.Y / CellSize), 1, MaxCellsPerAxis);
+    GridD = FMath::Clamp(FMath::CeilToInt32(Size.Z / CellSize), 1, MaxCellsPerAxis);
 
     // Counting sort (CSR): contar, prefijo acumulado, volcar. O(N). Orden fijo.
     const int32 NC = GridW * GridH * GridD;

@@ -202,15 +202,14 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     //    asi que WaterPool y NutrientPool acaban con el mismo numero de celdas.
     WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);  
 
-    auto LogRange = [](const FField2D& F, const TCHAR* N){
-    float Mn=TNumericLimits<float>::Max(), Mx=-Mn;
-    for (float V : F.Data){ Mn=FMath::Min(Mn,V); Mx=FMath::Max(Mx,V); }
-    UE_LOG(LogEco, Log, TEXT("[Eco] Campo %s: min=%.3f max=%.3f (%d celdas)"), N, Mn, Mx, F.Data.Num()); };
-    LogRange(WaterBase.Field, TEXT("Agua"));  LogRange(NutrientBase.Field, TEXT("Nutrientes"));
-
     NutrientBase.GeneratePatchyBase(HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
         HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed),S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);   
       
+    auto LogRange = [](const FField2D& F, const TCHAR* N) {
+        float Mn = TNumericLimits<float>::Max(), Mx = -Mn;
+        for (float V : F.Data) { Mn = FMath::Min(Mn, V); Mx = FMath::Max(Mx, V); }
+        UE_LOG(LogEco, Log, TEXT("[Eco] Campo %s: min=%.3f max=%.3f (%d celdas)"), N, Mn, Mx, F.Data.Num()); };
+    LogRange(WaterBase.Field, TEXT("Agua"));  LogRange(NutrientBase.Field, TEXT("Nutrientes"));
 
     // 3) Estado runtime (Fase 2): los pools arrancan llenos al nivel del base.
     WaterPool.InitFromBase(WaterBase.Field);
@@ -297,9 +296,7 @@ TStatId UEcosystemSubsystem::GetStatId() const
 
 float UEcosystemSubsystem::GetInterpolationAlpha() const
 {
-    return SecondsPerTick > 0.f
-        ? FMath::Clamp(static_cast<float>(Accumulator) / SecondsPerTick, 0.f, 1.f)
-        : 0.f;
+    return SecondsPerTick > 0.f? FMath::Clamp(static_cast<float>(Accumulator) / SecondsPerTick, 0.f, 1.f) : 0.f;     
 }
 
 // ---------------------------------------------------------------------------

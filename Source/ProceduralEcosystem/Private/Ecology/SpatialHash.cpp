@@ -18,7 +18,13 @@ void FSpatialHash::Build(const TArray<FVector>& Pos, int32 Num)
     check(Num <= Pos.Num());
 
     const int32 NumCells = GridW * GridH;
+    // SetNumZeroed solo cera los elementos NUEVOS: si el array ya tiene
+    // NumCells+1 elementos (todo tick despues del primero), conservaria los
+    // prefijos del tick anterior. Reset() mantiene la capacidad, asi que el
+    // SetNumZeroed siguiente re-cera todo el rango sin realojar.
+    CellStart.Reset();
     CellStart.SetNumZeroed(NumCells + 1);
+
 
     // Pasada 1: contar cuantos agentes caen en cada celda (histograma).
     for (int32 i = 0; i < Num; ++i)
