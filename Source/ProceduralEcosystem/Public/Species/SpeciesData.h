@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
 #include "SpeciesData.generated.h"
+class UMaterialInterface;
 
 
 
@@ -182,14 +183,31 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "0", ClampMax = "1"))
     float LeafDensity = 0.8f;
 
-    // --- Placeholders para fases posteriores ---
-  
-    // Fase 4 (LOD): NVariants, número de buckets de edad...
+    // ================================================================
+    // --- LOD y librería de arquetipos (Fase 4) ---
+    // ================================================================
+    // 3 especies × 5 buckets × 4 variantes = 60 mallas horneadas UNA vez que
+    // representan a los 20.000 árboles (doc. §4.2). El nº de buckets es global
+    // (Project Settings): define la escala común de tamaños.
 
-    virtual FPrimaryAssetId GetPrimaryAssetId() const override
-    {
-        return FPrimaryAssetId(TEXT("Species"), GetFName());
-    }
+    /** Variantes morfológicas por especie: más = menos repetición, más memoria. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD", meta = (ClampMin = "1", ClampMax = "16"))
+    int32 NumLodVariants = 4;
+
+    /** Material de la corteza (sección 0 de la malla horneada y del hero tree). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD")
+    TObjectPtr<UMaterialInterface> BarkMaterial;
+
+    /** Material del follaje (sección 1): two-sided + masked + subsurface. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD")
+    TObjectPtr<UMaterialInterface> LeafMaterial;
+
+    /** Material del impostor de campo lejano. Si es null se reutiliza
+        LeafMaterial (funciona, se ve mal): el atlas se hornea con el plugin
+        Impostor Baker cuando llegues al pulido. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD")
+    TObjectPtr<UMaterialInterface> ImpostorMaterial;
+
 
 #if WITH_EDITOR
     /** Validación de datos: avisa de configuraciones incoherentes al editar el asset. */

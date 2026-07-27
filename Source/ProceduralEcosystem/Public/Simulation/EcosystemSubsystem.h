@@ -88,6 +88,17 @@ public:
 
     /** Destruye todos los hero trees generados. */
     void ClearHeroTrees();
+
+    // --- Acceso de solo lectura para la capa de render (Fase 4) ---
+    // La poblacion es la UNICA fuente de verdad (doc. 0, "Propiedad de los
+    // datos"); el gestor de LOD elige representacion sin tocar la simulacion.
+    const FTreePopulation& GetPopulation() const { return Agents_Read; }
+    const TArray<TObjectPtr<USpeciesData>>& GetSpeciesList() const { return ResolvedSpecies; }
+    const USpeciesData* GetSpeciesById(uint16 SpeciesId) const { return ResolveSpecies(SpeciesId); }
+
+    /** true cuando el relieve y los campos ya estan listos (gatea el render). */
+    bool IsWorldReady() const { return bWorldReady; }
+
 private:
     void SimulateTick(float DtYears);
     void DrawDebug();

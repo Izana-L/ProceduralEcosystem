@@ -1,0 +1,139 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/Object.h"
+#include "Render/TreeArchetype.h"
+#include "TreeLibrary.generated.h"
+
+class AActor;
+class UStaticMesh;
+class USpeciesData;
+class UHierarchicalInstancedStaticMeshComponent;
+
+/** Ajustes de la libreria (los rellena el gestor de LOD desde UEcosystemSettings). */
+struct FTreeLibraryConfig
+{
+    int32 NumAgeBuckets = 5;
+    int32 NumInstanceCustomDataFloats = 1; // 1 float por instancia -> fase estacional (Fase 5)
+    bool  bInstancesCastShadow = true;
+    bool  bImpostorsCastShadow = false;    // doc. 4.6: que la sombra lejana la ponga el HLOD
+    float InstanceEndCullDistanceCm = 0.f; // 0 = sin cull por distancia del propio ISM
+    float ImpostorEndCullDistanceCm = 0.f;
+};
+
+/**
+ * Una entrada de la libreria: la malla horneada de un arquetipo, su impostor y
+ * los dos componentes de instancing (malla e impostor) con su bookkeeping.
+ *
+ * MeshMapping[i] = StableId del arbol que ocupa la instancia i del componente.
+ * Es el inverso de FTreeRenderState::InstanceIndex y lo que permite arreglar los
+ * indices tras un borrado por lotes (ver TreeInstancing::CompactMappingAfterRemoval).
+ */
+USTRUCT()
+struct FTreeArchetypeEntry
+{
+    GENERATED_BODY()
+
+    UPROPERTY(Transient) TObjectPtr<UStaticMesh> Mesh = nullptr;
+    UPROPERTY(Transient) TObjectPtr<UStaticMesh> ImpostorMesh = nullptr;
+    UPROPERTY(Transient) TObjectPtr<UHierarchicalInstancedStaticMeshComponent> MeshISM = nullptr;
+    UPROPERTY(Transient) TObjectPtr<UHierarchicalInstancedStaticMeshComponent> ImpostorISM = nullptr;
+
+    // Bookkeeping (no reflejado: son datos calientes de la capa de render).
+    TArray<uint32> MeshMapping;
+    TArray<uint32> ImpostorMapping;
+
+    float BakedHeightCm = 0.f;
+    int32 WoodTriangles = 0;
+    int32 LeafTriangles = 0;
+    bool  bBaked = false;
+};
+
+/**
+ * Libreria de arquetipos (doc. Fase 4, 4.2).
+ *
+ * Responsabilidades:
+ *   1. Derivar, por arquetipo, una USpeciesData con la morfologia escalada al
+ *      bucket y perturbada por la variante (fabrica de parametros).
+ *   2. Hornear su malla con la Fase 3 (SCA -> mallador -> UStaticMesh) UNA vez,
+ *      con semilla fija -> libreria reproducible.
+ *   3. Crear y servir el componente ISM/HISM de cada arquetipo (un componente
+ *      por malla = un draw call por arquetipo, no por arbol).
+ *
+ * NO decide que arbol se dibuja como que: eso es del gestor de LOD
+ * (UTreeRenderSubsystem). Aqui solo hay activos y su ciclo de vida.
+ *
+ * El horneado es AMORTIZADO: FindOrRequestBake encola y ProcessBakeQueue hornea
+ * como mucho N por frame, para no meter un hitch de segundos al arrancar
+ * (Apendice B, riesgo Medio de generacion en el game thread).
+ */
+UCLASS()
+class PROCEDURALECOSYSTEM_API UTreeLibrary : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    /** InHost debe estar en la identidad (ver ATreeInstanceHost). */
+    void Initialize(AActor* InHost, const TArray<TObjectPtr<USpeciesData>>& InSpecies,
+        const FTreeLibraryConfig& InConfig);
+    void Shutdown();
+
+    bool IsInitialized() const { return Host != nullptr; }
+
+    /**
+     * Especie DERIVADA del arquetipo: duplicado transitorio de la especie base
+     * con la morfologia escalada al bucket y con el jitter estable de la
+     * variante. La usan tanto el horneado de la libreria como los hero trees,
+     * de modo que un hero y su instancia son "la misma familia" de arbol.
+     */
+    const USpeciesData* GetArchetypeSpecies(const FArchetypeKey& Key);
+
+    /** Entrada ya horneada, o nullptr. */
+    FTreeArchetypeEntry* Find(const FArchetypeKey& Key);
+
+    /** Igual que Find, pero si no existe encola el horneado (devuelve nullptr esta vez). */
+    FTreeArchetypeEntry* FindOrRequestBake(const FArchetypeKey& Key);
+
+    /** Hornea como mucho MaxThisFrame arquetipos pendientes. Devuelve cuantos hizo. */
+    int32 ProcessBakeQueue(int32 MaxThisFrame);
+
+    /** Hornea de golpe toda la libreria (especies x buckets x variantes). Devuelve cuantas mallas. */
+    int32 BakeAll();
+
+    /** Componente de instancing del arquetipo, creandolo la primera vez. */
+    UHierarchicalInstancedStaticMeshComponent* GetOrCreateComponent(const FArchetypeKey& Key, bool bImpostor);
+
+    /** Vacia todas las instancias de todos los componentes (las mallas se conservan). */
+    void ClearAllInstances();
+
+    int32 GetNumBakedArchetypes() const { return Entries.Num(); }
+    int32 GetNumPendingBakes() const { return BakeQueue.Num(); }
+    int32 GetNumAgeBuckets() const { return Config.NumAgeBuckets; }
+
+    /** Recuento agregado para Eco.LOD.Stats. */
+    void GetStats(int32& OutMeshes, int32& OutComponents, int32& OutInstances, int32& OutTriangles) const;
+
+    const TMap<uint32, FTreeArchetypeEntry>& GetEntries() const { return Entries; }
+
+private:
+    bool BakeArchetype(const FArchetypeKey& Key);
+    const USpeciesData* GetBaseSpecies(uint16 SpeciesId) const;
+
+    /** Semilla fija del arquetipo: misma libreria en cada arranque (doc. 3.8). */
+    static uint32 ArchetypeSeed(const FArchetypeKey& Key)
+    {
+        return EcoRand::Hash32(0xB5297A4Du ^ (Key.Pack() * 2654435761u));
+    }
+
+    UPROPERTY(Transient) TObjectPtr<AActor> Host = nullptr;
+    UPROPERTY(Transient) TArray<TObjectPtr<USpeciesData>> BaseSpecies;
+
+    /** Clave = FArchetypeKey::Pack(). */
+    UPROPERTY(Transient) TMap<uint32, FTreeArchetypeEntry> Entries;
+    UPROPERTY(Transient) TMap<uint32, TObjectPtr<USpeciesData>> ArchetypeSpecies;
+
+    FTreeLibraryConfig Config;
+
+    TArray<uint32> BakeQueue;
+    TSet<uint32>   BakeQueued;
+};

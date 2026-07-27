@@ -172,6 +172,78 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
     int32 TickChunkGrainSize = 512;
 
+    // ================================================================
+    // --- Render y LOD (Fase 4): el puente de escala ---
+    // ================================================================
+
+    /** Interruptor maestro de la capa de render instanciada. Apagado = solo
+        simulación + esferas de debug (útil para la ablación de la Fase 7). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
+    bool bEnableTreeRendering = true;
+
+    /** Buckets de tamaño por especie (doc. Apéndice A: p.ej. 5). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "1", ClampMax = "32"))
+    int32 NumAgeBuckets = 5;
+
+    /** Histéresis del cambio de bucket, en fracción de bucket. Evita que un
+        árbol parado en el borde haga add/remove de instancia cada tick. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0", ClampMax = "0.49"))
+    float BucketHysteresis = 0.15f;
+
+    /** R_hero: radio (cm) dentro del cual un árbol puede ser hero (SCA en vivo). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0"))
+    float HeroRadiusCm = 6000.f;   // 60 m
+
+    /** Nº máximo de hero trees simultáneos (working set pequeño: decenas). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0"))
+    int32 HeroBudget = 24;
+
+    /** Hero trees generados por frame: amortiza los ms de SCA para no dar hitches. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "1"))
+    int32 MaxHeroPerFrame = 1;
+
+    /** R_impostor: a partir de aquí (cm) se dibuja el impostor en vez de la malla. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0"))
+    float ImpostorRadiusCm = 25000.f;   // 250 m
+
+    /** Más allá de esto (cm) el árbol no se dibuja (lo cubriría el HLOD de World Partition). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0"))
+    float CullRadiusCm = 120000.f;      // 1.2 km
+
+    /** Cadencia del re-nivelado completo. Los árboles se mueven despacio
+        respecto a la cámara: no hace falta cada frame (doc. §4.3). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "1"))
+    int32 RelevelEveryNFrames = 5;
+
+    /** Jitter de tamaño por instancia (doc. Apéndice A: 0.9-1.1 -> 0.1). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0", ClampMax = "0.5"))
+    float InstanceScaleJitter = 0.1f;
+
+    /** Cambio mínimo de escala para molestarse en actualizar la instancia. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0"))
+    float ScaleUpdateThreshold = 0.02f;
+
+    /** Arquetipos horneados por frame cuando se piden bajo demanda. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "1"))
+    int32 MaxBakesPerFrame = 2;
+
+    /** Hornear TODA la librería al arrancar (hitch inicial de ~1 s, cero después).
+        Recomendado para demos y para medir framerate sin ruido. */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
+    bool bPrebakeLibraryOnStart = false;
+
+    /** Las instancias cercanas proyectan sombra (VSM). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
+    bool bInstancesCastShadow = true;
+
+    /** Los impostors NO deberían proyectar sombra: que lo haga el proxy HLOD (doc. §4.6). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
+    bool bImpostorsCastShadow = false;
+
+    /** Floats de PerInstanceCustomData (1 = fase estacional por árbol, gancho de la Fase 5). */
+    UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0", ClampMax = "4"))
+    int32 NumInstanceCustomDataFloats = 1;
+
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")
     TArray<TSoftObjectPtr<USpeciesData>> Species;

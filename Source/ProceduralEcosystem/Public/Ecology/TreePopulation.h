@@ -46,7 +46,11 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     TArray<float>   Stress;     // acumulador [0..1]
     TArray<ETreeState> State;
     TArray<uint32>  RngState;   // stream RNG propio del arbol -> determinismo bajo paralelismo
+    TArray<uint32>  StableId;
 
+    /** Siguiente id a repartir. Se copia en CopyFrom para que los ids de la
+        germinacion sobre el buffer de escritura sean deterministas. */
+    uint32 NextStableId = 1;
     /** Numero de arboles actualmente en el array (vivos + muertos sin compactar). */
     int32 Num() const { return Position.Num(); }
 

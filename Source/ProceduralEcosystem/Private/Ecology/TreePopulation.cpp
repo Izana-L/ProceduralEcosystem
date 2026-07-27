@@ -10,6 +10,7 @@ void FTreePopulation::Reset()
     Stress.Reset();
     State.Reset();
     RngState.Reset();
+    StableId.Reset();
 }
 
 void FTreePopulation::Reserve(int32 ExpectedNum)
@@ -22,6 +23,7 @@ void FTreePopulation::Reserve(int32 ExpectedNum)
     Stress.Reserve(ExpectedNum);
     State.Reserve(ExpectedNum);
     RngState.Reserve(ExpectedNum);
+    StableId.Reserve(ExpectedNum);
 }
 
 int32 FTreePopulation::Add(const FVector& InPosition, uint16 InSpeciesId, uint32 InRngState,
@@ -35,6 +37,7 @@ int32 FTreePopulation::Add(const FVector& InPosition, uint16 InSpeciesId, uint32
     Stress.Add(0.f);
     State.Add(ETreeState::Sapling);
     RngState.Add((InRngState != 0u) ? InRngState : 1u); // 0 es absorbente para xorshift32 (ver EcoCore)
+    StableId.Add(NextStableId++);
     return Index;
 }
 
@@ -59,6 +62,7 @@ int32 FTreePopulation::CompactDead()
             Stress[Write] = Stress[Read];
             State[Write] = State[Read];
             RngState[Write] = RngState[Read];
+            StableId[Write] = StableId[Read];
         }
         ++Write;
     }
@@ -71,6 +75,7 @@ int32 FTreePopulation::CompactDead()
     Stress.SetNum(Write, EAllowShrinking::No);
     State.SetNum(Write, EAllowShrinking::No);
     RngState.SetNum(Write, EAllowShrinking::No);
+    StableId.SetNum(Write, EAllowShrinking::No);
     checkSlow(Position.Num() == SpeciesId.Num() && 
               Position.Num() == Age.Num() &&
               Position.Num() == Biomass.Num() && 
@@ -91,4 +96,6 @@ void FTreePopulation::CopyFrom(const FTreePopulation& Src)
     Stress = Src.Stress;
     State = Src.State;
     RngState = Src.RngState;
+    StableId = Src.StableId;
+    NextStableId = Src.NextStableId;
 }
