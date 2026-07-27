@@ -76,13 +76,14 @@ int32 FTreePopulation::CompactDead()
     State.SetNum(Write, EAllowShrinking::No);
     RngState.SetNum(Write, EAllowShrinking::No);
     StableId.SetNum(Write, EAllowShrinking::No);
-    checkSlow(Position.Num() == SpeciesId.Num() && 
-              Position.Num() == Age.Num() &&
-              Position.Num() == Biomass.Num() && 
-              Position.Num() == Height.Num() &&
-              Position.Num() == Stress.Num() && 
-              Position.Num() == State.Num() &&
-              Position.Num() == RngState.Num());
+    checkSlow(  Position.Num() == SpeciesId.Num() &&
+                Position.Num() == Age.Num() &&
+                Position.Num() == Biomass.Num() &&
+                Position.Num() == Height.Num() &&
+                Position.Num() == Stress.Num() &&
+                Position.Num() == State.Num() &&
+                Position.Num() == RngState.Num() &&
+                Position.Num() == StableId.Num());
     return OldNum - Write;
 }
 

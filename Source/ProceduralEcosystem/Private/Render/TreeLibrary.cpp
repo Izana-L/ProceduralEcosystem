@@ -294,7 +294,13 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
     const float EndCull = bImpostor ? Config.ImpostorEndCullDistanceCm : Config.InstanceEndCullDistanceCm;
     if (EndCull > 0.f)
     {
-        Comp->SetCullDistances(0, FMath::RoundToInt(EndCull));
+        // El fade del ISM debe ser un backstop ESTRECHO justo antes del corte, no
+        // repartirse por todo el rango: con StartCull=0 las instancias se
+        // difuminan desde la distancia 0 (el bosque "ralea"). Arrancamos el fade
+        // en el 90% del cull para que no compita con la conmutacion de nivel.
+        const int32 End = FMath::RoundToInt(EndCull);
+        const int32 Start = FMath::RoundToInt(EndCull * 0.9f);
+        Comp->SetCullDistances(Start, End);
     }
 
     Comp->SetupAttachment(Host->GetRootComponent());

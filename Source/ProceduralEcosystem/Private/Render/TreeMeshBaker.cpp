@@ -133,7 +133,11 @@ namespace TreeMeshBaker
 
         return Mesh;
     }
-
+    // NOTA: esto es un CROSSBOARD fijo (2 tarjetas perpendiculares), no un
+    // impostor octaedrico ni billboard que encare camara. Es suficiente con una
+    // textura de follaje masked y es lo mas barato. Si en el pulido quieres el
+    // octaedrico del doc, hace falta UNA card orientada a camara + material con
+    // UV dependientes de la vista (Impostor Baker); esta geometria NO lo sirve.
     UStaticMesh* BuildImpostorMesh(UObject* Outer, const FBox& LocalBounds, UMaterialInterface* ImpostorMaterial)
     {
         if (!LocalBounds.IsValid)

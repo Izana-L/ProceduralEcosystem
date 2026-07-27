@@ -79,7 +79,13 @@ bool UTreeRenderSubsystem::DoesSupportWorldType(const EWorldType::Type WorldType
 {
     return WorldType == EWorldType::Game || WorldType == EWorldType::PIE;
 }
-
+void UTreeRenderSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+    // Resuelve el enable desde Project Settings ANTES de crear nada; la consola
+    // (Eco.LOD.Enable) puede sobreescribirlo en runtime.
+    bEnabled = UEcosystemSettings::Get()->bEnableTreeRendering;
+}
 void UTreeRenderSubsystem::Deinitialize()
 {
     ReleaseEverything();
@@ -139,7 +145,14 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     Library = NewObject<UTreeLibrary>(this);
     Library->Initialize(Host, Eco->GetSpeciesList(), Cfg);
 
-    bEnabled = S->bEnableTreeRendering;
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+
+    // Render desactivado: no crees Host ni libreria (la simulacion corre igual).
+    // Si se activa por consola, esta funcion se vuelve a llamar y si inicializa.
+    if (!bEnabled)
+    {
+        return false;
+    }
 
     if (S->bPrebakeLibraryOnStart && bEnabled)
     {
@@ -365,8 +378,31 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         FTreeRenderState& State = States.FindOrAdd(StableId);
         State.Stamp = VisitStamp;
 
+        // Arquetipo: bucket con histeresis + variante estable. (Se calcula ANTES
+         // que Want porque QueueHero necesita la Key.)
+        const float Ratio = TreeArchetype::HeightRatio(Pop.Biomass[i], Sp->MaxBiomass);
+        const int32 Bucket = TreeArchetype::BucketWithHysteresis(Ratio, State.Bucket, NumBuckets, S->BucketHysteresis);
+        const uint8 Variant = TreeArchetype::VariantOf(StableId, Sp->NumLodVariants);
+        const FArchetypeKey Key(Pop.SpeciesId[i], static_cast<uint8>(Bucket), Variant);
+
+        const float ScaleInBucket = TreeArchetype::ScaleWithinBucket(Ratio, Bucket, NumBuckets);
+        const FTransform Xform = TreeArchetype::InstanceTransform(
+            Pop.Position[i], StableId, ScaleInBucket, S->InstanceScaleJitter);
+
+        // Un arbol solo se DIBUJA como hero cuando su actor ya esta generado: si
+        // lo quiere pero aun no lo esta, conserva su instancia/impostor como
+        // respaldo (sin hueco) y encolamos la generacion amortiguada (doc 4.4).
+        const bool bWantsHero = HeroSet.Contains(StableId);
+        const FHeroSlot* HeroSlot = HeroActors.Find(StableId);
+        const bool bHeroActive = HeroSlot && HeroSlot->Actor && HeroSlot->bActive;
+
+        if (bWantsHero && (!bHeroActive || HeroSlot->GeneratedKey != Key.Pack()))
+        {
+            QueueHero(StableId, Key, Xform); // genera, o regenera EN SITIO si cambio de bucket
+        }
+
         const ETreeRenderTier Want =
-            HeroSet.Contains(StableId) ? ETreeRenderTier::Hero :
+            (bWantsHero && bHeroActive) ? ETreeRenderTier::Hero :
             (D2 < ImpR2) ? ETreeRenderTier::Instance :
             (D2 < CullR2) ? ETreeRenderTier::Impostor :
             ETreeRenderTier::None;
@@ -379,37 +415,33 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         default:                        ++NumCulled; break;
         }
 
-        // Arquetipo: bucket con histeresis + variante estable.
-        const float Ratio = TreeArchetype::HeightRatio(Pop.Biomass[i], Sp->MaxBiomass);
-        const int32 Bucket = TreeArchetype::BucketWithHysteresis(Ratio, State.Bucket, NumBuckets, S->BucketHysteresis);
-        const uint8 Variant = TreeArchetype::VariantOf(StableId, Sp->NumLodVariants);
-        const FArchetypeKey Key(Pop.SpeciesId[i], static_cast<uint8>(Bucket), Variant);
-
-        const float ScaleInBucket = TreeArchetype::ScaleWithinBucket(Ratio, Bucket, NumBuckets);
-        const FTransform Xform = TreeArchetype::InstanceTransform(
-            Pop.Position[i], StableId, ScaleInBucket, S->InstanceScaleJitter);
+        // Hero que sigue siendo hero: NUNCA lo bajamos/subimos (ocultar-remostrar
+        // parpadea). El cambio de bucket lo resuelve ProcessHeroQueue regenerando
+        // el actor en sitio (atomico); aqui solo seguimos la escala con umbral.
+        if (Want == ETreeRenderTier::Hero && State.Tier == ETreeRenderTier::Hero)
+        {
+            if (FMath::Abs(ScaleInBucket - State.LastScale) > S->ScaleUpdateThreshold)
+            {
+                if (FHeroSlot* Slot = HeroActors.Find(StableId))
+                {
+                    if (Slot->Actor) { Slot->Actor->SetActorScale3D(Xform.GetScale3D()); }
+                }
+                State.LastScale = ScaleInBucket;
+            }
+            State.PackedKey = Key.Pack();
+            State.Bucket = Bucket;
+            continue;
+        }
 
         const bool bTierChanged = (State.Tier != Want);
         const bool bKeyChanged = (State.PackedKey != Key.Pack());
 
         if (!bTierChanged && !bKeyChanged)
         {
-            // Caso COMUN con diferencia: nada que reorganizar, solo (quiza) la
-            // escala del que ha crecido. Con umbral, porque la mayoria no cambia
-            // de forma perceptible entre dos re-nivelados.
+            // Solo instancia/impostor: actualiza escala en lote con umbral.
             if (FMath::Abs(ScaleInBucket - State.LastScale) > S->ScaleUpdateThreshold)
             {
-                if (State.Tier == ETreeRenderTier::Hero)
-                {
-                    if (FHeroSlot* Slot = HeroActors.Find(StableId))
-                    {
-                        if (Slot->Actor)
-                        {
-                            Slot->Actor->SetActorScale3D(Xform.GetScale3D());
-                        }
-                    }
-                }
-                else if (State.InstanceIndex >= 0)
+                if (State.InstanceIndex >= 0)
                 {
                     const uint64 CompKey = MakeComponentKey(State.PackedKey, State.Tier == ETreeRenderTier::Impostor);
                     Pending.FindOrAdd(CompKey).Updates.Add(TPair<uint32, FTransform>(StableId, Xform));
@@ -482,12 +514,19 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
         State.Tier = ETreeRenderTier::Hero;
         State.PackedKey = Key.Pack();
 
-        FPendingHero Info;
-        Info.Key = Key;
-        Info.Position = Xform.GetLocation();
-        Info.Scale = static_cast<float>(Xform.GetScale3D().X);
-        HeroInfo.Add(StableId, Info);
-        HeroQueue.AddUnique(StableId);
+        // El actor ya esta generado y activo (Want=Hero lo exige): mostrarlo con
+        // la escala actual. Esta es la conmutacion atomica instancia->hero: la
+        // baja de la instancia la hizo LeaveTier justo antes, sin hueco.
+        if (FHeroSlot* Slot = HeroActors.Find(StableId))
+        {
+            if (Slot->Actor)
+            {
+                Slot->Actor->SetActorHiddenInGame(false);
+                Slot->Actor->SetActorScale3D(Xform.GetScale3D());
+                Slot->bActive = true;
+                Slot->LastUsedStamp = VisitStamp;
+            }
+        }
         return;
     }
 
@@ -499,14 +538,14 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
         // Aun no horneado: se queda sin representar y se reintentara en el
         // proximo re-nivelado (PackedKey = 0 fuerza que se vea como cambio).
         State.Tier = ETreeRenderTier::None;
-        State.PackedKey = 0;
+        State.PackedKey = Key.Pack();
         return;
     }
 
     if (!Library->GetOrCreateComponent(Key, bImpostor))
     {
         State.Tier = ETreeRenderTier::None;
-        State.PackedKey = 0;
+        State.PackedKey = Key.Pack();
         return;
     }
 
@@ -518,7 +557,21 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
     State.PackedKey = Key.Pack();
     State.InstanceIndex = -1; // lo asigna el flush
 }
+bool UTreeRenderSubsystem::IsHeroActive(uint32 StableId) const
+{
+    const FHeroSlot* Slot = HeroActors.Find(StableId);
+    return Slot && Slot->bActive && Slot->Actor != nullptr;
+}
 
+void UTreeRenderSubsystem::QueueHero(uint32 StableId, const FArchetypeKey& Key, const FTransform& Xform)
+{
+    FPendingHero Info;
+    Info.Key = Key;
+    Info.Position = Xform.GetLocation();
+    Info.Scale = static_cast<float>(Xform.GetScale3D().X);
+    HeroInfo.Add(StableId, Info);   // siempre la info mas reciente
+    HeroQueue.AddUnique(StableId);
+}
 /**
  * Aplica los cambios acumulados: UNA llamada de alta, UNA de baja y UNA
  * invalidacion de render state por componente (doc. 4.4).
@@ -574,25 +627,29 @@ void UTreeRenderSubsystem::FlushInstanceOps()
         if (Ops.AddXforms.Num() > 0)
         {
             const TArray<int32> NewIndices = Comp->AddInstances(Ops.AddXforms, /*bShouldReturnIndices*/ true);
+
+            // Pre-dimensiona el mapping UNA vez (los indices de AddInstances son
+            // contiguos al final del buffer): evita un SetNum por cada alta.
+            if (NewIndices.Num() > 0)
+            {
+                int32 MaxIndex = Mapping.Num() - 1;
+                for (int32 Idx : NewIndices) { MaxIndex = FMath::Max(MaxIndex, Idx); }
+                if (MaxIndex + 1 > Mapping.Num())
+                {
+                    Mapping.SetNum(MaxIndex + 1, EAllowShrinking::No);
+                }
+            }
+
             for (int32 k = 0; k < NewIndices.Num() && k < Ops.AddIds.Num(); ++k)
             {
                 const uint32 Id = Ops.AddIds[k];
                 const int32 Index = NewIndices[k];
-
-                if (!Mapping.IsValidIndex(Index))
-                {
-                    Mapping.SetNum(Index + 1, EAllowShrinking::No);
-                }
                 Mapping[Index] = Id;
 
                 if (FTreeRenderState* Added = States.Find(Id))
                 {
                     Added->InstanceIndex = Index;
                 }
-
-                // Dato por instancia: fase [0,1) estable por arbol. No se usa aun;
-                // es el gancho para desincronizar el ciclo estacional en la Fase 5
-                // sin draw calls extra (PerInstanceCustomData).
                 if (Comp->NumCustomDataFloats > 0)
                 {
                     Comp->SetCustomDataValue(Index, 0,
@@ -645,8 +702,7 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         }
 
         // Puede haber dejado de ser hero mientras esperaba en la cola.
-        const FTreeRenderState* State = States.Find(StableId);
-        if (!State || State->Tier != ETreeRenderTier::Hero)
+        if (!States.Contains(StableId) || !HeroSet.Contains(StableId))
         {
             continue;
         }

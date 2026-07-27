@@ -2,6 +2,7 @@
 #include "Core/EcoCore.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TreePopulation.h"
+#include "Render/TreeArchetype.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
@@ -56,5 +57,46 @@ bool FEcoMort::RunTest(const FString&) {
         }
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodBucket, "Eco.LOD.BucketEscala", EcoTestFlags)
+bool FEcoLodBucket::RunTest(const FString&) {
+    const int32 N = 5;
+    // Invariante del doc 4.2: escala_en_bucket * borde_superior == fraccion de altura.
+    for (int32 b = 0; b < N; ++b) {
+        const float upper = TreeArchetype::BucketUpperRatio(b, N);
+        const float r = upper - 0.01f; // dentro del bucket b, sin tocar el clamp inferior
+        TestEqual(TEXT("BucketOf coherente"), TreeArchetype::BucketOf(r, N), b);
+        const float scale = TreeArchetype::ScaleWithinBucket(r, b, N);
+        TestTrue(TEXT("escala continua al cruzar bucket"), FMath::IsNearlyEqual(scale * upper, r, 1e-3f));
+    }
+    return true;
+}
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodHysteresis, "Eco.LOD.Histeresis", EcoTestFlags)
+bool FEcoLodHysteresis::RunTest(const FString&) {
+    const int32 N = 5; const float H = 0.15f;
+    // Borde 3/5=0.6; banda = H/N = 0.03. En 0.61 NO cruza; en 0.64 (>0.63) si.
+    TestEqual(TEXT("no cruza dentro de la banda"), TreeArchetype::BucketWithHysteresis(0.61f, 2, N, H), 2);
+    TestEqual(TEXT("cruza superada la banda"), TreeArchetype::BucketWithHysteresis(0.64f, 2, N, H), 3);
+    for (uint32 id = 1; id < 50; ++id)
+        TestTrue(TEXT("variante estable en rango"), TreeArchetype::VariantOf(id, 4) < 4);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodRemap, "Eco.LOD.RemapInstancias", EcoTestFlags)
+bool FEcoLodRemap::RunTest(const FString&) {
+    // Mapping instancia->id = [10,11,12,13,14]; borro instancias 1 y 3.
+    // UE desplaza hacia abajo -> queda [10,12,14] y se reubican 2->1 y 4->2.
+    TArray<uint32> Mapping = { 10, 11, 12, 13, 14 };
+    TArray<int32>  Removed = { 1, 3 };
+    TMap<uint32, int32> NewIndexOf;
+    TreeInstancing::CompactMappingAfterRemoval(Mapping, Removed,
+        [&](uint32 Id, int32 NewIndex) { NewIndexOf.Add(Id, NewIndex); });
+
+    TestEqual(TEXT("num tras compactar"), Mapping.Num(), 3);
+    TestEqual(TEXT("id en 1 == 12"), Mapping[1], 12u);
+    TestEqual(TEXT("id en 2 == 14"), Mapping[2], 14u);
+    TestEqual(TEXT("12 reubicado a 1"), NewIndexOf.FindRef(12u), 1);
+    TestEqual(TEXT("14 reubicado a 2"), NewIndexOf.FindRef(14u), 2);
+    return true;
+}
 #endif

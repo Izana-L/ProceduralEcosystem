@@ -87,6 +87,7 @@ class PROCEDURALECOSYSTEM_API UTreeRenderSubsystem : public UTickableWorldSubsys
 
 public:
     // --- UWorldSubsystem ---
+    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
     virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const override;
 
@@ -118,6 +119,8 @@ private:
     void ProcessHeroQueue(int32 MaxThisFrame);
     void ReleaseHero(uint32 StableId);
     void EvictOldHeroes();
+    void QueueHero(uint32 StableId, const FArchetypeKey& Key, const FTransform& Xform);
+    bool IsHeroActive(uint32 StableId) const;
 
     void DrawTierDebug(const FVector& ViewLocation) const;
     bool GetViewLocation(FVector& OutLocation) const;
