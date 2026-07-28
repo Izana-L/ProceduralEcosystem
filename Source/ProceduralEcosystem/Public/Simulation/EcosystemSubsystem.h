@@ -11,8 +11,9 @@
 #include "Ecology/SpatialHash.h"
 #include "Ecology/ResourcePool.h"
 #include "Ecology/TickScratch.h"
-#include "EcosystemSubsystem.generated.h"
 #include "Ecology/TreeDeathEvent.h"
+#include "EcosystemSubsystem.generated.h"
+
 
 class UFieldVisualizer;
 class ADecalActor;
