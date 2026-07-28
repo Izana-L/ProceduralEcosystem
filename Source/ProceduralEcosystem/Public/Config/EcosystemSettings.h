@@ -247,7 +247,24 @@ public:
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")
     TArray<TSoftObjectPtr<USpeciesData>> Species;
+    // ================================================================
+    // --- Fase 5: ciclo de vida y dinamica ---
+    // ================================================================
 
+    /** Modo "bosque vivo": interpola la escala de los hero trees entre ticks
+        para que el crecimiento se vea CONTINUO y no a saltos (doc. Fase 5). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo")
+    bool bSmoothHeroGrowth = true;
+
+    /** Constante de tiempo (s) del suavizado de escala del hero. Mas alto = mas
+        lento y suave. Suavizado exponencial: estable a cualquier framerate. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0.01"))
+    float HeroGrowthSmoothingSeconds = 0.6f;
+
+    /** Nº de muertes recientes que la simulacion conserva (anillo) para que la
+        capa de render genere caidas/tocones/hojarasca (lo consume el Paso 4). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0"))
+    int32 DeathEventBufferSize = 256;
     // --- Debug ---
     /** Material de decal (dominio Deferred Decal) con un parámetro de textura "FieldTex". */
     UPROPERTY(EditAnywhere, config, Category = "Debug")

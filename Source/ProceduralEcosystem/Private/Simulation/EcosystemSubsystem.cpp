@@ -110,7 +110,9 @@ static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(TEXT("Eco.ClearHeroTrees"
 
 static FAutoConsoleCommandWithWorld GEcoFingerprint( TEXT("Eco.Fingerprint"), TEXT("Loguea un hash del estado completo del bosque."),
     FConsoleCommandWithWorldDelegate::CreateStatic( [](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogStateFingerprint(); }));
-   
+static FAutoConsoleCommandWithWorld GEcoLogDeaths(TEXT("Eco.Deaths.Log"),
+    TEXT("Loguea el nº total de muertes y las ultimas del buffer (Fase 5)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogRecentDeaths(); }));
        
 
 void UEcosystemSubsystem::LogStateFingerprint() const
@@ -425,13 +427,27 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
                 const float VigorValue = EcologyRules::Vigor(fL, fW, fN);
 
-                // 2c) crecimiento + altura + edad + estado (Mature vs Sapling)
+                // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, doc. Fase 5)
+                const float NewAge = Agents_Read.Age[i] + DtYears;
+
+                // Senescencia: se decide con el estres del tick ANTERIOR
+                // (Agents_Read.Stress) para no depender del estres que aun no se
+                // ha calculado este tick -> el orden sigue siendo determinista.
+                const bool bSenescent = EcologyRules::IsSenescent(
+                    NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
+                    Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
+
+                // En declive el arbol casi deja de crecer.
+                const float EffGrowthRate = Sp->GrowthRate *
+                    EcologyRules::SenescentGrowthFactor(bSenescent, Sp->SenescentGrowthScale);
                 const float NewBiomass = EcologyRules::GrowBiomassLogistic(
-                    Agents_Read.Biomass[i], VigorValue, Sp->GrowthRate, Sp->MaxBiomass, DtYears);
+                    Agents_Read.Biomass[i], VigorValue, EffGrowthRate, Sp->MaxBiomass, DtYears);
+
                 Agents_Write.Biomass[i] = NewBiomass;
                 Agents_Write.Height[i] = EcologyRules::HeightFromBiomass(NewBiomass, Sp->MaxBiomass, Sp->MaxHeightCm);
-                Agents_Write.Age[i] = Agents_Read.Age[i] + DtYears;
-                Agents_Write.State[i] = (Agents_Write.Age[i] >= Sp->MaturityAge) ? ETreeState::Mature : ETreeState::Sapling;
+                Agents_Write.Age[i] = NewAge;
+                Agents_Write.State[i] = bSenescent ? ETreeState::Senescent
+                    : (NewAge >= Sp->MaturityAge ? ETreeState::Mature : ETreeState::Sapling);
 
                 // 2d) estres
                 Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
@@ -445,9 +461,11 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 EcologyRules::DepositKernel(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
                     -NewBiomass * Sp->NutrientDemand * DtYears);
 
-                // 2f) mortalidad (probabilistica, con el RNG propio del arbol)
-                const float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
-                    Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
+                // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
+                //     La senescencia multiplica la probabilidad de morir (doc. Fase 5).
+                float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
+                    
+                pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
 
                 if (EcoRand::NextUnit(RngState) < pDeath)
                 {
@@ -457,6 +475,11 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     Pulse.Position = P;
                     Pulse.RadiusCm = RootRadiusCm;
                     Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings->NutrientDecompositionFactor);
+                    // Fase 5: datos para la caida/tocon/hojarasca del render.
+                    Pulse.SpeciesId = Agents_Read.SpeciesId[i];
+                    Pulse.StableId = Agents_Read.StableId[i];
+                    Pulse.Biomass = NewBiomass;
+                    Pulse.HeightCm = Agents_Write.Height[i];
                     Ctx.DeathPulses.Add(Pulse);
                 }
                 else if (Agents_Write.State[i] == ETreeState::Mature)
@@ -492,6 +515,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     for (const FPendingDeathPulse& Pulse : PendingDeaths)
     {
         EcologyRules::DepositKernel(NutrientBase.Field, NutrientPool.Next.Data, Pulse.Position, Pulse.RadiusCm, Pulse.Amount);
+        RecordDeathEvent(Pulse); // Fase 5: alimenta la capa de render
     }
 
     // Reserva una sola vez: PendingSeeds.Num() es la cota superior de germinaciones.
@@ -704,7 +728,63 @@ void UEcosystemSubsystem::LogPopulationStats() const
     UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion total: %d | %s"),
         TickCount, Agents_Read.Num(), *Breakdown);
 }
+// ---------------------------------------------------------------------------
+//  Eventos de muerte (Fase 5)
+// ---------------------------------------------------------------------------
+void UEcosystemSubsystem::RecordDeathEvent(const FPendingDeathPulse& Pulse)
+{
+    const int32 Cap = FMath::Max(0, UEcosystemSettings::Get()->DeathEventBufferSize);
+    if (Cap == 0) { return; }
 
+    FTreeDeathEvent Ev;
+    Ev.Position = Pulse.Position;
+    Ev.SpeciesId = Pulse.SpeciesId;
+    Ev.StableId = Pulse.StableId;
+    Ev.Biomass = Pulse.Biomass;
+    Ev.HeightCm = Pulse.HeightCm;
+    Ev.Tick = TickCount;
+
+    if (RecentDeaths.Num() < Cap)
+    {
+        RecentDeaths.Add(Ev);
+    }
+    else
+    {
+        RecentDeaths[static_cast<int32>(DeathEventCounter % Cap)] = Ev;
+    }
+    ++DeathEventCounter;
+}
+
+void UEcosystemSubsystem::CollectNewDeathEvents(int64& InOutCursor, TArray<FTreeDeathEvent>& Out) const
+{
+    const int32 EffCap = RecentDeaths.Num();
+    if (EffCap == 0) { InOutCursor = DeathEventCounter; return; }
+
+    // Solo estan disponibles las ultimas EffCap muertes (el anillo pisa las viejas).
+    int64 From = FMath::Max<int64>(InOutCursor, DeathEventCounter - EffCap);
+    for (int64 g = From; g < DeathEventCounter; ++g)
+    {
+        Out.Add(RecentDeaths[static_cast<int32>(g % EffCap)]);
+    }
+    InOutCursor = DeathEventCounter;
+}
+
+void UEcosystemSubsystem::LogRecentDeaths() const
+{
+    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Muertes totales: %lld | en buffer: %d"),
+        DeathEventCounter, RecentDeaths.Num());
+    const int32 Show = FMath::Min(5, RecentDeaths.Num());
+    for (int32 k = 0; k < Show; ++k)
+    {
+        const int64 g = DeathEventCounter - 1 - k;
+        if (g < 0) { break; }
+        const FTreeDeathEvent& Ev = RecentDeaths[static_cast<int32>(g % RecentDeaths.Num())];
+        const USpeciesData* Sp = ResolveSpecies(Ev.SpeciesId);
+        UE_LOG(LogEco, Log, TEXT("  #%lld %s en (%.0f, %.0f) biomasa=%.1f altura=%.0f tick=%lld"),
+            g, Sp ? *Sp->SpeciesName.ToString() : TEXT("?"),
+            Ev.Position.X, Ev.Position.Y, Ev.Biomass, Ev.HeightCm, Ev.Tick);
+    }
+}
 // ---------------------------------------------------------------------------
 //  Debug agents (Fase 0)
 // ---------------------------------------------------------------------------
@@ -793,7 +873,12 @@ void UEcosystemSubsystem::DrawDebug()
             if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
 
             const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
-            const FColor Color = Sp ? Sp->DebugColor : FColor::White;
+            FColor Color = Sp ? Sp->DebugColor : FColor::White;
+            // Fase 5: los arboles en declive se ven apagados/marrones.
+            if (Agents_Read.State[i] == ETreeState::Senescent)
+            {
+                Color = FColor(150, 90, 40);
+            }
             const float  H = Agents_Read.Height[i];
             const FVector Center = Agents_Read.Position[i] + FVector(0.f, 0.f, H * 0.5f);
             const float  Radius = FMath::Max(30.f, H * 0.3f);

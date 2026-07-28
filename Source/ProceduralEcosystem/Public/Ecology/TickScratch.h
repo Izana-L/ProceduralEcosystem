@@ -16,6 +16,12 @@ struct FPendingDeathPulse
     FVector Position = FVector::ZeroVector; // mundo, cm
     float   RadiusCm = 0.f;                 // mismo radio efectivo que su consumo
     float   Amount = 0.f;                   // ya calculado con DeathNutrientPulse (clase 3)
+
+    // --- Fase 5: datos para que el render genere caida/tocon/hojarasca ---
+    uint16  SpeciesId = 0;
+    uint32  StableId = 0;
+    float   Biomass = 0.f;
+    float   HeightCm = 0.f;
 };
 
 /**

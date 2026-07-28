@@ -122,7 +122,12 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     }
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
-
+    // Render desactivado: no crees Host ni libreria (la simulacion corre igual).
+    // Si se activa por consola, esta funcion se vuelve a llamar y si inicializa.
+    if (!bEnabled)
+    {
+        return false;
+    }
     Host = World->SpawnActor<ATreeInstanceHost>(ATreeInstanceHost::StaticClass(), FTransform::Identity);
     if (!Host)
     {
@@ -145,14 +150,7 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     Library = NewObject<UTreeLibrary>(this);
     Library->Initialize(Host, Eco->GetSpeciesList(), Cfg);
 
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-
-    // Render desactivado: no crees Host ni libreria (la simulacion corre igual).
-    // Si se activa por consola, esta funcion se vuelve a llamar y si inicializa.
-    if (!bEnabled)
-    {
-        return false;
-    }
+    
 
     if (S->bPrebakeLibraryOnStart && bEnabled)
     {

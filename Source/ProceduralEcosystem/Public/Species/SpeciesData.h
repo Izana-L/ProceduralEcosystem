@@ -207,7 +207,30 @@ public:
         Impostor Baker cuando llegues al pulido. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD")
     TObjectPtr<UMaterialInterface> ImpostorMaterial;
+    // ================================================================
+// --- Senescencia (Fase 5): el declive antes de la muerte ---
+// ================================================================
+// El estado ETreeState::Senescent deja de ser un placeholder. Un arbol
+// entra en declive por VEJEZ (fraccion de su longevidad) o por ESTRES
+// sostenido; entonces casi deja de crecer, no se reproduce y su
+// probabilidad de morir se multiplica. De aqui salen los tocones/snags
+// y el auto-aclareo visible del bosque.
 
+/** Fraccion de la longevidad a partir de la cual el arbol entra en senescencia. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SenescenceAgeFraction = 0.75f;
+
+    /** Estres sostenido (>=) que fuerza la senescencia aunque el arbol sea joven. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SenescenceStressThreshold = 0.85f;
+
+    /** Multiplicador del crecimiento en senescencia (~0 = deja de crecer). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SenescentGrowthScale = 0.1f;
+
+    /** Multiplicador de la probabilidad de morir cuando esta senescente. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "1"))
+    float SenescentMortalityMultiplier = 3.f;
 
 #if WITH_EDITOR
     /** Validación de datos: avisa de configuraciones incoherentes al editar el asset. */

@@ -12,6 +12,7 @@
 #include "Ecology/ResourcePool.h"
 #include "Ecology/TickScratch.h"
 #include "EcosystemSubsystem.generated.h"
+#include "Ecology/TreeDeathEvent.h"
 
 class UFieldVisualizer;
 class ADecalActor;
@@ -60,19 +61,29 @@ public:
     //     con la sombra de los vecinos (conexion micro<-macro). Se rellena en
     //     cada SimulateTick, asi que refleja el estado del ultimo tick corrido. ---
     const FLightFieldCoarse& GetLightCoarse() const { return LightCoarse; }
-
+    // --- Eventos de muerte (Fase 5): anillo circular + cursor monotono ---
+    TArray<FTreeDeathEvent> RecentDeaths;
+    int64 DeathEventCounter = 0;
     // --- Debug agents (Fase 0: sondas manuales, no forman parte de la simulacion) ---
     void AddDebugAgent(const FVector& WorldPos, const FColor& Color, float Radius);
     void AddRandomDebugAgent();
     void ClearDebugAgents();
     void LogStateFingerprint() const;
     void LogFiniteCheck() const;
+
+    // --- Eventos de muerte (Fase 5): la capa de render los consume ---
+    void  LogRecentDeaths() const;
+    int64 GetDeathEventCounter() const { return DeathEventCounter; }
+    /** Copia en Out las muertes con indice >= InOutCursor (limitado al anillo) y avanza el cursor. */
+    void  CollectNewDeathEvents(int64& InOutCursor, TArray<FTreeDeathEvent>& Out) const;
+
     // --- Heatmaps ---
     void PaintTestField();
     void PaintWaterField();
     void PaintNutrientField();
     void PaintVigorField();
     void PaintLightField();
+
     // --- Poblacion (Fase 2) ---
     /** Siembra Count plantulas aleatorias sobre el terreno (consola: Eco.SeedForest). */
     void SeedInitialPopulation(int32 Count);
@@ -104,7 +115,7 @@ private:
     void DrawDebug();
     void EnsureHeatmapDecal();
     void LogPopulationStats() const;
-   
+    void RecordDeathEvent(const FPendingDeathPulse& Pulse);
     const USpeciesData* ResolveSpecies(uint16 SpeciesId) const;
 
     // --- Estado de tiempo ---

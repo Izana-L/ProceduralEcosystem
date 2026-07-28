@@ -100,7 +100,30 @@ namespace EcologyRules
         const float pStress = DtYears * Stress * StressMortalityWeight;
         return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
     }
+    /**
+ * Senescencia (Fase 5): el arbol entra en declive si es VIEJO (rebasa una
+ * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
+ * Devuelve true si cualquiera de las dos condiciones aplica.
+ */
+    FORCEINLINE bool IsSenescent(float Age, float Longevity, float SenescenceAgeFraction,
+        float Stress, float SenescenceStressThreshold)
+    {
+        const bool bOld = Age >= SenescenceAgeFraction * FMath::Max(Longevity, KINDA_SMALL_NUMBER);
+        const bool bStressed = Stress >= SenescenceStressThreshold;
+        return bOld || bStressed;
+    }
 
+    /** Factor multiplicativo del crecimiento en senescencia (1 = normal, ~0 = detenido). */
+    FORCEINLINE float SenescentGrowthFactor(bool bSenescent, float SenescentGrowthScale)
+    {
+        return bSenescent ? FMath::Clamp(SenescentGrowthScale, 0.f, 1.f) : 1.f;
+    }
+
+    /** Aplica el multiplicador de mortalidad de la senescencia a una pDeath ya calculada. */
+    FORCEINLINE float ApplySenescentMortality(float pDeath, bool bSenescent, float Multiplier)
+    {
+        return bSenescent ? FMath::Clamp(pDeath * FMath::Max(1.f, Multiplier), 0.f, 1.f) : pDeath;
+    }
     /** Nº de semillas emitidas este tick (Poisson de media SeedRate*Biomass*dt). */
     FORCEINLINE int32 ComputeSeedCount(float SeedRatePerBiomass, float Biomass, float DtYears,
         uint32& RngState)
