@@ -11,6 +11,7 @@ class UEcosystemSubsystem;
 class USpeciesData;
 class UTreeLibrary;
 class UHierarchicalInstancedStaticMeshComponent;
+class UMaterialParameterCollection; // Fase 5 (ciclo estacional)
 
 /** Nivel de representacion de un arbol (doc. Fase 4, 4.1). */
 UENUM()
@@ -35,6 +36,7 @@ struct FTreeRenderState
     int32  Bucket = -1;        // ultimo bucket (para la histeresis)
     float  LastScale = 0.f;    // ultima escala subida (umbral de actualizacion)
     uint32 Stamp = 0;          // pasada de re-nivelado en que se vio vivo por ultima vez
+    uint8  LastVitalityQ = 255; // Fase 5: ultima "sequedad" cuantizada escrita en float1 (255 = nunca)
 };
 
 /** Hero pendiente de generar (la cola amortigua el coste, doc. 4.4). */
@@ -55,6 +57,11 @@ struct FHeroSlot
     uint32 GeneratedKey = 0; // arquetipo con el que se genero: si cambia, hay que regenerar
     uint32 LastUsedStamp = 0;
     bool   bActive = false;
+
+    // Fase 5 (bosque vivo): escala objetivo hacia la que UpdateHeroInterpolation
+    // acerca la escala del actor cada frame, para que el crecimiento se vea
+    // continuo y no a saltos entre re-nivelados.
+    float  TargetScale = 1.f;
 };
 
 /**
@@ -87,7 +94,6 @@ class PROCEDURALECOSYSTEM_API UTreeRenderSubsystem : public UTickableWorldSubsys
 
 public:
     // --- UWorldSubsystem ---
-    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
     virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const override;
 
@@ -119,8 +125,14 @@ private:
     void ProcessHeroQueue(int32 MaxThisFrame);
     void ReleaseHero(uint32 StableId);
     void EvictOldHeroes();
-    void QueueHero(uint32 StableId, const FArchetypeKey& Key, const FTransform& Xform);
-    bool IsHeroActive(uint32 StableId) const;
+
+    /** Fase 5 (bosque vivo): acerca cada frame la escala de los hero trees a su
+        FHeroSlot::TargetScale con un suavizado exponencial (barato: son decenas). */
+    void UpdateHeroInterpolation(float DeltaTime);
+
+    /** Fase 5 (estacional): avanza la fase de estacion global y la empuja al
+        Material Parameter Collection que leen los materiales de follaje. */
+    void UpdateSeason(float DeltaTime);
 
     void DrawTierDebug(const FVector& ViewLocation) const;
     bool GetViewLocation(FVector& OutLocation) const;
@@ -137,6 +149,7 @@ private:
         TArray<uint32>     AddIds;
         TArray<FTransform> AddXforms;
         TArray<TPair<uint32, FTransform>> Updates; // (StableId, transform): el indice se resuelve tras las bajas
+        TArray<TPair<uint32, float>>      CustomData1; // Fase 5: (StableId, sequedad) para PerInstanceCustomData[1]
     };
 
     UPROPERTY(Transient) TObjectPtr<UTreeLibrary> Library = nullptr;
@@ -168,4 +181,7 @@ private:
     int32 NumImpostor = 0;
     int32 NumCulled = 0;
     double LastRelevelMs = 0.0;
+
+    // Fase 5 (estacional): fase de estacion [0,1) empujada al MPC cada frame.
+    float SeasonPhase = 0.f;
 };

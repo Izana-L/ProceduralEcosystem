@@ -14,6 +14,11 @@
 #include "DrawDebugHelpers.h"
 #include "Async/ParallelFor.h"
 #include "Async/TaskGraphInterfaces.h"
+#include "Serialization/MemoryWriter.h" 
+#include "Serialization/MemoryReader.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "HAL/FileManager.h"
 
 // Categoría de log local a este .cpp (declara y define en un solo sitio).
 // Evita meter DECLARE_LOG_CATEGORY_EXTERN en una cabecera reflejada por UHT.
@@ -29,7 +34,7 @@ static UEcosystemSubsystem* GetEco(UWorld* World)
 static TAutoConsoleVariable<int32> CVarForceST(
     TEXT("Eco.ForceSingleThread"), 0, TEXT("1 = tick en un solo hilo (validar determinismo)."));
 
-static FAutoConsoleCommandWithWorldAndArgs GEcoStep( TEXT("Eco.Step"),
+static FAutoConsoleCommandWithWorldAndArgs GEcoStep(TEXT("Eco.Step"),
     TEXT("Avanza N ticks de simulacion (por defecto 1). Uso: Eco.Step [N]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* World)
@@ -40,7 +45,7 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoStep( TEXT("Eco.Step"),
                 S->StepN(N);
             }
         }));
-   
+
 
 static FAutoConsoleCommandWithWorld GEcoTogglePause(TEXT("Eco.TogglePause"),
     TEXT("Pausa/reanuda el avance automatico de la simulacion."),
@@ -52,16 +57,16 @@ static FAutoConsoleCommandWithWorld GEcoAddAgent(TEXT("Eco.AddAgent"),
 
 static FAutoConsoleCommandWithWorld GEcoClear(TEXT("Eco.ClearAgents"),
     TEXT("Borra todos los agentes de debug."),
-    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearDebugAgents(); }));  
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearDebugAgents(); }));
 
 static FAutoConsoleCommandWithWorld GEcoPaint(TEXT("Eco.PaintTestField"),
     TEXT("Genera y pinta un campo de prueba como heatmap sobre el terreno."),
-    FConsoleCommandWithWorldDelegate::CreateStatic( [](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintTestField(); }));
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintTestField(); }));
 
 static FAutoConsoleCommandWithWorld GEcoPaintWater(TEXT("Eco.PaintWater"),
     TEXT("Pinta el heatmap del agua disponible actual (pool, no el base)."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintWaterField(); }));
-        
+
 static FAutoConsoleCommandWithWorld GEcoPaintNutrients(TEXT("Eco.PaintNutrients"),
     TEXT("Pinta el heatmap de nutrientes disponibles actuales (pool, no el base)."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintNutrientField(); }));
@@ -69,7 +74,7 @@ static FAutoConsoleCommandWithWorld GEcoPaintNutrients(TEXT("Eco.PaintNutrients"
 static FAutoConsoleCommandWithWorld GEcoPaintVigor(TEXT("Eco.PaintVigor"),
     TEXT("Pinta el heatmap de idoneidad (vigor de Liebig) de la especie HeatmapSpeciesIndex."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->PaintVigorField(); }));
-    
+
 
 static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(TEXT("Eco.SeedForest"),
     TEXT("Siembra N plantulas aleatorias sobre el terreno (por defecto 200). Uso: Eco.SeedForest [N]"),
@@ -82,7 +87,7 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoSeedForest(TEXT("Eco.SeedForest")
                 S->SeedInitialPopulation(N);
             }
         }));
-    
+
 static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(TEXT("Eco.GrowHeroTree"),
     TEXT("Genera un hero tree (SCA) con la luz actual del ecosistema. "
         "Uso: Eco.GrowHeroTree [SpeciesIndex] [Seed] [X] [Y] (X,Y en cm; por defecto, centro del terreno)."),
@@ -102,18 +107,57 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoGrowHeroTree(TEXT("Eco.GrowHeroTr
                 S->SpawnHeroTree(FVector(X, Y, Z), SpeciesIndex, Seed);
             }
         }));
-    
+
 
 static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(TEXT("Eco.ClearHeroTrees"),
     TEXT("Destruye todos los hero trees generados."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World) { if (UEcosystemSubsystem* S = GetEco(World)) S->ClearHeroTrees(); }));
 
-static FAutoConsoleCommandWithWorld GEcoFingerprint( TEXT("Eco.Fingerprint"), TEXT("Loguea un hash del estado completo del bosque."),
-    FConsoleCommandWithWorldDelegate::CreateStatic( [](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogStateFingerprint(); }));
+static FAutoConsoleCommandWithWorld GEcoFingerprint(TEXT("Eco.Fingerprint"), TEXT("Loguea un hash del estado completo del bosque."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogStateFingerprint(); }));
+
+// --- Fase 5 (Paso 1): eventos de muerte ---
 static FAutoConsoleCommandWithWorld GEcoLogDeaths(TEXT("Eco.Deaths.Log"),
     TEXT("Loguea el nº total de muertes y las ultimas del buffer (Fase 5)."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogRecentDeaths(); }));
-       
+
+// --- Fase 5 (Paso 5): descomposicion visible en el terreno ---
+static FAutoConsoleCommandWithWorld GEcoPaintDecomp(TEXT("Eco.PaintDecomposition"),
+    TEXT("Pinta el heatmap de descomposicion (puntos de muerte recientes) sobre el terreno."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->PaintDecompositionField(); }));
+
+static TAutoConsoleVariable<int32> CVarDecompLive(TEXT("Eco.Decomp.Live"), 0,
+    TEXT("1 = repinta el heatmap de descomposicion cada tick (ver manchas aparecer y desvanecerse)."));
+
+// --- Fase 5 (Paso 6): bake a un año objetivo (guardar/cargar) ---
+static FString EcoBakePath(const FString& Name)
+{
+    return FPaths::ProjectSavedDir() / TEXT("EcoBakes") / (Name + TEXT(".ecobake"));
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GEcoSave(TEXT("Eco.Save"),
+    TEXT("Guarda el bosque en Saved/EcoBakes/<nombre>.ecobake (por defecto 'bake'). Uso: Eco.Save [nombre]"),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+        [](const TArray<FString>& Args, UWorld* World)
+        {
+            if (UEcosystemSubsystem* S = GetEco(World))
+            {
+                S->SaveState(EcoBakePath(Args.Num() > 0 ? Args[0] : TEXT("bake")));
+            }
+        }));
+
+static FAutoConsoleCommandWithWorldAndArgs GEcoLoad(TEXT("Eco.Load"),
+    TEXT("Carga el bosque desde Saved/EcoBakes/<nombre>.ecobake (por defecto 'bake'). Uso: Eco.Load [nombre]"),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+        [](const TArray<FString>& Args, UWorld* World)
+        {
+            if (UEcosystemSubsystem* S = GetEco(World))
+            {
+                S->LoadState(EcoBakePath(Args.Num() > 0 ? Args[0] : TEXT("bake")));
+            }
+        }));
+
+
 
 void UEcosystemSubsystem::LogStateFingerprint() const
 {
@@ -149,13 +193,13 @@ void UEcosystemSubsystem::LogFiniteCheck() const
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
 // ---------------------------------------------------------------------------
 static TAutoConsoleVariable<int32> CVarDebugAgents(TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug (Fase 0) como esferas."));
-    
-static TAutoConsoleVariable<int32> CVarDebugPopulation( TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
-   
-static TAutoConsoleVariable<int32> CVarDebugTerrain( TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
-   
+
+static TAutoConsoleVariable<int32> CVarDebugPopulation(TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
+
+static TAutoConsoleVariable<int32> CVarDebugTerrain(TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
+
 static TAutoConsoleVariable<int32> CVarDebugHeatmap(TEXT("Eco.Debug.Heatmap"), 1, TEXT("Muestra (1) u oculta (0) el decal de heatmap."));
-    
+
 
 // ---------------------------------------------------------------------------
 //  UWorldSubsystem
@@ -202,11 +246,11 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     // 2) Campos base (Fase 1): potencial del terreno, calculado una sola vez.
     //    Ambos comparten geometria con HeightField (mismo Width/Height/CellSize/Origin),
     //    asi que WaterPool y NutrientPool acaban con el mismo numero de celdas.
-    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);  
+    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);
 
     NutrientBase.GeneratePatchyBase(HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
-        HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed),S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);   
-      
+        HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed), S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);
+
     auto LogRange = [](const FField2D& F, const TCHAR* N) {
         float Mn = TNumericLimits<float>::Max(), Mx = -Mn;
         for (float V : F.Data) { Mn = FMath::Min(Mn, V); Mx = FMath::Max(Mx, V); }
@@ -216,6 +260,11 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     // 3) Estado runtime (Fase 2): los pools arrancan llenos al nivel del base.
     WaterPool.InitFromBase(WaterBase.Field);
     NutrientPool.InitFromBase(NutrientBase.Field);
+
+    // Fase 5 (Paso 5): campo de descomposicion, misma geometria que los campos,
+    // arranca a cero (aun no ha muerto nadie).
+    DecompositionField.Init(NutrientBase.Field.Width, NutrientBase.Field.Height,
+        NutrientBase.Field.CellSize, NutrientBase.Field.Origin, 0.f);
 
     // 4) Grid de luz grueso: geometria derivada del relieve + settings.
     const FBox2D Bounds = HeightField.GetWorldBounds();
@@ -298,7 +347,7 @@ TStatId UEcosystemSubsystem::GetStatId() const
 
 float UEcosystemSubsystem::GetInterpolationAlpha() const
 {
-    return SecondsPerTick > 0.f? FMath::Clamp(static_cast<float>(Accumulator) / SecondsPerTick, 0.f, 1.f) : 0.f;     
+    return SecondsPerTick > 0.f ? FMath::Clamp(static_cast<float>(Accumulator) / SecondsPerTick, 0.f, 1.f) : 0.f;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +476,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
                 const float VigorValue = EcologyRules::Vigor(fL, fW, fN);
 
-                // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, doc. Fase 5)
+                // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, Fase 5 Paso 1)
                 const float NewAge = Agents_Read.Age[i] + DtYears;
 
                 // Senescencia: se decide con el estres del tick ANTERIOR
@@ -462,9 +511,9 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     -NewBiomass * Sp->NutrientDemand * DtYears);
 
                 // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
-                //     La senescencia multiplica la probabilidad de morir (doc. Fase 5).
-                float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
-                    
+                //     La senescencia multiplica la probabilidad de morir (Fase 5 Paso 1).
+                float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
+                    Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
                 pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
 
                 if (EcoRand::NextUnit(RngState) < pDeath)
@@ -512,10 +561,24 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
     NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
 
+    // Fase 5 (Paso 5): envejece las manchas de descomposicion existentes
+    // (decaimiento exponencial) antes de sumar las de este tick.
+    if (DecompositionField.IsValid())
+    {
+        const float Decay = FMath::Exp(-Settings->DecompositionDecayPerYear * DtYears);
+        for (float& V : DecompositionField.Data) { V *= Decay; }
+    }
+
     for (const FPendingDeathPulse& Pulse : PendingDeaths)
     {
         EcologyRules::DepositKernel(NutrientBase.Field, NutrientPool.Next.Data, Pulse.Position, Pulse.RadiusCm, Pulse.Amount);
-        RecordDeathEvent(Pulse); // Fase 5: alimenta la capa de render
+        RecordDeathEvent(Pulse); // Fase 5 (Paso 1/4): alimenta la capa de suelo
+        // Fase 5 (Paso 5): mancha de descomposicion visible en el terreno.
+        if (DecompositionField.IsValid())
+        {
+            EcologyRules::DepositKernel(DecompositionField, DecompositionField.Data,
+                Pulse.Position, Pulse.RadiusCm, Pulse.Amount * Settings->DecompositionPulseScale);
+        }
     }
 
     // Reserva una sola vez: PendingSeeds.Num() es la cota superior de germinaciones.
@@ -728,8 +791,9 @@ void UEcosystemSubsystem::LogPopulationStats() const
     UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion total: %d | %s"),
         TickCount, Agents_Read.Num(), *Breakdown);
 }
+
 // ---------------------------------------------------------------------------
-//  Eventos de muerte (Fase 5)
+//  Eventos de muerte (Fase 5, Paso 1): anillo que consume la capa de suelo
 // ---------------------------------------------------------------------------
 void UEcosystemSubsystem::RecordDeathEvent(const FPendingDeathPulse& Pulse)
 {
@@ -785,6 +849,106 @@ void UEcosystemSubsystem::LogRecentDeaths() const
             Ev.Position.X, Ev.Position.Y, Ev.Biomass, Ev.HeightCm, Ev.Tick);
     }
 }
+
+// ---------------------------------------------------------------------------
+//  Bake a un año objetivo (Fase 5, Paso 6): guardar / cargar el estado completo
+// ---------------------------------------------------------------------------
+//
+// Se serializa la UNICA fuente de verdad (la poblacion) + el estado runtime de
+// los campos (pools de agua/nutrientes y descomposicion) + los streams de RNG +
+// el contador de ticks. Los campos BASE (relieve, agua/nutrientes potenciales,
+// luz) NO se guardan: son deterministas a partir de la semilla maestra y se
+// regeneran identicos en OnWorldBeginPlay. Por eso un bake solo cuadra con la
+// misma MasterSeed/ajustes de relieve.
+void UEcosystemSubsystem::SerializeState(FArchive& Ar)
+{
+    Ar << TickCount;
+    Ar.Serialize(&Rng, sizeof(FEcosystemRng)); // streams de RNG (struct plano)
+
+    auto PODArray = [&Ar](auto& Arr)
+        {
+            int32 N = Arr.Num();
+            Ar << N;
+            if (Ar.IsLoading()) { Arr.SetNumUninitialized(N); }
+            if (N > 0) { Ar.Serialize(Arr.GetData(), (int64)N * sizeof(Arr[0])); }
+        };
+    auto FieldSer = [&Ar, &PODArray](FField2D& F)
+        {
+            Ar << F.Width; Ar << F.Height; Ar << F.CellSize; Ar << F.Origin;
+            PODArray(F.Data);
+        };
+
+    // Poblacion (SoA): la fuente de verdad de posicion/especie/edad/tamano/estado.
+    FTreePopulation& P = Agents_Read;
+    PODArray(P.Position);  PODArray(P.SpeciesId); PODArray(P.Age);   PODArray(P.Biomass);
+    PODArray(P.Height);    PODArray(P.Stress);    PODArray(P.State); PODArray(P.RngState);
+    PODArray(P.StableId);
+    Ar << P.NextStableId;
+
+    // Estado runtime de los campos.
+    FieldSer(WaterPool.Current);
+    FieldSer(NutrientPool.Current);
+    FieldSer(DecompositionField);
+}
+
+void UEcosystemSubsystem::SaveState(const FString& FilePath)
+{
+    TArray<uint8> Bytes;
+    FMemoryWriter Ar(Bytes, /*bIsPersistent*/ true);
+
+    uint32 Magic = 0x4F434501u; // "ECO" + version de formato
+    int32  Version = 1;
+    uint32 Seed = Rng.MasterSeed;
+    Ar << Magic << Version << Seed;
+    SerializeState(Ar);
+
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(FilePath), /*Tree*/ true);
+    if (FFileHelper::SaveArrayToFile(Bytes, *FilePath))
+    {
+        UE_LOG(LogEco, Log, TEXT("[Eco/F5] Bake guardado: %s (tick %lld, %d arboles, %d KB)."),
+            *FilePath, TickCount, Agents_Read.Num(), Bytes.Num() / 1024);
+    }
+    else
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] No se pudo escribir el bake: %s"), *FilePath);
+    }
+}
+
+bool UEcosystemSubsystem::LoadState(const FString& FilePath)
+{
+    TArray<uint8> Bytes;
+    if (!FFileHelper::LoadFileToArray(Bytes, *FilePath))
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco/F5] No existe el bake: %s"), *FilePath);
+        return false;
+    }
+
+    FMemoryReader Ar(Bytes, /*bIsPersistent*/ true);
+    uint32 Magic = 0; int32 Version = 0; uint32 Seed = 0;
+    Ar << Magic << Version << Seed;
+    if (Magic != 0x4F434501u)
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] '%s' no es un bake valido."), *FilePath);
+        return false;
+    }
+    if (Seed != Rng.MasterSeed)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Eco/F5] El bake se hizo con semilla %u pero la actual es %u: "
+            "los campos base pueden no cuadrar (se carga de todas formas)."), Seed, Rng.MasterSeed);
+    }
+
+    SerializeState(Ar);
+
+    // Post-carga: los buffers Next parten del Current recien cargado.
+    WaterPool.Next = WaterPool.Current;
+    NutrientPool.Next = NutrientPool.Current;
+
+    bPaused = true; // un bake es un instante objetivo: se muestra congelado
+    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Bake cargado: %s (tick %lld, %d arboles). "
+        "Simulacion en pausa; Eco.TogglePause para continuar."), *FilePath, TickCount, Agents_Read.Num());
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 //  Debug agents (Fase 0)
 // ---------------------------------------------------------------------------
@@ -858,6 +1022,14 @@ void UEcosystemSubsystem::DrawDebug()
         HeatmapDecal->SetActorHiddenInGame(CVarDebugHeatmap.GetValueOnGameThread() == 0);
     }
 
+    // Fase 5 (Paso 5): en modo live, repinta la descomposicion una vez por tick
+    // para ver las manchas de muerte aparecer y desvanecerse en el terreno.
+    if (CVarDecompLive.GetValueOnGameThread() != 0 && LastDecompPaintTick != TickCount)
+    {
+        PaintDecompositionField();
+        LastDecompPaintTick = TickCount;
+    }
+
     if (CVarDebugAgents.GetValueOnGameThread() != 0)
     {
         for (const FEcoDebugAgent& A : DebugAgents)
@@ -874,7 +1046,7 @@ void UEcosystemSubsystem::DrawDebug()
 
             const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
             FColor Color = Sp ? Sp->DebugColor : FColor::White;
-            // Fase 5: los arboles en declive se ven apagados/marrones.
+            // Fase 5 (Paso 1): los arboles en declive se ven apagados/marrones.
             if (Agents_Read.State[i] == ETreeState::Senescent)
             {
                 Color = FColor(150, 90, 40);
@@ -958,6 +1130,16 @@ void UEcosystemSubsystem::PaintLightField()
     FieldViz->UpdateFromField(L);
     EnsureHeatmapDecal();
     UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de luz (ras de suelo) pintado."));
+}
+void UEcosystemSubsystem::PaintDecompositionField()
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    if (!FieldViz || !DecompositionField.IsValid()) { return; }
+    // Rango FIJO [0, max]: las manchas no cambian de intensidad al variar el
+    // maximo del campo entre ticks (el auto-rango haria "latir" el heatmap).
+    FieldViz->UpdateFromField(DecompositionField.Data, 0.f, FMath::Max(0.001f, S->DecompositionPaintMax));
+    EnsureHeatmapDecal();
+    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Heatmap de descomposicion (puntos de muerte) pintado."));
 }
 void UEcosystemSubsystem::EnsureHeatmapDecal()
 {

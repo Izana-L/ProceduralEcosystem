@@ -6,6 +6,8 @@
 
 class USpeciesData;
 class UMaterialInterface;
+class UStaticMesh;                  // Fase 5 (capa de suelo)
+class UMaterialParameterCollection; // Fase 5 (ciclo estacional)
 
 /**
  * Configuración central del proyecto. Aparece en
@@ -240,35 +242,117 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
     bool bImpostorsCastShadow = false;
 
-    /** Floats de PerInstanceCustomData (1 = fase estacional por árbol, gancho de la Fase 5). */
+    /** Floats de PerInstanceCustomData. Fase 5: [0]=fase estacional por arbol,
+        [1]=sequedad (0 sano, 1 seco/senescente). Por eso el minimo util es 2. */
     UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0", ClampMax = "4"))
-    int32 NumInstanceCustomDataFloats = 1;
+    int32 NumInstanceCustomDataFloats = 2;
 
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")
     TArray<TSoftObjectPtr<USpeciesData>> Species;
-    // ================================================================
-    // --- Fase 5: ciclo de vida y dinamica ---
-    // ================================================================
 
-    /** Modo "bosque vivo": interpola la escala de los hero trees entre ticks
-        para que el crecimiento se vea CONTINUO y no a saltos (doc. Fase 5). */
-    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo")
-    bool bSmoothHeroGrowth = true;
-
-    /** Constante de tiempo (s) del suavizado de escala del hero. Mas alto = mas
-        lento y suave. Suavizado exponencial: estable a cualquier framerate. */
-    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0.01"))
-    float HeroGrowthSmoothingSeconds = 0.6f;
-
-    /** Nº de muertes recientes que la simulacion conserva (anillo) para que la
-        capa de render genere caidas/tocones/hojarasca (lo consume el Paso 4). */
-    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0"))
-    int32 DeathEventBufferSize = 256;
     // --- Debug ---
     /** Material de decal (dominio Deferred Decal) con un parámetro de textura "FieldTex". */
     UPROPERTY(EditAnywhere, config, Category = "Debug")
     TSoftObjectPtr<UMaterialInterface> HeatmapDecalMaterial;
+
+    // ================================================================
+    // --- Fase 5: ciclo de vida y dinamica ---
+    // ================================================================
+
+    // --- Paso 0/2: bosque vivo (crecimiento continuo + buffer de muertes) ---
+    /** Interpola la escala de los hero trees entre ticks para que el crecimiento
+        se vea CONTINUO y no a saltos. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo")
+    bool bSmoothHeroGrowth = true;
+
+    /** Constante de tiempo (s) del suavizado de escala del hero (exponencial). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0.01"))
+    float HeroGrowthSmoothingSeconds = 0.6f;
+
+    /** Nº de muertes recientes que la simulacion conserva (anillo) para la capa
+        de suelo (tocones/hojarasca). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|BosqueVivo", meta = (ClampMin = "0"))
+    int32 DeathEventBufferSize = 256;
+
+    // --- Paso 3: ciclo estacional de follaje ---
+    /** Material Parameter Collection con un escalar "Season" [0,1). El material
+        de follaje lo lee para tintar/secar la hoja segun la estacion. Si es
+        null, el ciclo estacional simplemente no se aplica (no rompe nada). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones")
+    TSoftObjectPtr<UMaterialParameterCollection> SeasonMPC;
+
+    /** Avanza la estacion sola con el tiempo real (modo bosque vivo). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones")
+    bool bAutoAdvanceSeason = true;
+
+    /** Segundos reales que dura un ciclo estacional completo (primavera->invierno). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones", meta = (ClampMin = "0.1"))
+    float VisualYearSeconds = 24.f;
+
+    // --- Paso 4: capa de suelo (tocones/snags, madera muerta, hojarasca) ---
+    /** Interruptor maestro de la capa de suelo. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    bool bEnableSoilLayer = true;
+
+    /** Malla del tocon/tronco caido. Asigna aqui p.ej. /Engine/BasicShapes/Cylinder
+        (o tu propia malla). Si es null, no se generan tocones. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    TSoftObjectPtr<UStaticMesh> SnagMesh;
+
+    /** Malla de la hojarasca (una card plana). Asigna p.ej. /Engine/BasicShapes/Plane.
+        Si es null, no se genera hojarasca. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    TSoftObjectPtr<UStaticMesh> LitterMesh;
+
+    /** Material de la madera muerta (opcional; si null usa el de la malla). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    TSoftObjectPtr<UMaterialInterface> SnagMaterial;
+
+    /** Material de la hojarasca (opcional; ideal: el mismo LeafMaterial otoñal). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    TSoftObjectPtr<UMaterialInterface> LitterMaterial;
+
+    /** Maximo de tocones/troncos simultaneos (anillo: al llenarse se reutiliza el mas viejo). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    int32 MaxSnags = 512;
+
+    /** Maximo de cards de hojarasca simultaneas (anillo). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    int32 MaxLitter = 4096;
+
+    /** Altura del tocon como fraccion de la altura del arbol al morir. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0.05", ClampMax = "1"))
+    float SnagHeightFraction = 0.45f;
+
+    /** Segundos reales que tarda un tocon en caer y quedar como tronco tumbado. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0.1"))
+    float SnagFallSeconds = 4.f;
+
+    /** Nº de cards de hojarasca esparcidas por cada muerte. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    int32 LitterPerDeath = 6;
+
+    /** Radio (cm) de dispersion de la hojarasca alrededor de la muerte. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    float LitterRadiusCm = 300.f;
+
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    bool bSnagsCastShadow = true;
+
+   // --- Paso 5: descomposicion visible en el terreno ---
+   /** Cuanto se desvanece por año la mancha de descomposicion (decaimiento exponencial). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Descomposicion", meta = (ClampMin = "0"))
+    float DecompositionDecayPerYear = 0.5f;
+
+    /** Escala del pulso de descomposicion depositado al morir un arbol. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Descomposicion", meta = (ClampMin = "0"))
+    float DecompositionPulseScale = 1.f;
+
+    /** Valor que el heatmap pinta como "maximo" (rango FIJO, para que las manchas
+        no cambien de intensidad al variar el maximo del campo entre ticks). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Descomposicion", meta = (ClampMin = "0.001"))
+    float DecompositionPaintMax = 20.f;
 
     static const UEcosystemSettings* Get() { return GetDefault<UEcosystemSettings>(); }
 };

@@ -14,12 +14,12 @@
 #include "Ecology/TreeDeathEvent.h"
 #include "EcosystemSubsystem.generated.h"
 
-
 class UFieldVisualizer;
 class ADecalActor;
 class UMaterialInstanceDynamic;
 class USpeciesData;
 class AHeroTreeActor;
+class FArchive; // Fase 5 (Paso 6): serializacion del bake
 
 /**
  * Motor de la simulacion de ecosistema.
@@ -62,9 +62,7 @@ public:
     //     con la sombra de los vecinos (conexion micro<-macro). Se rellena en
     //     cada SimulateTick, asi que refleja el estado del ultimo tick corrido. ---
     const FLightFieldCoarse& GetLightCoarse() const { return LightCoarse; }
-    // --- Eventos de muerte (Fase 5): anillo circular + cursor monotono ---
-    TArray<FTreeDeathEvent> RecentDeaths;
-    int64 DeathEventCounter = 0;
+
     // --- Debug agents (Fase 0: sondas manuales, no forman parte de la simulacion) ---
     void AddDebugAgent(const FVector& WorldPos, const FColor& Color, float Radius);
     void AddRandomDebugAgent();
@@ -72,25 +70,28 @@ public:
     void LogStateFingerprint() const;
     void LogFiniteCheck() const;
 
-    // --- Eventos de muerte (Fase 5): la capa de render los consume ---
+    // --- Eventos de muerte (Fase 5, Paso 1): la capa de suelo los consume ---
     void  LogRecentDeaths() const;
     int64 GetDeathEventCounter() const { return DeathEventCounter; }
     /** Copia en Out las muertes con indice >= InOutCursor (limitado al anillo) y avanza el cursor. */
     void  CollectNewDeathEvents(int64& InOutCursor, TArray<FTreeDeathEvent>& Out) const;
-
     // --- Heatmaps ---
     void PaintTestField();
     void PaintWaterField();
     void PaintNutrientField();
     void PaintVigorField();
     void PaintLightField();
-
+    void PaintDecompositionField(); // Fase 5 (Paso 5): puntos de muerte en el terreno
     // --- Poblacion (Fase 2) ---
     /** Siembra Count plantulas aleatorias sobre el terreno (consola: Eco.SeedForest). */
     void SeedInitialPopulation(int32 Count);
 
     /** Nº de arboles vivos actualmente (para HUD/consola/tests). */
     int32 GetLivePopulationCount() const { return Agents_Read.Num(); }
+
+    // --- Bake a un año objetivo (Fase 5, Paso 6): guardar / cargar el estado ---
+    void SaveState(const FString& FilePath);
+    bool LoadState(const FString& FilePath);
 
     // --- Hero trees (Fase 3): geometria SCA en vivo ---
     /** Genera un hero tree en WorldPos con la especie SpeciesIndex (indice en
@@ -116,7 +117,9 @@ private:
     void DrawDebug();
     void EnsureHeatmapDecal();
     void LogPopulationStats() const;
-    void RecordDeathEvent(const FPendingDeathPulse& Pulse);
+    void RecordDeathEvent(const FPendingDeathPulse& Pulse); // Fase 5 (Paso 1)
+    void SerializeState(FArchive& Ar);                      // Fase 5 (Paso 6): guardar/cargar
+
     const USpeciesData* ResolveSpecies(uint16 SpeciesId) const;
 
     // --- Estado de tiempo ---
@@ -144,6 +147,12 @@ private:
     FNutrientField NutrientBase;
     FLightFieldCoarse LightCoarse; // este SI se recalcula entero cada tick (serial, ver SimulateTick)
 
+    // --- Fase 5 (Paso 5): campo de "descomposicion reciente". Recibe un pulso al
+    //     morir un arbol y decae con el tiempo; se pinta en el terreno. Solo
+    //     visualizacion (no entra en el vigor). Un solo buffer (se actualiza serial). ---
+    FField2D DecompositionField;
+    int64    LastDecompPaintTick = -1; // ultimo tick repintado en modo "live"
+
     // --- Estado runtime (Fase 2): doble buffer de disponibilidad actual ---
     FResourcePool WaterPool;
     FResourcePool NutrientPool;
@@ -161,6 +170,10 @@ private:
     /** Cache de especies resueltas: evita LoadSynchronous miles de veces por tick. */
     UPROPERTY(Transient)
     TArray<TObjectPtr<USpeciesData>> ResolvedSpecies;
+
+    // --- Eventos de muerte (Fase 5, Paso 1): anillo circular + cursor monotono ---
+    TArray<FTreeDeathEvent> RecentDeaths;
+    int64 DeathEventCounter = 0;
 
     // --- Debug agents (Fase 0) ---
     UPROPERTY(Transient)
