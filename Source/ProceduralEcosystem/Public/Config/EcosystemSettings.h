@@ -285,6 +285,15 @@ public:
     /** Avanza la estacion sola con el tiempo real (modo bosque vivo). */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones")
     bool bAutoAdvanceSeason = true;
+    /** La estacion sigue el AÑO SIMULADO (TickCount*YearsPerTick + alpha) en vez del
+       reloj de pared. Es lo coherente en modo bosque vivo: con los defaults
+       (SecondsPerSimTick=0.5, YearsPerTick=1, VisualYearSeconds=24) el reloj de
+       pared da UNA primavera mientras pasan 48 años simulados, o sea que follaje y
+       ecologia cuentan calendarios distintos. Con la sim PAUSADA (bake estatico) se
+       cae automaticamente al reloj de VisualYearSeconds, que es lo que se quiere
+       para animar la estacion en un beauty shot congelado. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones")
+    bool bSeasonFollowsSimClock = true;
 
     /** Segundos reales que dura un ciclo estacional completo (primavera->invierno). */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones", meta = (ClampMin = "0.1"))
@@ -328,7 +337,23 @@ public:
     /** Segundos reales que tarda un tocon en caer y quedar como tronco tumbado. */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0.1"))
     float SnagFallSeconds = 4.f;
+    /** Segundos que el tocon aguanta EN PIE antes de empezar a caer. El doc. 5.4 lo
+        pide explicitamente ("permanencia un tiempo como snag - ecologicamente
+        relevante"): un arbol muerto no se desploma en el instante en que muere. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    float SnagStandingSeconds = 6.f;
 
+    /** Segundos que el tronco tumbado permanece como madera muerta antes de
+        retirarse (doc. 5.4: "pasado un tiempo se retira el snag/tronco,
+        coincidiendo con el pulso de nutrientes"). 0 = no se retira nunca.
+        Para que cuadre con la mancha de descomposicion del terreno: esta decae
+        con exp(-DecompositionDecayPerYear * años) y un año simulado dura
+        SecondsPerSimTick/YearsPerTick segundos reales; con los defaults
+        (0.5 s/año, decay 0.5) la mancha se apaga en ~4 años = ~2 s reales, asi
+        que sube DecompositionDecayPerYear o baja este valor si quieres que
+        desaparezcan a la vez. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    float SnagLogSeconds = 20.f;
     /** Nº de cards de hojarasca esparcidas por cada muerte. */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
     int32 LitterPerDeath = 6;

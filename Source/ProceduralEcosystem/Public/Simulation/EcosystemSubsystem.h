@@ -19,8 +19,13 @@ class ADecalActor;
 class UMaterialInstanceDynamic;
 class USpeciesData;
 class AHeroTreeActor;
-class FArchive; // Fase 5 (Paso 6): serializacion del bake
-
+class FArchive; 
+// Fase 5 (Paso 6): serializacion del bake
+/** Se emite cuando LoadState sustituye la poblacion entera. Las capas que
+    mantienen estado indexado por StableId (render: instancias y heroes cacheados;
+    suelo: tocones y hojarasca) DEBEN tirarlo: los StableId del bake son de otra
+    corrida y reutilizarlos coloca representaciones de arboles viejos. */
+DECLARE_MULTICAST_DELEGATE(FOnEcoStateLoaded);
 /**
  * Motor de la simulacion de ecosistema.
  *
@@ -53,8 +58,14 @@ public:
     void StepN(int32 N) { PendingSteps += FMath::Max(1, N); }
     int64 GetTickCount() const { return TickCount; }
 
-    /** Alpha de interpolacion de render [0..1] dentro del tick actual (para Fase 5). */
+    /**Alpha de interpolacion de render[0..1] dentro del tick actual : cuanto se ha
+        consumido ya del tick en curso.Es el puente tick(discreto) < ->frame(continuo)
+        del doc. 5.2; lo usa el ciclo estacional para avanzar de forma suave. */
     float GetInterpolationAlpha() const;
+
+    /** Años simulados que avanza cada tick (settings). Lo necesita el reloj
+        estacional para contar el MISMO año que la ecologia. */
+    float GetYearsPerTick() const { return YearsPerTick; }
 
     // --- Terreno ---
     const FHeightField& GetHeightField() const { return HeightField; }
@@ -93,6 +104,8 @@ public:
     void SaveState(const FString& FilePath);
     bool LoadState(const FString& FilePath);
 
+    /** Notifica a las capas de vista que la poblacion se ha sustituido de golpe. */
+    FOnEcoStateLoaded OnStateLoaded;
     // --- Hero trees (Fase 3): geometria SCA en vivo ---
     /** Genera un hero tree en WorldPos con la especie SpeciesIndex (indice en
         Species) y semilla Seed, usando la luz gruesa actual como contexto de
@@ -114,11 +127,22 @@ public:
 
 private:
     void SimulateTick(float DtYears);
+    /** Rehace el grid de luz grueso con la poblacion actual (ClearShadow + deposito
+        de todas las copas). Lo llama SimulateTick al principio del tick, y LoadState
+        despues de cargar: sin esto un bake cargado deja la luz del bosque ANTERIOR,
+        y como LoadState deja la sim en pausa nadie la refresca -> los hero trees que
+        generes para el beauty shot crecerian contra la sombra de vecinos que ya no
+        existen, que es justo la feature que vende el doc. 3.5. */
+    void RebuildCoarseLight();
     void DrawDebug();
     void EnsureHeatmapDecal();
     void LogPopulationStats() const;
     void RecordDeathEvent(const FPendingDeathPulse& Pulse); // Fase 5 (Paso 1)
-    void SerializeState(FArchive& Ar);                      // Fase 5 (Paso 6): guardar/cargar
+    /** Serializa/deserializa un bake completo sobre Payload. Deserializar sobre un
+        objeto APARTE (y no directamente sobre los miembros vivos) es lo que permite
+        VALIDAR antes de pisar el estado: un fichero corrupto o de otra resolucion de
+        relieve dejaba la simulacion a medio cargar y luego indexaba fuera de rango. */
+    void SerializeState(FArchive& Ar, struct FEcoBakePayload& Payload);
 
     const USpeciesData* ResolveSpecies(uint16 SpeciesId) const;
 
@@ -166,6 +190,7 @@ private:
         pone a cero una vez y se reutiliza cada tick (ResetForNextTick) en vez
         de reasignar arrays del tamano del campo en cada SimulateTick. */
     TArray<FTickScratch> TickContexts;
+    TArray<FVector> NewbornPositions;
 
     /** Cache de especies resueltas: evita LoadSynchronous miles de veces por tick. */
     UPROPERTY(Transient)

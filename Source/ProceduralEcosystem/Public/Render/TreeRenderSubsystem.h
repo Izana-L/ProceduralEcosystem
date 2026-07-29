@@ -37,6 +37,10 @@ struct FTreeRenderState
     float  LastScale = 0.f;    // ultima escala subida (umbral de actualizacion)
     uint32 Stamp = 0;          // pasada de re-nivelado en que se vio vivo por ultima vez
     uint8  LastVitalityQ = 255; // Fase 5: ultima "sequedad" cuantizada escrita en float1 (255 = nunca)
+    /** El arbol esta en HeroQueue esperando su malla, pero SIGUE dibujado con su
+        representacion anterior (instancia/impostor). El cambio de nivel se
+        consuma en ProcessHeroQueue, cuando el actor ya tiene geometria. */
+    bool   bHeroPending = false;
 };
 
 /** Hero pendiente de generar (la cola amortigua el coste, doc. 4.4). */
@@ -44,7 +48,8 @@ struct FPendingHero
 {
     FArchetypeKey Key;
     FVector  Position = FVector::ZeroVector;
-    float    Scale = 1.f;
+    float    Scale = 1.f;          // escala final de instancia (bucket * jitter)
+    float    ScaleInBucket = 1.f;  // sin jitter: es lo que compara el umbral de re-escalado
 };
 
 /** Ranura de hero cacheado (reentrar en el nivel hero debe ser instantaneo). */
@@ -113,16 +118,18 @@ public:
     UTreeLibrary* GetLibrary() const { return Library; }
 
 private:
+    void HandleStateLoaded();
     bool EnsureInitialized();
     void ReleaseEverything();
 
     void UpdateLOD(const FVector& ViewLocation);
     void EnterTier(uint32 StableId, FTreeRenderState& State, ETreeRenderTier Want,
-        const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket);
+                   const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness);
     void LeaveTier(uint32 StableId, FTreeRenderState& State);
     void FlushInstanceOps();
 
     void ProcessHeroQueue(int32 MaxThisFrame);
+    void CommitHeroTier(uint32 StableId, FTreeRenderState& State, const FPendingHero& Info);
     void ReleaseHero(uint32 StableId);
     void EvictOldHeroes();
 
@@ -150,6 +157,11 @@ private:
         TArray<FTransform> AddXforms;
         TArray<TPair<uint32, FTransform>> Updates; // (StableId, transform): el indice se resuelve tras las bajas
         TArray<TPair<uint32, float>>      CustomData1; // Fase 5: (StableId, sequedad) para PerInstanceCustomData[1]
+        /** Sequedad inicial de cada alta, paralelo a AddIds/AddXforms. Una instancia
+            recien creada nace con TODA su custom data a 0 (= sana): si no se escribe
+            aqui, un arbol senescente que acaba de cambiar de bucket se dibuja verde
+            hasta que su sequedad cambie de banda... que puede no pasar nunca. */
+        TArray<float>                     AddDryness;
     };
 
     UPROPERTY(Transient) TObjectPtr<UTreeLibrary> Library = nullptr;

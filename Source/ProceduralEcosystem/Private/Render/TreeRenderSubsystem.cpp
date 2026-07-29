@@ -170,6 +170,10 @@ bool UTreeRenderSubsystem::EnsureInitialized()
         Library->BakeAll();
     }
 
+    // Un Eco.Load sustituye la poblacion entera: States, HeroActors y los mapeos
+    // instancia->StableId quedan referidos a arboles de otra corrida.
+    Eco->OnStateLoaded.AddUObject(this, &UTreeRenderSubsystem::HandleStateLoaded);
+
     bInitialized = true;
 
     UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Capa de render lista (%d especies, %d buckets)."),
@@ -177,8 +181,14 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     return true;
 }
 
+
 void UTreeRenderSubsystem::ReleaseEverything()
 {
+    if (Eco)
+    {
+        Eco->OnStateLoaded.RemoveAll(this); // el delegate sobrevive a este subsistema
+    }
+
     for (TPair<uint32, FHeroSlot>& It : HeroActors)
     {
         if (It.Value.Actor)
@@ -249,7 +259,11 @@ void UTreeRenderSubsystem::RebuildAll()
 
     bForceRelevel = true;
 }
-
+void UTreeRenderSubsystem::HandleStateLoaded()
+{
+    RebuildAll();
+    UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Bake cargado: estado de render reconstruido."));
+}
 void UTreeRenderSubsystem::BakeLibraryNow()
 {
     if (EnsureInitialized() && Library)
@@ -392,6 +406,9 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
 
         const uint32 StableId = Pop.StableId[i];
         const double D2 = FVector::DistSquared(Pop.Position[i], ViewLocation);
+        // Sequedad: la necesitan TANTO la rama estable (actualizar) COMO EnterTier
+        // (sembrar la custom data de la instancia nueva), asi que se calcula aqui.
+        const float Dryness = DrynessOf(Pop.State[i], Pop.Stress[i]);
 
         FTreeRenderState& State = States.FindOrAdd(StableId);
         State.Stamp = VisitStamp;
@@ -409,7 +426,15 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         case ETreeRenderTier::Impostor: ++NumImpostor; break;
         default:                        ++NumCulled; break;
         }
-
+        // Estaba encolado como hero y ha dejado de serlo mientras esperaba: cancela
+        // la generacion. Si no, ProcessHeroQueue le montaria un actor a un arbol que
+        // ya no es hero (y ademas se colaria delante de los que si lo son).
+        if (State.bHeroPending && Want != ETreeRenderTier::Hero)
+        {
+            HeroQueue.Remove(StableId);
+            HeroInfo.Remove(StableId);
+            State.bHeroPending = false;
+        }
         // Arquetipo: bucket con histeresis + variante estable.
         const float Ratio = TreeArchetype::HeightRatio(Pop.Biomass[i], Sp->MaxBiomass);
         const int32 Bucket = TreeArchetype::BucketWithHysteresis(Ratio, State.Bucket, NumBuckets, S->BucketHysteresis);
@@ -464,11 +489,11 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
 
             // Fase 5 (estacional): actualiza la "sequedad" por instancia (float1) si
             // cambio de banda. Solo aqui, en la rama estable (sin cambio de nivel/bucket),
-            // donde el indice de instancia no se va a mover en este flush.
+            // donde el indice de instancia no se va a mover en este flush. El caso
+            // "instancia recien creada" lo cubre EnterTier/FlushInstanceOps.
             if (State.InstanceIndex >= 0 &&
                 (State.Tier == ETreeRenderTier::Instance || State.Tier == ETreeRenderTier::Impostor))
             {
-                const float Dryness = DrynessOf(Pop.State[i], Pop.Stress[i]);
                 const uint8 Q = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Dryness * 15.f), 0, 15));
                 if (Q != State.LastVitalityQ)
                 {
@@ -481,9 +506,22 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
             State.Bucket = Bucket;
             continue;
         }
+        if (Want == ETreeRenderTier::Hero)
+        {
+            FPendingHero Info;
+            Info.Key = Key;
+            Info.Position = Xform.GetLocation();
+            Info.Scale = static_cast<float>(Xform.GetScale3D().X);
+            Info.ScaleInBucket = ScaleInBucket;
+            HeroInfo.Add(StableId, Info);      // sobrescribe: refresca pos/escala
+            HeroQueue.AddUnique(StableId);
+            State.bHeroPending = true;
+            State.Bucket = Bucket;
+            continue;                          // la representacion actual sigue en pantalla
+        }
 
         LeaveTier(StableId, State);
-        EnterTier(StableId, State, Want, Key, Xform, ScaleInBucket);
+        EnterTier(StableId, State, Want, Key, Xform, ScaleInBucket, Dryness);
         State.Bucket = Bucket;
     }
 
@@ -525,10 +563,15 @@ void UTreeRenderSubsystem::LeaveTier(uint32 StableId, FTreeRenderState& State)
 
     State.InstanceIndex = -1;
     State.Tier = ETreeRenderTier::None;
+    // La proxima instancia sera OTRA instancia (posiblemente en otro componente)
+    // y nacera con custom data a 0. Sin este reset, el comparador de banda
+    // (Q != LastVitalityQ) da falso y la sequedad no se vuelve a escribir jamas.
+    State.LastVitalityQ = 255;
+    State.bHeroPending = false;
 }
 
 void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, ETreeRenderTier Want,
-    const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket)
+    const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness)
 {
     State.LastScale = ScaleInBucket;
 
@@ -539,19 +582,11 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
         return;
     }
 
-    if (Want == ETreeRenderTier::Hero)
-    {
-        State.Tier = ETreeRenderTier::Hero;
-        State.PackedKey = Key.Pack();
-
-        FPendingHero Info;
-        Info.Key = Key;
-        Info.Position = Xform.GetLocation();
-        Info.Scale = static_cast<float>(Xform.GetScale3D().X);
-        HeroInfo.Add(StableId, Info);
-        HeroQueue.AddUnique(StableId);
-        return;
-    }
+    // El nivel hero NO entra por aqui: UpdateLOD lo encola y ProcessHeroQueue lo
+    // consuma cuando la malla esta lista (swap diferido, para que el arbol no
+    // desaparezca mientras se genera). Ver la rama Want==Hero de UpdateLOD.
+    checkf(Want != ETreeRenderTier::Hero,TEXT("EnterTier no debe recibir Hero: la transicion a hero es diferida."));
+        
 
     // Instancia o impostor: hace falta que el arquetipo este horneado.
     const bool bImpostor = (Want == ETreeRenderTier::Impostor);
@@ -575,10 +610,14 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
     FPendingComponentOps& Ops = Pending.FindOrAdd(MakeComponentKey(Key.Pack(), bImpostor));
     Ops.AddIds.Add(StableId);
     Ops.AddXforms.Add(Xform);
+    Ops.AddDryness.Add(Dryness);   // la instancia nace ya con su estado sanitario
 
     State.Tier = Want;
     State.PackedKey = Key.Pack();
     State.InstanceIndex = -1; // lo asigna el flush
+    // Sincroniza el centinela con lo que el flush va a escribir, para que el
+    // siguiente re-nivelado no reescriba lo mismo.
+    State.LastVitalityQ = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Dryness * 15.f), 0, 15));
 }
 
 /**
@@ -652,13 +691,18 @@ void UTreeRenderSubsystem::FlushInstanceOps()
                     Added->InstanceIndex = Index;
                 }
 
-                // Dato por instancia: fase [0,1) estable por arbol. No se usa aun;
-                // es el gancho para desincronizar el ciclo estacional en la Fase 5
-                // sin draw calls extra (PerInstanceCustomData).
+                // Datos por instancia (PerInstanceCustomData, sin draw calls extra):
+                //   [0] = fase estacional estable por arbol -> el material desincroniza
+                //         el cambio de estacion para que no cambien todos al unisono.
+                //   [1] = sequedad inicial (0 sano, 1 seco/senescente).
                 if (Comp->NumCustomDataFloats > 0)
                 {
                     Comp->SetCustomDataValue(Index, 0,
                         TreeArchetype::StableUnit(Id, TreeArchetype::SaltPhase), /*bMarkRenderStateDirty*/ false);
+                }
+                if (Comp->NumCustomDataFloats > 1 && Ops.AddDryness.IsValidIndex(k))
+                {
+                    Comp->SetCustomDataValue(Index, 1, Ops.AddDryness[k], /*bMarkRenderStateDirty*/ false);
                 }
             }
         }
@@ -721,9 +765,10 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
             continue;
         }
 
-        // Puede haber dejado de ser hero mientras esperaba en la cola.
-        const FTreeRenderState* State = States.Find(StableId);
-        if (!State || State->Tier != ETreeRenderTier::Hero)
+        // Puede haber dejado de ser hero mientras esperaba en la cola. Ojo: con el
+        // swap diferido, un hero pendiente TODAVIA tiene Tier == Instance/Impostor.
+        FTreeRenderState* State = States.Find(StableId);
+        if (!State || (!State->bHeroPending && State->Tier != ETreeRenderTier::Hero))
         {
             continue;
         }
@@ -734,10 +779,12 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         // Cacheado y con el MISMO arquetipo: reentrar es instantaneo.
         if (Slot.Actor && Slot.GeneratedKey == Info.Key.Pack())
         {
+            Slot.Actor->SetActorLocation(Info.Position);  // el actor cacheado puede venir de otra corrida (Eco.Load)
             Slot.Actor->SetActorHiddenInGame(false);
             Slot.Actor->SetActorScale3D(FVector(Info.Scale));
             Slot.TargetScale = Info.Scale; // Fase 5 (bosque vivo): arranca a su tamano
             Slot.bActive = true;
+            CommitHeroTier(StableId, *State, Info);  // AHORA se suelta la instancia anterior
             ++Done;
             continue;
         }
@@ -751,8 +798,7 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
 
         if (!Slot.Actor)
         {
-            Slot.Actor = World->SpawnActor<AHeroTreeActor>(Info.Position,
-                FRotator(0.f, TreeArchetype::YawOf(StableId), 0.f));
+            Slot.Actor = World->SpawnActor<AHeroTreeActor>(Info.Position, FRotator::ZeroRotator);
         }
         if (!Slot.Actor)
         {
@@ -770,15 +816,44 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         // arboles cercanos se ven "conscientes de su sitio" y los lejanos no
         // hace falta que lo esten.
         Slot.Actor->Generate(ArchetypeSp, EcoRand::Hash32(StableId), &Eco->GetLightCoarse(), Info.Position);
-        Slot.Actor->SetActorRotation(FRotator(0.f, TreeArchetype::YawOf(StableId), 0.f));
+        Slot.Actor->SetActorRotation(FRotator::ZeroRotator); // ver nota de A3 en el SpawnActor
         Slot.Actor->SetActorScale3D(FVector(Info.Scale));
         Slot.TargetScale = Info.Scale; // Fase 5 (bosque vivo): arranca a su tamano
         Slot.Actor->SetActorHiddenInGame(false);
         Slot.GeneratedKey = Info.Key.Pack();
         Slot.bActive = true;
 
+        CommitHeroTier(StableId, *State, Info);  // la malla ya esta: suelta la anterior
+
         ++Done;
     }
+
+    // Las bajas que acaba de encolar CommitHeroTier se aplican YA. Si esperasen al
+    // FlushInstanceOps del proximo re-nivelado, la instancia y el hero se dibujarian
+    // SUPERPUESTOS durante hasta RelevelEveryNFrames frames.
+    if (Pending.Num() > 0)
+    {
+        FlushInstanceOps();
+    }
+}
+
+/**
+ * Consuma la transicion a hero: ahora que el actor tiene geometria y esta visible,
+ * se suelta la instancia/impostor que lo venia representando y se pasa el estado
+ * de render a Hero. Es la segunda mitad del swap diferido (la primera es la rama
+ * Want==Hero de UpdateLOD).
+ */
+void UTreeRenderSubsystem::CommitHeroTier(uint32 StableId, FTreeRenderState& State, const FPendingHero& Info)
+{
+    if (State.Tier != ETreeRenderTier::Hero)
+    {
+        LeaveTier(StableId, State);   // encola RemoveInstance de la representacion anterior
+    }
+    State.Tier = ETreeRenderTier::Hero;
+    State.PackedKey = Info.Key.Pack();
+    State.InstanceIndex = -1;
+    State.LastScale = Info.ScaleInBucket;
+    State.bHeroPending = false;
 }
 
 void UTreeRenderSubsystem::ReleaseHero(uint32 StableId)
@@ -933,10 +1008,24 @@ void UTreeRenderSubsystem::UpdateSeason(float DeltaTime)
     const float Override = CVarSeason.GetValueOnGameThread();
     if (Override >= 0.f)
     {
+        // Consola: estacion fijada a mano para demos/capturas.
         SeasonPhase = FMath::Frac(Override);
+    }
+    else if (S->bSeasonFollowsSimClock && Eco && !Eco->IsPaused())
+    {
+        // MODO BOSQUE VIVO. La estacion es EL AÑO SIMULADO, no el reloj de pared:
+        // TickCount da los años enteros y el alpha de interpolacion del doc. 5.2 el
+        // resto, asi que la fase avanza de forma continua a 60 fps aunque el tick
+        // sea discreto. Sin esto, el follaje y la ecologia cuentan años distintos.
+        const double YearsPerTick = Eco->GetYearsPerTick();
+        const double Years = Eco->GetTickCount() * YearsPerTick
+            + Eco->GetInterpolationAlpha() * YearsPerTick;
+        SeasonPhase = static_cast<float>(FMath::Frac(Years));
     }
     else if (S->bAutoAdvanceSeason && DeltaTime > 0.f)
     {
+        // MODO BAKE ESTATICO (o sim pausada): no hay años simulados que seguir, asi
+        // que la estacion corre con su propio reloj para poder animar el beauty shot.
         const float Period = FMath::Max(0.1f, S->VisualYearSeconds);
         SeasonPhase = FMath::Frac(SeasonPhase + DeltaTime / Period);
     }

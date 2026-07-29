@@ -101,10 +101,16 @@ namespace EcologyRules
         return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
     }
     /**
- * Senescencia (Fase 5): el arbol entra en declive si es VIEJO (rebasa una
- * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
- * Devuelve true si cualquiera de las dos condiciones aplica.
- */
+       * Senescencia (Fase 5): el arbol ENTRA en declive si es VIEJO (rebasa una
+       * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
+       * Devuelve true si cualquiera de las dos condiciones aplica.
+       *
+       * OJO: esta funcion decide la ENTRADA, no la permanencia. Es pura sobre el
+       * estres actual, asi que devuelve false en cuanto el arbol se recupera. La
+       * senescencia es irreversible, y esa persistencia la impone el llamante
+       * (SimulateTick) haciendo OR con el estado del tick anterior. No la uses
+       * sola para decidir si un arbol ES senescente.
+       */
     FORCEINLINE bool IsSenescent(float Age, float Longevity, float SenescenceAgeFraction,
         float Stress, float SenescenceStressThreshold)
     {

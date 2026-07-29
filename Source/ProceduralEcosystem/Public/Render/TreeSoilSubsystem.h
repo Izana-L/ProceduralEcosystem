@@ -11,8 +11,23 @@ class UMaterialInterface;
 class UHierarchicalInstancedStaticMeshComponent;
 
 /**
- * Un tocon/tronco: su instancia en el ISM de madera + el estado de su caida.
- * No se reflejan (son datos calientes de la capa de render).
+ * Linea temporal de la muerte visible (doc. 5.4): el arbol muere -> queda un TOCON
+ * EN PIE un tiempo (fase ecologicamente relevante, no se desploma al instante) ->
+ * CAE -> se queda como TRONCO/madera muerta -> se RETIRA, en paralelo al pulso de
+ * nutrientes y a la mancha de descomposicion del terreno.
+ */
+enum class ESnagPhase : uint8
+{
+    Standing, // en pie, aun no ha empezado a caer
+    Falling,  // volcando sobre su base
+    Log,      // tronco tumbado (madera muerta)
+    Gone      // retirado: la instancia sigue existiendo pero con escala ~0 y su
+              // ranura es la primera candidata a reutilizarse
+};
+
+/**
+ * Un tocon/tronco: su instancia en el ISM de madera + su fase y el tiempo que
+ * lleva en ella. No se refleja (son datos calientes de la capa de render).
  */
 struct FSoilSnag
 {
@@ -21,8 +36,9 @@ struct FSoilSnag
     float   HeightCm = 100.f;
     float   RadiusCm = 10.f;
     float   Yaw = 0.f;   // orientacion y direccion de caida (grados)
-    float   FallT = 0.f; // 0 = en pie, 1 = tumbado (ya es tronco/madera muerta)
-    bool    bFalling = true;
+    float   FallT = 0.f; // 0 = en pie, 1 = tumbado
+    float   PhaseSeconds = 0.f;                    // tiempo acumulado en la fase actual
+    ESnagPhase Phase = ESnagPhase::Standing;
 };
 
 /**
@@ -65,7 +81,8 @@ private:
 
     void SpawnSnag(const FTreeDeathEvent& Death);
     void SpawnLitterAround(const FVector& Base, float SpreadCm, int32 Count, uint32& RngState);
-    void UpdateFallingSnags(float DeltaTime);
+    /** Avanza la linea temporal Standing -> Falling -> Log -> Gone de cada tocon. */
+    void UpdateSnags(float DeltaTime);
     FTransform SnagTransform(const FSoilSnag& Snag) const;
 
     UPROPERTY(Transient) TObjectPtr<AActor> Host = nullptr;

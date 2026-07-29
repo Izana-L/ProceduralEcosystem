@@ -263,8 +263,16 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     // Fase 5 (Paso 5): campo de descomposicion, misma geometria que los campos,
     // arranca a cero (aun no ha muerto nadie).
-    DecompositionField.Init(NutrientBase.Field.Width, NutrientBase.Field.Height,
-        NutrientBase.Field.CellSize, NutrientBase.Field.Origin, 0.f);
+    DecompositionField.Init(NutrientBase.Field.Width, NutrientBase.Field.Height,NutrientBase.Field.CellSize, NutrientBase.Field.Origin, 0.f);
+    // Fase 5 (Paso 1): anillo de muertes dimensionado UNA sola vez. Escritor
+    // (RecordDeathEvent) y lector (CollectNewDeathEvents) tienen que usar el MISMO
+    // modulo. Si el escritor lo leyera de los settings en cada muerte -y
+    // UEcosystemSettings es un UDeveloperSettings, editable EN VIVO- subir
+    // DeathEventBufferSize a mitad de partida haria que ambos indexaran distinto y
+    // la capa de suelo pondria tocones en las coordenadas de otros arboles.
+    RecentDeaths.Reset();
+    RecentDeaths.SetNum(FMath::Max(0, S->DeathEventBufferSize));
+    DeathEventCounter = 0;
 
     // 4) Grid de luz grueso: geometria derivada del relieve + settings.
     const FBox2D Bounds = HeightField.GetWorldBounds();
@@ -389,19 +397,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // la Fase 3 (busqueda de puntos de atraccion del SCA) y esta disponible
     // ya para cualquier extension futura (p.ej. densidad local en germinacion).
 
-    LightCoarse.ClearShadow();
-    for (int32 i = 0; i < Agents_Read.Num(); ++i)
-    {
-        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
-        const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
-        if (!Sp) { continue; }
-
-        const float H = Agents_Read.Height[i];
-        const FVector Apex = Agents_Read.Position[i] + FVector(0.f, 0.f, H);
-        // Radio/profundidad de copa: aproximacion hasta que la Fase 3 aporte
-        // geometria real (ver constantes kCanopy* arriba).
-        LightCoarse.DepositCanopyShadow(Apex, H * kCanopyRadiusFraction, H, kCanopyShadowDensity);
-    }
+    RebuildCoarseLight();
 
     Agents_Write.CopyFrom(Agents_Read);
     WaterPool.BeginTick();
@@ -482,9 +478,21 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 // Senescencia: se decide con el estres del tick ANTERIOR
                 // (Agents_Read.Stress) para no depender del estres que aun no se
                 // ha calculado este tick -> el orden sigue siendo determinista.
-                const bool bSenescent = EcologyRules::IsSenescent(
-                    NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
-                    Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
+                // Senescencia: se decide con el estres del tick ANTERIOR
+                // (Agents_Read.Stress) para no depender del estres que aun no se
+                // ha calculado este tick -> el orden sigue siendo determinista.
+                //
+                // Y es una puerta de UN SOLO SENTIDO: IsSenescent es funcion pura del
+                // estres ACTUAL, asi que por si sola haria que un arbol que se recupera
+                // volviese de Senescent a Mature, cosa que biologicamente no ocurre
+                // (el declive no se revierte). Se hace "pegajosa" leyendo el estado del
+                // snapshot de lectura, que es inmutable durante todo el tick: sigue
+                // siendo determinista bajo paralelismo.
+                const bool bSenescent = (Agents_Read.State[i] == ETreeState::Senescent) ||
+                                         EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction, Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
+                    
+                       
+                        
 
                 // En declive el arbol casi deja de crecer.
                 const float EffGrowthRate = Sp->GrowthRate *
@@ -531,10 +539,18 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     Pulse.HeightCm = Agents_Write.Height[i];
                     Ctx.DeathPulses.Add(Pulse);
                 }
-                else if (Agents_Write.State[i] == ETreeState::Mature)
+                else if (NewAge >= Sp->MaturityAge && (Agents_Write.State[i] == ETreeState::Mature ||Agents_Write.State[i] == ETreeState::Senescent))          
                 {
-                    // 2g) semillas (solo si sigue vivo y es maduro)
-                    const int32 NumSeeds = EcologyRules::ComputeSeedCount(Settings->SeedRatePerBiomass, NewBiomass, DtYears, RngState);
+                    // 2g) semillas (solo si sigue vivo y ha alcanzado la madurez).
+                    //     El senescente SIGUE reproduciendose, con menos fuerza: cortarlo
+                    //     a cero eliminaba la ventana de maxima fecundidad y cambiaba en
+                    //     silencio el balance de sucesion que ajusto la Fase 2.
+                    //     La comprobacion explicita de MaturityAge hace falta ahora porque
+                    //     un SAPLING muy estresado tambien entra en Senescent, y una
+                    //     plantula no se reproduce.
+                    const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f) : 1.f;
+                    const int32 NumSeeds = EcologyRules::ComputeSeedCount( Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
+                       
                     const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
 
                     for (int32 s = 0; s < NumSeeds; ++s)
@@ -587,6 +603,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
 
     const FBox2D WorldBounds = HeightField.GetWorldBounds();
     const double MinSpacingSq = FMath::Square((double)Settings->MinGerminationSpacingCm);
+    NewbornPositions.Reset();
 
     for (const FPendingSeed& Seed : PendingSeeds)
     {
@@ -625,6 +642,22 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     bTooClose = true;
                 }
             });
+
+        // El hash se construyo sobre Agents_Read y NO contiene las plantulas que han
+        // germinado en este mismo bucle, asi que hay que comprobarlas aparte o dos
+        // semillas del mismo tick germinan pegadas. El bucle es serial y de orden
+        // fijo, asi que el resultado sigue siendo determinista.
+        // (Escaneo lineal: son unas pocas decenas-cientos por tick; si algun dia
+        //  crece, mete estas posiciones en un mini-hash.)
+        if (!bTooClose)
+        {
+            for (const FVector& NP : NewbornPositions)
+            {
+                const double dx = NP.X - GerminationPos.X;
+                const double dy = NP.Y - GerminationPos.Y;
+                if (dx * dx + dy * dy < MinSpacingSq) { bTooClose = true; break; }
+            }
+        }
         if (bTooClose) { continue; }
 
         const float LightHere = LightCoarse.SampleLightSmooth(GerminationPos);
@@ -645,6 +678,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         if (EcoRand::NextUnit(SeedRng) < pGerm)
         {
             Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * kGerminationBiomassFraction);
+            NewbornPositions.Add(GerminationPos); 
         }
     }
 
@@ -662,7 +696,22 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         LogPopulationStats();
     }
 }
+void UEcosystemSubsystem::RebuildCoarseLight()
+{
+    LightCoarse.ClearShadow();
+    for (int32 i = 0; i < Agents_Read.Num(); ++i)
+    {
+        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+        const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
+        if (!Sp) { continue; }
 
+        const float H = Agents_Read.Height[i];
+        const FVector Apex = Agents_Read.Position[i] + FVector(0.f, 0.f, H);
+        // Radio/profundidad de copa: aproximacion hasta que la Fase 3 aporte
+        // geometria real (ver constantes kCanopy* arriba).
+        LightCoarse.DepositCanopyShadow(Apex, H * kCanopyRadiusFraction, H, kCanopyShadowDensity);
+    }
+}
 const USpeciesData* UEcosystemSubsystem::ResolveSpecies(uint16 SpeciesId) const
 {
     return ResolvedSpecies.IsValidIndex(SpeciesId) ? ResolvedSpecies[SpeciesId] : nullptr;
@@ -797,7 +846,7 @@ void UEcosystemSubsystem::LogPopulationStats() const
 // ---------------------------------------------------------------------------
 void UEcosystemSubsystem::RecordDeathEvent(const FPendingDeathPulse& Pulse)
 {
-    const int32 Cap = FMath::Max(0, UEcosystemSettings::Get()->DeathEventBufferSize);
+    const int32 Cap = RecentDeaths.Num();
     if (Cap == 0) { return; }
 
     FTreeDeathEvent Ev;
@@ -808,41 +857,39 @@ void UEcosystemSubsystem::RecordDeathEvent(const FPendingDeathPulse& Pulse)
     Ev.HeightCm = Pulse.HeightCm;
     Ev.Tick = TickCount;
 
-    if (RecentDeaths.Num() < Cap)
-    {
-        RecentDeaths.Add(Ev);
-    }
-    else
-    {
-        RecentDeaths[static_cast<int32>(DeathEventCounter % Cap)] = Ev;
-    }
+    RecentDeaths[static_cast<int32>(DeathEventCounter % Cap)] = Ev;
     ++DeathEventCounter;
 }
 
 void UEcosystemSubsystem::CollectNewDeathEvents(int64& InOutCursor, TArray<FTreeDeathEvent>& Out) const
 {
-    const int32 EffCap = RecentDeaths.Num();
-    if (EffCap == 0) { InOutCursor = DeathEventCounter; return; }
+    const int32 Cap = RecentDeaths.Num();   // mismo modulo que RecordDeathEvent
+    if (Cap == 0) { InOutCursor = DeathEventCounter; return; }
 
-    // Solo estan disponibles las ultimas EffCap muertes (el anillo pisa las viejas).
-    int64 From = FMath::Max<int64>(InOutCursor, DeathEventCounter - EffCap);
+    // Solo estan disponibles las ultimas Cap muertes (el anillo pisa las viejas).
+    // From nunca baja de DeathEventCounter-Cap, asi que jamas se lee una ranura
+    // que aun no se ha escrito (el array esta predimensionado con eventos vacios).
+    const int64 From = FMath::Max<int64>(InOutCursor, DeathEventCounter - Cap);
     for (int64 g = From; g < DeathEventCounter; ++g)
     {
-        Out.Add(RecentDeaths[static_cast<int32>(g % EffCap)]);
+        Out.Add(RecentDeaths[static_cast<int32>(g % Cap)]);
     }
     InOutCursor = DeathEventCounter;
 }
 
 void UEcosystemSubsystem::LogRecentDeaths() const
 {
-    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Muertes totales: %lld | en buffer: %d"),
-        DeathEventCounter, RecentDeaths.Num());
-    const int32 Show = FMath::Min(5, RecentDeaths.Num());
+    const int32 Cap = RecentDeaths.Num();
+    // El anillo esta PREDIMENSIONADO: Num() es la capacidad, no cuantas muertes hay.
+    const int64 Available = FMath::Min<int64>(DeathEventCounter, Cap);
+    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Muertes totales: %lld | disponibles en el anillo: %lld/%d"),
+        DeathEventCounter, Available, Cap);
+    const int32 Show = static_cast<int32>(FMath::Min<int64>(5, Available));
     for (int32 k = 0; k < Show; ++k)
     {
         const int64 g = DeathEventCounter - 1 - k;
         if (g < 0) { break; }
-        const FTreeDeathEvent& Ev = RecentDeaths[static_cast<int32>(g % RecentDeaths.Num())];
+        const FTreeDeathEvent& Ev = RecentDeaths[static_cast<int32>(g % Cap)];
         const USpeciesData* Sp = ResolveSpecies(Ev.SpeciesId);
         UE_LOG(LogEco, Log, TEXT("  #%lld %s en (%.0f, %.0f) biomasa=%.1f altura=%.0f tick=%lld"),
             g, Sp ? *Sp->SpeciesName.ToString() : TEXT("?"),
@@ -859,17 +906,57 @@ void UEcosystemSubsystem::LogRecentDeaths() const
 // el contador de ticks. Los campos BASE (relieve, agua/nutrientes potenciales,
 // luz) NO se guardan: son deterministas a partir de la semilla maestra y se
 // regeneran identicos en OnWorldBeginPlay. Por eso un bake solo cuadra con la
-// misma MasterSeed/ajustes de relieve.
-void UEcosystemSubsystem::SerializeState(FArchive& Ar)
+// misma MasterSeed/ajustes de relieve -- y por eso hay que COMPROBARLO al cargar.
+//
+// El anillo de muertes (RecentDeaths/DeathEventCounter) NO se serializa a
+// proposito: es un buffer de eventos para la capa de vista, no estado del bosque.
+// Tras cargar, la capa de suelo se vacia (OnStateLoaded -> Clear) y recoloca su
+// cursor, asi que no hay nada que restaurar.
+
+static constexpr uint32 kEcoBakeMagic = 0x4F434501u;
+static constexpr int32  kEcoBakeVersion = 1;
+
+/** Todo lo que vive en un bake. Ver SerializeState. */
+struct FEcoBakePayload
 {
-    Ar << TickCount;
-    Ar.Serialize(&Rng, sizeof(FEcosystemRng)); // streams de RNG (struct plano)
+    int64           TickCount = 0;
+    FEcosystemRng   Rng;
+    FTreePopulation Population;
+    FField2D        Water, Nutrient, Decomposition;
+};
+
+/** Dos rejillas describen el MISMO trozo de mundo con la MISMA resolucion. */
+static bool EcoFieldGeometryMatches(const FField2D& A, const FField2D& B)
+{
+    return A.Width == B.Width
+        && A.Height == B.Height
+        && FMath::IsNearlyEqual(A.CellSize, B.CellSize, 1e-6)
+        && A.Origin.Equals(B.Origin, 1.0)   // 1 cm de tolerancia
+        && A.Data.Num() == A.Width * A.Height;
+}
+
+void UEcosystemSubsystem::SerializeState(FArchive& Ar, FEcoBakePayload& P)
+{
+    Ar << P.TickCount;
+    Ar.Serialize(&P.Rng, sizeof(FEcosystemRng)); // streams de RNG (struct plano)
 
     auto PODArray = [&Ar](auto& Arr)
         {
             int32 N = Arr.Num();
             Ar << N;
-            if (Ar.IsLoading()) { Arr.SetNumUninitialized(N); }
+            if (Ar.IsLoading())
+            {
+                // Un N corrupto (o simplemente un fichero truncado) haria un
+                // SetNumUninitialized gigantesco -> OOM. Se valida contra lo que
+                // realmente queda por leer en el archivo.
+                const int64 Bytes = (int64)N * (int64)sizeof(Arr[0]);
+                if (N < 0 || Bytes > Ar.TotalSize() - Ar.Tell())
+                {
+                    Ar.SetError();
+                    return;
+                }
+                Arr.SetNumUninitialized(N);
+            }
             if (N > 0) { Ar.Serialize(Arr.GetData(), (int64)N * sizeof(Arr[0])); }
         };
     auto FieldSer = [&Ar, &PODArray](FField2D& F)
@@ -879,28 +966,36 @@ void UEcosystemSubsystem::SerializeState(FArchive& Ar)
         };
 
     // Poblacion (SoA): la fuente de verdad de posicion/especie/edad/tamano/estado.
-    FTreePopulation& P = Agents_Read;
-    PODArray(P.Position);  PODArray(P.SpeciesId); PODArray(P.Age);   PODArray(P.Biomass);
-    PODArray(P.Height);    PODArray(P.Stress);    PODArray(P.State); PODArray(P.RngState);
-    PODArray(P.StableId);
-    Ar << P.NextStableId;
+    FTreePopulation& Pop = P.Population;
+    PODArray(Pop.Position);  PODArray(Pop.SpeciesId); PODArray(Pop.Age);   PODArray(Pop.Biomass);
+    PODArray(Pop.Height);    PODArray(Pop.Stress);    PODArray(Pop.State); PODArray(Pop.RngState);
+    PODArray(Pop.StableId);
+    Ar << Pop.NextStableId;
 
     // Estado runtime de los campos.
-    FieldSer(WaterPool.Current);
-    FieldSer(NutrientPool.Current);
-    FieldSer(DecompositionField);
+    FieldSer(P.Water);
+    FieldSer(P.Nutrient);
+    FieldSer(P.Decomposition);
 }
 
 void UEcosystemSubsystem::SaveState(const FString& FilePath)
 {
+    FEcoBakePayload Payload;
+    Payload.TickCount = TickCount;
+    Payload.Rng = Rng;
+    Payload.Population.CopyFrom(Agents_Read);
+    Payload.Water = WaterPool.Current;
+    Payload.Nutrient = NutrientPool.Current;
+    Payload.Decomposition = DecompositionField;
+
     TArray<uint8> Bytes;
     FMemoryWriter Ar(Bytes, /*bIsPersistent*/ true);
 
-    uint32 Magic = 0x4F434501u; // "ECO" + version de formato
-    int32  Version = 1;
+    uint32 Magic = kEcoBakeMagic;
+    int32  Version = kEcoBakeVersion;
     uint32 Seed = Rng.MasterSeed;
     Ar << Magic << Version << Seed;
-    SerializeState(Ar);
+    SerializeState(Ar, Payload);
 
     IFileManager::Get().MakeDirectory(*FPaths::GetPath(FilePath), /*Tree*/ true);
     if (FFileHelper::SaveArrayToFile(Bytes, *FilePath))
@@ -926,9 +1021,15 @@ bool UEcosystemSubsystem::LoadState(const FString& FilePath)
     FMemoryReader Ar(Bytes, /*bIsPersistent*/ true);
     uint32 Magic = 0; int32 Version = 0; uint32 Seed = 0;
     Ar << Magic << Version << Seed;
-    if (Magic != 0x4F434501u)
+    if (Magic != kEcoBakeMagic)
     {
         UE_LOG(LogEco, Error, TEXT("[Eco/F5] '%s' no es un bake valido."), *FilePath);
+        return false;
+    }
+    if (Version != kEcoBakeVersion)
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] '%s' es version %d y esta build lee la %d: no se carga."),
+            *FilePath, Version, kEcoBakeVersion);
         return false;
     }
     if (Seed != Rng.MasterSeed)
@@ -937,13 +1038,75 @@ bool UEcosystemSubsystem::LoadState(const FString& FilePath)
             "los campos base pueden no cuadrar (se carga de todas formas)."), Seed, Rng.MasterSeed);
     }
 
-    SerializeState(Ar);
+    // --- Deserializar APARTE y validar: nada de pisar el estado vivo todavia ---
+    FEcoBakePayload P;
+    SerializeState(Ar, P);
+    if (Ar.IsError())
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] '%s' esta corrupto o truncado: no se carga."), *FilePath);
+        return false;
+    }
+
+    // Geometria de los campos: si no cuadra con los campos BASE actuales, el tick
+    // indexaria Base.Data[] fuera de rango en RegenerateTowardBase y saltaria el
+    // check() de ReduceScratchInto. Es un crash, no un artefacto visual.
+    if (!EcoFieldGeometryMatches(P.Water, WaterBase.Field) ||
+        !EcoFieldGeometryMatches(P.Nutrient, NutrientBase.Field) ||
+        !EcoFieldGeometryMatches(P.Decomposition, NutrientBase.Field))
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] El bake usa una geometria de relieve distinta "
+            "(%dx%d @ %.0f cm) de la actual (%dx%d @ %.0f cm): no se carga. Ajusta "
+            "HeightfieldResolution/HeightfieldCellSizeCm o rehaz el bake."),
+            P.Water.Width, P.Water.Height, P.Water.CellSize,
+            WaterBase.Field.Width, WaterBase.Field.Height, WaterBase.Field.CellSize);
+        return false;
+    }
+
+    // Coherencia interna del SoA: todos los arrays paralelos con el mismo largo.
+    const FTreePopulation& NewPop = P.Population;
+    const int32 N = NewPop.Position.Num();
+    if (NewPop.SpeciesId.Num() != N || NewPop.Age.Num() != N || NewPop.Biomass.Num() != N ||
+        NewPop.Height.Num() != N || NewPop.Stress.Num() != N || NewPop.State.Num() != N ||
+        NewPop.RngState.Num() != N || NewPop.StableId.Num() != N)
+    {
+        UE_LOG(LogEco, Error, TEXT("[Eco/F5] El bake tiene los arrays SoA descuadrados: no se carga."));
+        return false;
+    }
+
+    // Especies: un bake de un proyecto con mas especies dejaria arboles cuyo
+    // ResolveSpecies devuelve null -> nunca crecen, nunca mueren, no se dibujan.
+    for (int32 i = 0; i < N; ++i)
+    {
+        if (!ResolvedSpecies.IsValidIndex(NewPop.SpeciesId[i]))
+        {
+            UE_LOG(LogEco, Error, TEXT("[Eco/F5] El bake referencia la especie %d y solo hay %d "
+                "configuradas en Project Settings: no se carga."),
+                (int32)NewPop.SpeciesId[i], ResolvedSpecies.Num());
+            return false;
+        }
+    }
+
+    // --- Commit: a partir de aqui ya no puede fallar ---
+    TickCount = P.TickCount;
+    Rng = P.Rng;
+    Agents_Read.CopyFrom(NewPop);
+    WaterPool.Current = P.Water;
+    NutrientPool.Current = P.Nutrient;
+    DecompositionField = P.Decomposition;
 
     // Post-carga: los buffers Next parten del Current recien cargado.
     WaterPool.Next = WaterPool.Current;
     NutrientPool.Next = NutrientPool.Current;
 
+    // La luz gruesa es estado DERIVADO de la poblacion y solo se refresca al inicio
+    // de SimulateTick; como aqui dejamos la sim en pausa, hay que rehacerla a mano o
+    // se queda la del bosque anterior (ver A7).
+    RebuildCoarseLight();
+    ClearHeroTrees();
+
     bPaused = true; // un bake es un instante objetivo: se muestra congelado
+    OnStateLoaded.Broadcast();
+
     UE_LOG(LogEco, Log, TEXT("[Eco/F5] Bake cargado: %s (tick %lld, %d arboles). "
         "Simulacion en pausa; Eco.TogglePause para continuar."), *FilePath, TickCount, Agents_Read.Num());
     return true;

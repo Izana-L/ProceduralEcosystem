@@ -40,11 +40,22 @@ bool UTreeSoilSubsystem::DoesSupportWorldType(const EWorldType::Type WorldType) 
 
 void UTreeSoilSubsystem::Deinitialize()
 {
+    if (Eco)
+    {
+        Eco->OnStateLoaded.RemoveAll(this);
+    }
     if (Host)
     {
         Host->Destroy();
         Host = nullptr;
     }
+    WoodISM = nullptr;
+    LitterISM = nullptr;
+    Snags.Reset();
+    SnagCursor = 0;
+    LitterCount = 0;
+    LitterCursor = 0;
+    bInitialized = false;
     Super::Deinitialize();
 }
 
@@ -122,6 +133,10 @@ bool UTreeSoilSubsystem::EnsureInitialized()
     // capa (evita un estallido de tocones al arrancar). Solo cuentan las nuevas.
     DeathCursor = Eco->GetDeathEventCounter();
 
+    // Un Eco.Load sustituye el bosque: los tocones y la hojarasca de la corrida
+    // anterior no corresponden a ningun arbol del bake.
+    Eco->OnStateLoaded.AddUObject(this, &UTreeSoilSubsystem::Clear);
+
     bInitialized = true;
     UE_LOG(LogEcoSoil, Log, TEXT("[Eco/Suelo] Capa de suelo lista."));
     return true;
@@ -184,7 +199,7 @@ void UTreeSoilSubsystem::Tick(float DeltaTime)
     }
 
     // 2) Animar la caida de los tocones que aun estan de pie.
-    UpdateFallingSnags(DeltaTime);
+    UpdateSnags(DeltaTime);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,9 +224,23 @@ void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
     Snag.RadiusCm = FMath::Max(4.f, Snag.HeightCm * 0.06f); // tronco corto y relativamente grueso
     Snag.Yaw = TreeArchetype::YawOf(Death.StableId);        // orientacion estable por arbol
     Snag.FallT = 0.f;
-    Snag.bFalling = true;
+    Snag.PhaseSeconds = 0.f;
+    Snag.Phase = ESnagPhase::Standing;   // arranca EN PIE (doc. 5.4), no cayendo
 
     const FTransform Xform = SnagTransform(Snag);
+
+    // 1) Ranura ya retirada (Gone): es la reutilizacion natural, y ademas mantiene
+    //    coherente el criterio "se va el mas viejo por EDAD, no por presion".
+    for (FSoilSnag& Candidate : Snags)
+    {
+        if (Candidate.Phase == ESnagPhase::Gone && Candidate.InstanceIndex >= 0)
+        {
+            Snag.InstanceIndex = Candidate.InstanceIndex;
+            Candidate = Snag;
+            WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, Xform, false, /*bMarkDirty*/ true, true);
+            return;
+        }
+    }
 
     if (Snags.Num() < Cap)
     {
@@ -220,8 +249,9 @@ void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
     }
     else
     {
-        // Anillo lleno: reutiliza la instancia del tocon mas viejo (no se borra
-        // ninguna instancia -> sin baile de indices de RemoveInstances).
+        // Anillo lleno y nadie retirado todavia: reutiliza la instancia del tocon mas
+        // viejo (no se borra ninguna instancia -> sin baile de indices de
+        // RemoveInstances). Es un backstop de memoria, NO el mecanismo de retirada.
         FSoilSnag& Old = Snags[SnagCursor];
         Snag.InstanceIndex = Old.InstanceIndex;
         Old = Snag;
@@ -242,6 +272,14 @@ FTransform UTreeSoilSubsystem::SnagTransform(const FSoilSnag& Snag) const
     static constexpr float EngineCylHeight = 100.f;
     static constexpr float EngineCylRadius = 50.f;
 
+    // Retirado: escala ~0 en vez de RemoveInstance, para no mover los indices del
+    // resto (mismo criterio de diseno que el anillo: aqui NUNCA se borra una
+    // instancia). La ranura queda libre para el proximo tocon.
+    if (Snag.Phase == ESnagPhase::Gone)
+    {
+        return FTransform(FQuat::Identity, Snag.Base, FVector(KINDA_SMALL_NUMBER));
+    }
+
     const float HalfH = Snag.HeightCm * 0.5f;
     const FVector Scale(Snag.RadiusCm / EngineCylRadius,
         Snag.RadiusCm / EngineCylRadius,
@@ -260,30 +298,72 @@ FTransform UTreeSoilSubsystem::SnagTransform(const FSoilSnag& Snag) const
     return FTransform(Rot, Loc, Scale);
 }
 
-void UTreeSoilSubsystem::UpdateFallingSnags(float DeltaTime)
+/**
+ * Linea temporal de la muerte (doc. 5.4), desacoplada del sim (que ya avanzo):
+ *   Standing (SnagStandingSeconds) -> Falling (SnagFallSeconds) -> Log (SnagLogSeconds) -> Gone
+ * Se mide en tiempo REAL porque es una animacion de render, no ecologia: el
+ * pulso de nutrientes ya lo aplico la simulacion en el tick de la muerte.
+ */
+void UTreeSoilSubsystem::UpdateSnags(float DeltaTime)
 {
     if (!WoodISM || DeltaTime <= 0.f)
     {
         return;
     }
     const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const float Step = DeltaTime / FMath::Max(0.1f, S->SnagFallSeconds);
+    const float FallSeconds = FMath::Max(0.1f, S->SnagFallSeconds);
 
     bool bAnyMoved = false;
     for (FSoilSnag& Snag : Snags)
     {
-        if (!Snag.bFalling || Snag.InstanceIndex < 0)
+        if (Snag.InstanceIndex < 0 || Snag.Phase == ESnagPhase::Gone)
         {
             continue;
         }
-        Snag.FallT = FMath::Min(1.f, Snag.FallT + Step);
-        if (Snag.FallT >= 1.f)
+
+        Snag.PhaseSeconds += DeltaTime;
+        bool bDirty = false;
+
+        switch (Snag.Phase)
         {
-            Snag.bFalling = false; // ya es un tronco tumbado (madera muerta), se queda
+        case ESnagPhase::Standing:
+            if (Snag.PhaseSeconds >= S->SnagStandingSeconds)
+            {
+                Snag.Phase = ESnagPhase::Falling;
+                Snag.PhaseSeconds = 0.f;
+            }
+            break;
+
+        case ESnagPhase::Falling:
+            Snag.FallT = FMath::Clamp(Snag.PhaseSeconds / FallSeconds, 0.f, 1.f);
+            bDirty = true;
+            if (Snag.FallT >= 1.f)
+            {
+                Snag.Phase = ESnagPhase::Log;
+                Snag.PhaseSeconds = 0.f;
+            }
+            break;
+
+        case ESnagPhase::Log:
+            // SnagLogSeconds == 0 -> la madera muerta se queda para siempre
+            // (comportamiento anterior, util para un beauty shot estatico).
+            if (S->SnagLogSeconds > 0.f && Snag.PhaseSeconds >= S->SnagLogSeconds)
+            {
+                Snag.Phase = ESnagPhase::Gone;
+                bDirty = true;
+            }
+            break;
+
+        default:
+            break;
         }
-        WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, SnagTransform(Snag),
-            /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
-        bAnyMoved = true;
+
+        if (bDirty)
+        {
+            WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, SnagTransform(Snag),
+                /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
+            bAnyMoved = true;
+        }
     }
     if (bAnyMoved)
     {
@@ -356,6 +436,17 @@ void UTreeSoilSubsystem::Clear()
 
 void UTreeSoilSubsystem::LogStats() const
 {
-    UE_LOG(LogEcoSoil, Log, TEXT("[Eco/Suelo] Tocones: %d | hojarasca: %d | cursor de muertes: %lld"),
-        Snags.Num(), LitterCount, DeathCursor);
+    int32 Standing = 0, Falling = 0, Logs = 0, Gone = 0;
+    for (const FSoilSnag& S : Snags)
+    {
+        switch (S.Phase)
+        {
+        case ESnagPhase::Standing: ++Standing; break;
+        case ESnagPhase::Falling:  ++Falling;  break;
+        case ESnagPhase::Log:      ++Logs;     break;
+        default:                   ++Gone;     break;
+        }
+    }
+    UE_LOG(LogEcoSoil, Log, TEXT("[Eco/Suelo] Tocones: %d (en pie %d, cayendo %d, tumbados %d, retirados %d) | hojarasca: %d | cursor de muertes: %lld"),
+        Snags.Num(), Standing, Falling, Logs, Gone, LitterCount, DeathCursor);
 }

@@ -231,7 +231,13 @@ public:
     /** Multiplicador de la probabilidad de morir cuando esta senescente. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "1"))
     float SenescentMortalityMultiplier = 3.f;
-
+    /** Fraccion de la tasa de semillas que CONSERVA un arbol senescente.
+       0 = deja de reproducirse (comportamiento anterior). Cortarlo a cero
+       silenciaba justo la ventana de maxima fecundidad -la biomasa, y por tanto
+       SeedRate*Biomass, es maxima en los ultimos años- cuando en un bosque real
+       los dominantes viejos son la PRINCIPAL fuente de semilla. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SenescentSeedScale = 0.4f;
 #if WITH_EDITOR
     /** Validación de datos: avisa de configuraciones incoherentes al editar el asset. */
     virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
