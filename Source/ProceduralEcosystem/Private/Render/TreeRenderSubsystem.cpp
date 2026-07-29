@@ -174,6 +174,15 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     // instancia->StableId quedan referidos a arboles de otra corrida.
     Eco->OnStateLoaded.AddUObject(this, &UTreeRenderSubsystem::HandleStateLoaded);
 
+    // MPC de estacion resuelto UNA vez (correccion B6): antes UpdateSeason hacia
+    // LoadSynchronous en cada frame.
+    SeasonMPCCached = S->SeasonMPC.LoadSynchronous();
+    if (!SeasonMPCCached)
+    {
+        UE_LOG(LogEcoRender, Log,
+            TEXT("[Eco/LOD] Sin SeasonMPC en Project Settings: el ciclo estacional no se aplicara."));
+    }
+
     bInitialized = true;
 
     UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Capa de render lista (%d especies, %d buckets)."),
@@ -200,8 +209,13 @@ void UTreeRenderSubsystem::ReleaseEverything()
     HeroQueue.Reset();
     HeroInfo.Reset();
     HeroSet.Reset();
+    HeroBest.Reset();
+    DistSqCache.Reset();
     States.Reset();
     Pending.Reset();
+    ResolvedUpdates.Reset();
+    BatchXforms.Reset();
+    SeasonMPCCached = nullptr;
 
     if (Library)
     {
@@ -375,23 +389,34 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
     ++VisitStamp;
 
     // --- 1) Seleccion de hero: los HeroBudget mas cercanos dentro de R_hero ---
-    HeroCandidates.Reset(PopNum);
+    // SELECCION PARCIAL (C4), no un sort completo: en bosque denso dentro de
+    // HeroRadiusCm hay cientos de arboles y solo interesan HeroBudget (24). Se
+    // mantiene un array acotado y ordenado; un candidato mas lejano que el peor
+    // del array se descarta en O(1), que es el caso comun.
+    // De paso se cachea D2 para que la pasada 2 no lo recalcule.
+    const int32 HeroBudget = FMath::Max(0, S->HeroBudget);
+    HeroBest.Reset();
+    DistSqCache.SetNumUninitialized(PopNum, EAllowShrinking::No);
+
     for (int32 i = 0; i < PopNum; ++i)
     {
-        if (Pop.State[i] == ETreeState::Dead) { continue; }
-        const double D2 = FVector::DistSquared(Pop.Position[i], ViewLocation);
-        if (D2 < HeroR2)
-        {
-            HeroCandidates.Add(TPair<float, int32>(static_cast<float>(D2), i));
-        }
+        const double D2d = FVector::DistSquared(Pop.Position[i], ViewLocation);
+        const float  D2 = static_cast<float>(D2d);
+        DistSqCache[i] = D2;
+
+        if (HeroBudget == 0 || Pop.State[i] == ETreeState::Dead || D2d >= HeroR2) { continue; }
+        if (HeroBest.Num() == HeroBudget && D2 >= HeroBest.Last().Key) { continue; } // no entra
+
+        int32 Insert = HeroBest.Num();
+        while (Insert > 0 && HeroBest[Insert - 1].Key > D2) { --Insert; }
+        HeroBest.Insert(TPair<float, int32>(D2, i), Insert);
+        if (HeroBest.Num() > HeroBudget) { HeroBest.Pop(EAllowShrinking::No); }
     }
-    HeroCandidates.Sort([](const TPair<float, int32>& A, const TPair<float, int32>& B) { return A.Key < B.Key; });
 
     HeroSet.Reset();
-    const int32 HeroCount = FMath::Min(HeroCandidates.Num(), FMath::Max(0, S->HeroBudget));
-    for (int32 k = 0; k < HeroCount; ++k)
+    for (const TPair<float, int32>& Cand : HeroBest)
     {
-        HeroSet.Add(Pop.StableId[HeroCandidates[k].Value]);
+        HeroSet.Add(Pop.StableId[Cand.Value]);
     }
 
     // --- 2) Nivel deseado y arquetipo de cada arbol ---
@@ -401,11 +426,32 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
     {
         if (Pop.State[i] == ETreeState::Dead) { continue; }
 
+        const uint32 StableId = Pop.StableId[i];
+        const double D2 = DistSqCache[i];
+        const bool bWantsHero = HeroSet.Contains(StableId);
+
+        // SALIDA TEMPRANA DE LOS CULLADOS (optimizacion C3).
+        // Antes se hacia States.FindOrAdd() -es decir, un insert en un TMap- y se
+        // calculaba el arquetipo completo (3 hashes + una FTransform) para CADA
+        // arbol de la poblacion, incluidos los miles que estan mas alla de
+        // CullRadiusCm y no se dibujan. Peor: quedaban estampados, asi que States
+        // crecia hasta el tamano de la poblacion entera y nunca se limpiaba.
+        // Ahora el caso comun a 20k es un test de distancia y nada mas, y States
+        // queda proporcional a lo que de verdad se dibuja.
+        if (!bWantsHero && D2 >= CullR2)
+        {
+            ++NumCulled;
+            if (FTreeRenderState* Existing = States.Find(StableId))
+            {
+                LeaveTier(StableId, *Existing);
+                States.Remove(StableId);
+            }
+            continue;
+        }
+
         const USpeciesData* Sp = Eco->GetSpeciesById(Pop.SpeciesId[i]);
         if (!Sp) { continue; }
 
-        const uint32 StableId = Pop.StableId[i];
-        const double D2 = FVector::DistSquared(Pop.Position[i], ViewLocation);
         // Sequedad: la necesitan TANTO la rama estable (actualizar) COMO EnterTier
         // (sembrar la custom data de la instancia nueva), asi que se calcula aqui.
         const float Dryness = DrynessOf(Pop.State[i], Pop.Stress[i]);
@@ -414,17 +460,15 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         State.Stamp = VisitStamp;
 
         const ETreeRenderTier Want =
-            HeroSet.Contains(StableId) ? ETreeRenderTier::Hero :
+            bWantsHero ? ETreeRenderTier::Hero :
             (D2 < ImpR2) ? ETreeRenderTier::Instance :
-            (D2 < CullR2) ? ETreeRenderTier::Impostor :
-            ETreeRenderTier::None;
+            ETreeRenderTier::Impostor;
 
         switch (Want)
         {
         case ETreeRenderTier::Hero:     ++NumHero; break;
         case ETreeRenderTier::Instance: ++NumInstance; break;
-        case ETreeRenderTier::Impostor: ++NumImpostor; break;
-        default:                        ++NumCulled; break;
+        default:                        ++NumImpostor; break;
         }
         // Estaba encolado como hero y ha dejado de serlo mientras esperaba: cancela
         // la generacion. Si no, ProcessHeroQueue le montaria un actor a un arbol que
@@ -457,7 +501,11 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         }
 
         const bool bTierChanged = (State.Tier != Want);
-        const bool bKeyChanged = (State.PackedKey != Key.Pack());
+        // B8: si no hay representacion valida (p.ej. el arquetipo aun no estaba
+        // horneado), PackedKey no significa nada y hay que reintentar. Antes esto
+        // se codificaba poniendo PackedKey = 0, que choca con la clave LEGITIMA
+        // Species0/Bucket0/Variant0 -la plantula mas comun de la simulacion-.
+        const bool bKeyChanged = !State.bHasRepresentation || (State.PackedKey != Key.Pack());
 
         if (!bTierChanged && !bKeyChanged)
         {
@@ -563,6 +611,7 @@ void UTreeRenderSubsystem::LeaveTier(uint32 StableId, FTreeRenderState& State)
 
     State.InstanceIndex = -1;
     State.Tier = ETreeRenderTier::None;
+    State.bHasRepresentation = false; // B8: la clave guardada ya no describe nada
     // La proxima instancia sera OTRA instancia (posiblemente en otro componente)
     // y nacera con custom data a 0. Sin este reset, el comparador de banda
     // (Q != LastVitalityQ) da falso y la sequedad no se vuelve a escribir jamas.
@@ -579,31 +628,32 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
     {
         State.Tier = ETreeRenderTier::None;
         State.PackedKey = Key.Pack();
+        State.bHasRepresentation = true; // "no dibujar" es una decision valida y estable
         return;
     }
 
     // El nivel hero NO entra por aqui: UpdateLOD lo encola y ProcessHeroQueue lo
     // consuma cuando la malla esta lista (swap diferido, para que el arbol no
     // desaparezca mientras se genera). Ver la rama Want==Hero de UpdateLOD.
-    checkf(Want != ETreeRenderTier::Hero,TEXT("EnterTier no debe recibir Hero: la transicion a hero es diferida."));
-        
+    checkf(Want != ETreeRenderTier::Hero,
+        TEXT("EnterTier no debe recibir Hero: la transicion a hero es diferida."));
 
     // Instancia o impostor: hace falta que el arquetipo este horneado.
     const bool bImpostor = (Want == ETreeRenderTier::Impostor);
     FTreeArchetypeEntry* Entry = Library->FindOrRequestBake(Key);
     if (!Entry)
     {
-        // Aun no horneado: se queda sin representar y se reintentara en el
-        // proximo re-nivelado (PackedKey = 0 fuerza que se vea como cambio).
+        // Aun no horneado: se queda sin representar y se reintentara en el proximo
+        // re-nivelado (bHasRepresentation = false fuerza que se vea como cambio).
         State.Tier = ETreeRenderTier::None;
-        State.PackedKey = 0;
+        State.bHasRepresentation = false;
         return;
     }
 
     if (!Library->GetOrCreateComponent(Key, bImpostor))
     {
         State.Tier = ETreeRenderTier::None;
-        State.PackedKey = 0;
+        State.bHasRepresentation = false;
         return;
     }
 
@@ -614,6 +664,7 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
 
     State.Tier = Want;
     State.PackedKey = Key.Pack();
+    State.bHasRepresentation = true;
     State.InstanceIndex = -1; // lo asigna el flush
     // Sincroniza el centinela con lo que el flush va a escribir, para que el
     // siguiente re-nivelado no reescriba lo mismo.
@@ -707,16 +758,43 @@ void UTreeRenderSubsystem::FlushInstanceOps()
             }
         }
 
-        // --- 3) ACTUALIZACIONES DE TRANSFORM ---
-        for (const TPair<uint32, FTransform>& Update : Ops.Updates)
+        // --- 3) ACTUALIZACIONES DE TRANSFORM, EN LOTE ---
+        // El doc. 5.2 nombra la API explicitamente ("aplicado en lote con
+        // BatchUpdateInstancesTransforms") y el 4.4 lo repite. Antes esto era un
+        // UpdateInstanceTransform por instancia. Como los indices no son contiguos
+        // por casualidad, se resuelven, se ORDENAN y se agrupan las tiradas
+        // consecutivas: cada tirada es una sola llamada por lote (correccion B5).
+        if (Ops.Updates.Num() > 0)
         {
-            if (const FTreeRenderState* Found = States.Find(Update.Key))
+            ResolvedUpdates.Reset(Ops.Updates.Num());
+            for (const TPair<uint32, FTransform>& Update : Ops.Updates)
             {
-                if (Found->InstanceIndex >= 0)
+                if (const FTreeRenderState* Found = States.Find(Update.Key))
                 {
-                    Comp->UpdateInstanceTransform(Found->InstanceIndex, Update.Value,
-                        /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
+                    if (Found->InstanceIndex >= 0)
+                    {
+                        ResolvedUpdates.Add(TPair<int32, FTransform>(Found->InstanceIndex, Update.Value));
+                    }
                 }
+            }
+            ResolvedUpdates.Sort([](const TPair<int32, FTransform>& A, const TPair<int32, FTransform>& B)
+                { return A.Key < B.Key; });
+
+            int32 Run = 0;
+            while (Run < ResolvedUpdates.Num())
+            {
+                int32 End = Run + 1;
+                while (End < ResolvedUpdates.Num() && ResolvedUpdates[End].Key == ResolvedUpdates[End - 1].Key + 1)
+                {
+                    ++End;
+                }
+
+                BatchXforms.Reset(End - Run);
+                for (int32 k = Run; k < End; ++k) { BatchXforms.Add(ResolvedUpdates[k].Value); }
+
+                Comp->BatchUpdateInstancesTransforms(ResolvedUpdates[Run].Key, BatchXforms,
+                    /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
+                Run = End;
             }
         }
 
@@ -851,6 +929,7 @@ void UTreeRenderSubsystem::CommitHeroTier(uint32 StableId, FTreeRenderState& Sta
     }
     State.Tier = ETreeRenderTier::Hero;
     State.PackedKey = Info.Key.Pack();
+    State.bHasRepresentation = true; // B8
     State.InstanceIndex = -1;
     State.LastScale = Info.ScaleInBucket;
     State.bHeroPending = false;
@@ -956,7 +1035,7 @@ void UTreeRenderSubsystem::LogStats() const
 // ---------------------------------------------------------------------------
 //
 // Los hero trees son actores (decenas como mucho), asi que escalarlos cada
-// frame es barato y NO viola la regla §4.4 de "no tocar el HISM cada frame":
+// frame es barato y NO viola la regla 4.4 de "no tocar el HISM cada frame":
 // las instancias masivas siguen actualizandose en lote y con umbral. Aqui solo
 // suavizamos los pocos arboles cercanos, que son los que se ven crecer de cerca.
 //
@@ -1013,10 +1092,10 @@ void UTreeRenderSubsystem::UpdateSeason(float DeltaTime)
     }
     else if (S->bSeasonFollowsSimClock && Eco && !Eco->IsPaused())
     {
-        // MODO BOSQUE VIVO. La estacion es EL AÑO SIMULADO, no el reloj de pared:
-        // TickCount da los años enteros y el alpha de interpolacion del doc. 5.2 el
+        // MODO BOSQUE VIVO. La estacion es EL ANO SIMULADO, no el reloj de pared:
+        // TickCount da los anos enteros y el alpha de interpolacion del doc. 5.2 el
         // resto, asi que la fase avanza de forma continua a 60 fps aunque el tick
-        // sea discreto. Sin esto, el follaje y la ecologia cuentan años distintos.
+        // sea discreto. Sin esto, el follaje y la ecologia cuentan anos distintos.
         const double YearsPerTick = Eco->GetYearsPerTick();
         const double Years = Eco->GetTickCount() * YearsPerTick
             + Eco->GetInterpolationAlpha() * YearsPerTick;
@@ -1024,16 +1103,17 @@ void UTreeRenderSubsystem::UpdateSeason(float DeltaTime)
     }
     else if (S->bAutoAdvanceSeason && DeltaTime > 0.f)
     {
-        // MODO BAKE ESTATICO (o sim pausada): no hay años simulados que seguir, asi
+        // MODO BAKE ESTATICO (o sim pausada): no hay anos simulados que seguir, asi
         // que la estacion corre con su propio reloj para poder animar el beauty shot.
         const float Period = FMath::Max(0.1f, S->VisualYearSeconds);
         SeasonPhase = FMath::Frac(SeasonPhase + DeltaTime / Period);
     }
 
-    UMaterialParameterCollection* MPC = S->SeasonMPC.LoadSynchronous();
-    if (!MPC) { return; } // sin MPC asignado, el ciclo estacional simplemente no se aplica
+    // MPC resuelto una vez en EnsureInitialized (B6). Sin MPC asignado, el ciclo
+    // estacional simplemente no se aplica: no rompe nada.
+    if (!SeasonMPCCached) { return; }
 
-    if (UMaterialParameterCollectionInstance* Inst = World->GetParameterCollectionInstance(MPC))
+    if (UMaterialParameterCollectionInstance* Inst = World->GetParameterCollectionInstance(SeasonMPCCached))
     {
         Inst->SetScalarParameterValue(TEXT("Season"), SeasonPhase);
     }

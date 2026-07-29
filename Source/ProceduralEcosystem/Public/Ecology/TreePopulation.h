@@ -12,7 +12,9 @@ enum class ETreeState : uint8
 {
     Sapling,    // plantula: recien germinado, biomasa baja
     Mature,     // adulto: puede reproducirse (Age > SpeciesData->MaturityAge)
-    Senescent,  // declive: aun vivo pero con alta probabilidad de morir (placeholder Fase 5)
+    Senescent,  // declive (Fase 5): casi deja de crecer, se reproduce menos y su
+    // probabilidad de morir se multiplica. Es IRREVERSIBLE: una vez
+    // dentro no se vuelve a Mature aunque baje el estres.
     Dead        // marcado para compactar; no se dibuja ni se procesa
 };
 
@@ -37,7 +39,7 @@ enum class ETreeState : uint8
  */
 struct PROCEDURALECOSYSTEM_API FTreePopulation
 {
-    // --- Estado por-agente (arrays paralelos, mismo indice = mismo arbol) ---
+    
     TArray<FVector> Position;   // posicion de mundo, cm
     TArray<uint16>  SpeciesId;  // indice en UEcosystemSettings::Species (solo lectura)
     TArray<float>   Age;        // anios simulados
@@ -75,8 +77,8 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
      * Elimina todos los arboles marcados State == Dead, preservando el orden
      * relativo de los que quedan vivos (compactacion estable, doc. 2.7: "la
      * germinacion y compactacion en orden fijo"). No es la tecnica clasica de
-     * swap-with-last: esa reordena y rompe la correspondencia estable índice
-     * <-> "posición de nacimiento" que pide el documento para reproducibilidad.
+     * swap-with-last: esa reordena y rompe la correspondencia estable indice
+     * <-> "posicion de nacimiento" que pide el documento para reproducibilidad.
      * Devuelve cuantos arboles se eliminaron.
      */
     int32 CompactDead();

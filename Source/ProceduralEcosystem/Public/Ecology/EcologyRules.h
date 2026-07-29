@@ -8,12 +8,12 @@
 /**
  * Formulas puras del nucleo biologico (doc. Fase 2, seccion 2.6). Cada
  * funcion es un paso nombrado del pseudocodigo del documento: se pueden
- * testear por separado y se combinan en el bucle de tick (clase 5).
+ * testear por separado y se combinan en el bucle de tick.
  *
  * Deliberadamente NO tocan FTreePopulation, FSpatialHash ni los campos de
  * recursos: solo reciben floats y devuelven floats. Eso hace trivial
- * comprobar cada formula de forma aislada (p.ej. en un test o en el
- * inmediato Blueprint de debug) sin montar una simulacion entera.
+ * comprobar cada formula de forma aislada (ver Private/Test/EcoTests.cpp)
+ * sin montar una simulacion entera.
  */
 namespace EcologyRules
 {
@@ -42,7 +42,7 @@ namespace EcologyRules
     }
 
     /**
-     * Crecimiento logistico: lento en plantula (B pequeño), rapido a media
+     * Crecimiento logistico: lento en plantula (B pequeno), rapido a media
      * vida, saturante cerca de MaxBiomass (el termino 1-B/MaxBiomass tiende
      * a 0). Devuelve la NUEVA biomasa, ya sumado el incremento.
      */
@@ -59,7 +59,7 @@ namespace EcologyRules
      * H = MaxHeight * (B/MaxBiomass)^(1/3). La raiz cubica viene de asumir
      * que la biomasa escala aprox. con el volumen del arbol (~ largo^3): es
      * una aproximacion deliberadamente burda para la Fase 2 (solo alimenta
-     * el grid de luz y el tamaño de las esferas de debug); el Pipe Model de
+     * el grid de luz y el tamano de las esferas de debug); el Pipe Model de
      * la Fase 3 la sustituira por geometria real.
      */
     FORCEINLINE float HeightFromBiomass(float Biomass, float MaxBiomass, float MaxHeightCm)
@@ -100,17 +100,18 @@ namespace EcologyRules
         const float pStress = DtYears * Stress * StressMortalityWeight;
         return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
     }
+
     /**
-       * Senescencia (Fase 5): el arbol ENTRA en declive si es VIEJO (rebasa una
-       * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
-       * Devuelve true si cualquiera de las dos condiciones aplica.
-       *
-       * OJO: esta funcion decide la ENTRADA, no la permanencia. Es pura sobre el
-       * estres actual, asi que devuelve false en cuanto el arbol se recupera. La
-       * senescencia es irreversible, y esa persistencia la impone el llamante
-       * (SimulateTick) haciendo OR con el estado del tick anterior. No la uses
-       * sola para decidir si un arbol ES senescente.
-       */
+     * Senescencia (Fase 5): el arbol ENTRA en declive si es VIEJO (rebasa una
+     * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
+     * Devuelve true si cualquiera de las dos condiciones aplica.
+     *
+     * OJO: esta funcion decide la ENTRADA, no la permanencia. Es pura sobre el
+     * estres actual, asi que devuelve false en cuanto el arbol se recupera. La
+     * senescencia es irreversible, y esa persistencia la impone el llamante
+     * (SimulateTick) haciendo OR con el estado del tick anterior. No la uses
+     * sola para decidir si un arbol ES senescente.
+     */
     FORCEINLINE bool IsSenescent(float Age, float Longevity, float SenescenceAgeFraction,
         float Stress, float SenescenceStressThreshold)
     {
@@ -130,7 +131,8 @@ namespace EcologyRules
     {
         return bSenescent ? FMath::Clamp(pDeath * FMath::Max(1.f, Multiplier), 0.f, 1.f) : pDeath;
     }
-    /** Nº de semillas emitidas este tick (Poisson de media SeedRate*Biomass*dt). */
+
+    /** Numero de semillas emitidas este tick (Poisson de media SeedRate*Biomass*dt). */
     FORCEINLINE int32 ComputeSeedCount(float SeedRatePerBiomass, float Biomass, float DtYears,
         uint32& RngState)
     {
@@ -180,27 +182,49 @@ namespace EcologyRules
         const float Ratio = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
         return RootRadiusM * 100.f * Ratio;
     }
+
+    /** Cota superior de celdas que toca el kernel para un radio dado (reserva de scratch). */
+    FORCEINLINE int32 KernelCellCount(const FField2D& Geometry, float RadiusCm)
+    {
+        if (RadiusCm <= 0.f || Geometry.CellSize <= 0.0) { return 1; }
+        const int32 R = FMath::CeilToInt(RadiusCm / Geometry.CellSize);
+        return (2 * R + 1) * (2 * R + 1);
+    }
+
     /**
      * Reparte TotalAmount (puede ser negativo: consumo) entre las celdas de
-     * Deltas dentro de RadiusCm de WorldPos, con un kernel lineal
-     * NORMALIZADO (ver .cpp) para que la suma de lo depositado sea
-     * EXACTAMENTE TotalAmount pase lo que pase con el redondeo a celdas.
-     * Geometry describe la rejilla de Deltas (debe tener el mismo tamaño
-     * que el campo que se parcheará luego en la reducción).
-     * Solo escribe en Deltas: es la mitad "local al hilo" del patrón de
-     * scratch, así que es segura de llamar desde dentro de un ParallelFor.
+     * Deltas dentro de RadiusCm de WorldPos, con un kernel lineal NORMALIZADO
+     * (ver .cpp) para que la suma de lo depositado sea EXACTAMENTE TotalAmount
+     * pase lo que pase con el redondeo a celdas. Geometry describe la rejilla de
+     * Deltas (debe tener el mismo tamano que el campo que se parcheara despues).
+     *
+     * Version DENSA: escribe directamente sobre un campo completo. Usala solo
+     * desde codigo SERIAL (pulsos de muerte, campo de descomposicion).
      */
     void DepositKernel(const FField2D& Geometry, TArray<float>& Deltas,
         const FVector& WorldPos, float RadiusCm, float TotalAmount);
 
     /**
-     * Reducción serial (doc. 2.4): suma los deltas de agua/nutrientes de
-     * TODOS los contextos sobre los arrays de destino, recorriendo Contexts
-     * en orden de índice creciente (fijo — no depende de qué hilo físico
-     * ejecutó cada tarea). Concatena semillas y pulsos de muerte en ese
-     * mismo orden. DEBE llamarse siempre de forma serial, nunca dentro de
-     * un ParallelFor: es precisamente el punto donde el scratch privado de
-     * cada tarea vuelve a converger en un único estado compartido.
+     * Version DISPERSA del anterior: en vez de escribir en un campo del tamano
+     * del mundo, APENDA pares (celda, cantidad) a la lista de la tarea. Es la
+     * que usa el paso paralelo del tick (ver FCellDelta para el porque).
+     *
+     * Recorre las celdas exactamente en el mismo orden que la version densa, asi
+     * que la reduccion posterior es reproducible. Solo escribe en OutDeltas: es
+     * segura de llamar desde dentro de un ParallelFor.
+     */
+    void DepositKernelSparse(const FField2D& Geometry, TArray<FCellDelta>& OutDeltas,
+        const FVector& WorldPos, float RadiusCm, float TotalAmount);
+
+    /**
+     * Reduccion serial (doc. 2.4): aplica los deltas de agua/nutrientes de TODOS
+     * los contextos sobre los arrays de destino, recorriendo Contexts en orden de
+     * indice creciente (fijo: no depende de que hilo fisico ejecuto cada tarea) y,
+     * dentro de cada contexto, las entradas en su orden de insercion. Concatena
+     * semillas y pulsos de muerte en ese mismo orden. DEBE llamarse siempre de
+     * forma serial, nunca dentro de un ParallelFor: es precisamente el punto donde
+     * el scratch privado de cada tarea vuelve a converger en un unico estado
+     * compartido.
      */
     void ReduceScratchInto(const TArray<FTickScratch>& Contexts,
         TArray<float>& DestWater, TArray<float>& DestNutrient,

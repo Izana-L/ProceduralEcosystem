@@ -2,7 +2,7 @@
 
 void FSpatialHash::Init(const FBox2D& WorldBounds, double InCellSize)
 {
-    CellSize = FMath::Max(InCellSize, 1.0); // evita división por cero si llega un 0 por error
+    CellSize = FMath::Max(InCellSize, 1.0); // evita division por cero si llega un 0 por error
     Origin = WorldBounds.Min;
 
     const FVector2D Size = WorldBounds.Max - WorldBounds.Min;
@@ -11,6 +11,7 @@ void FSpatialHash::Init(const FBox2D& WorldBounds, double InCellSize)
 
     CellStart.Reset();
     SortedIdx.Reset();
+    Cursor.Reset();
 }
 
 void FSpatialHash::Build(const TArray<FVector>& Pos, int32 Num)
@@ -24,7 +25,6 @@ void FSpatialHash::Build(const TArray<FVector>& Pos, int32 Num)
     // SetNumZeroed siguiente re-cera todo el rango sin realojar.
     CellStart.Reset();
     CellStart.SetNumZeroed(NumCells + 1);
-
 
     // Pasada 1: contar cuantos agentes caen en cada celda (histograma).
     for (int32 i = 0; i < Num; ++i)
@@ -41,8 +41,10 @@ void FSpatialHash::Build(const TArray<FVector>& Pos, int32 Num)
 
     // Pasada 3: volcar. Cursor es una copia editable de los offsets; se usa
     // como "siguiente hueco libre" de cada celda y se va incrementando.
-    TArray<int32> Cursor = CellStart;
-    SortedIdx.SetNumUninitialized(Num);
+    // Es un MIEMBRO persistente: la asignacion reutiliza la capacidad de ticks
+    // anteriores en vez de pedir ~168 KB al heap cada vez (optimizacion C5).
+    Cursor = CellStart;
+    SortedIdx.SetNumUninitialized(Num, EAllowShrinking::No);
     for (int32 i = 0; i < Num; ++i)
     {
         const int32 c = CellOf(Pos[i]);

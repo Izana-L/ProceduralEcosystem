@@ -76,33 +76,30 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Recursos|Nutrientes", meta = (ClampMin = "1"))
     int32 NutrientOctaves = 3;
 
-    // --- Recursos: luz gruesa (Fase 1) ---
-    /** cm por voxel horizontal de la rejilla de luz (varios metros). */
-    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "1"))
-    float LightCellSizeXYCm = 400.f;
+    // --- Recursos: luz gruesa (Fase 1/2) ---
+    // NOTA (limpieza B1): aqui vivian LightCellSizeXYCm y LightCellSizeZCm, que NADIE
+    // leia -- el tamano de voxel sale de LightCoarseCellSizeCm, mas abajo. Tambien
+    // estaba LightCoarseLayers, que ahora se DERIVA (ver LightCanopyHeadroomCm).
+    // Si actualizas desde una version anterior, borra esas tres claves y las tres de
+    // TestTreeCanopy* de Config/DefaultGame.ini: son literales huerfanos.
 
-    /** cm por voxel vertical de la rejilla de luz. */
-    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "1"))
-    float LightCellSizeZCm = 400.f;
-
-    /** Margen de altura (cm) por encima del relieve para alojar las copas. */
+    /** Margen de altura (cm) por encima del ARBOL MAS ALTO que cubre la rejilla de luz.
+        El nº de capas se calcula solo a partir de la MaxHeightCm mayor de las especies
+        + este margen: la rejilla es relativa al terreno (ver FLightFieldCoarse), asi
+        que NO hace falta cubrir el desnivel del relieve. */
     UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "0"))
-    float LightCanopyHeadroomCm = 8000.f;
+    float LightCanopyHeadroomCm = 1500.f;
 
+    /** Margen (cm) POR DEBAJO del terreno que cubre la rejilla de luz. Da holgura en
+        pendientes fuertes, donde la copa de un vecino cuesta abajo cae por debajo de
+        la cota de esta columna. */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Luz", meta = (ClampMin = "0"))
+    float LightGroundClearanceCm = 800.f;
 
     /** Especie por defecto para el heatmap de idoneidad (índice en Species). */
     UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0"))
     int32 HeatmapSpeciesIndex = 0;
 
-    // --- Árboles de prueba (Eco.AddTree): copa que deposita sombra ---
-    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "1"))
-    float TestTreeCanopyRadiusCm = 1200.f;
-
-    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "1"))
-    float TestTreeCanopyDepthCm = 6000.f;
-
-    UPROPERTY(EditAnywhere, config, Category = "Vigor|Árbol de prueba", meta = (ClampMin = "0", ClampMax = "1"))
-    float TestTreeCanopyDensity = 0.9f;
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0.01"))
     float LightHalfSaturationMax = 5.f;
 
@@ -150,12 +147,22 @@ public:
     float NutrientDiffusionRate = 0.2f;
 
     // --- Ecología (Fase 2): grid de luz grueso (FLightFieldCoarse) ---
+    /** Lado del voxel de luz, horizontal y vertical (cm). El nº de capas NO se
+        configura: se deriva de la especie mas alta + LightCanopyHeadroomCm +
+        LightGroundClearanceCm, porque la rejilla es relativa al terreno. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "50"))
     float LightCoarseCellSizeCm = 400.f;
 
-    /** Nº de voxels verticales. Layers * LightCoarseCellSizeCm debe cubrir HeightScaleCm + el arbol mas alto posible. */
-    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
-    int32 LightCoarseLayers = 32;
+    /**
+     * Cada cuantos ticks se reconstruye el grid de luz grueso (optimizacion C6).
+     * 1 = cada tick (comportamiento exacto, por defecto). Las copas cambian de
+     * tamano despacio, asi que subirlo a 2-4 apenas altera el resultado y ahorra
+     * la pasada serial de ClearShadow + deposito. SUBELO SOLO SI EL PROFILING LO
+     * PIDE (doc. 6.4: medir primero) y anota el valor en la memoria, porque
+     * cambia el resultado de la simulacion (no es una optimizacion neutra).
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1", ClampMax = "16"))
+    int32 LightRebuildEveryNTicks = 1;
 
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float MinGerminationSpacingCm = 100.f;
@@ -358,6 +365,26 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
     int32 LitterPerDeath = 6;
 
+    /** Lado (cm) de una card de hojarasca en mundo. Antes era una constante
+        escondida en el .cpp junto al tamano de /Engine/BasicShapes/Plane; ahora la
+        escala se deriva de los bounds REALES de LitterMesh, asi que este valor es
+        el tamano que quieres ver, sea cual sea la malla que asignes. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "1"))
+    float LitterCardCm = 70.f;
+
+    /** Altura (cm) a la que se levanta la hojarasca sobre el terreno, para evitar
+        z-fighting con el material del suelo. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
+    float LitterGroundOffsetCm = 3.f;
+
+    /** La capa de suelo se apaga tambien cuando se apaga la capa de arboles
+        (bEnableTreeRendering / Eco.LOD.Enable 0). Es lo coherente para la ablacion
+        de la Fase 7: si comparas "con y sin capa de render", los tocones y la
+        hojarasca son parte de esa capa. Ponlo a false si quieres estudiarlas por
+        separado. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
+    bool bSoilFollowsTreeRendering = true;
+
     /** Radio (cm) de dispersion de la hojarasca alrededor de la muerte. */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo", meta = (ClampMin = "0"))
     float LitterRadiusCm = 300.f;
@@ -365,8 +392,8 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Suelo")
     bool bSnagsCastShadow = true;
 
-   // --- Paso 5: descomposicion visible en el terreno ---
-   /** Cuanto se desvanece por año la mancha de descomposicion (decaimiento exponencial). */
+    // --- Paso 5: descomposicion visible en el terreno ---
+    /** Cuanto se desvanece por año la mancha de descomposicion (decaimiento exponencial). */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Descomposicion", meta = (ClampMin = "0"))
     float DecompositionDecayPerYear = 0.5f;
 

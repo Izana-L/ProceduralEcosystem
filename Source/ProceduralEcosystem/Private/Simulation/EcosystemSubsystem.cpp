@@ -116,6 +116,21 @@ static FAutoConsoleCommandWithWorld GEcoClearHeroTrees(TEXT("Eco.ClearHeroTrees"
 static FAutoConsoleCommandWithWorld GEcoFingerprint(TEXT("Eco.Fingerprint"), TEXT("Loguea un hash del estado completo del bosque."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogStateFingerprint(); }));
 
+// Limpieza B1: estas tres estaban IMPLEMENTADAS pero sin comando que las
+// registrase, o sea codigo inalcanzable. CheckFinite y Profile son justo las que
+// hacen falta para los capitulos de robustez y de rendimiento de la memoria.
+static FAutoConsoleCommandWithWorld GEcoCheckFinite(TEXT("Eco.CheckFinite"),
+    TEXT("Comprueba que no hay NaN/Inf en la poblacion ni en los campos."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogFiniteCheck(); }));
+
+static FAutoConsoleCommandWithWorld GEcoPaintLight(TEXT("Eco.PaintLight"),
+    TEXT("Pinta el heatmap de luz disponible a ras de suelo."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->PaintLightField(); }));
+
+static FAutoConsoleCommandWithWorld GEcoProfile(TEXT("Eco.Profile"),
+    TEXT("Desglosa el coste del tick por etapas y la memoria de las estructuras (doc. 6.4)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogTickProfile(); }));
+
 // --- Fase 5 (Paso 1): eventos de muerte ---
 static FAutoConsoleCommandWithWorld GEcoLogDeaths(TEXT("Eco.Deaths.Log"),
     TEXT("Loguea el nº total de muertes y las ultimas del buffer (Fase 5)."),
@@ -188,6 +203,28 @@ void UEcosystemSubsystem::LogFiniteCheck() const
     Scan(WaterPool.Current.Data, TEXT("Water")); Scan(NutrientPool.Current.Data, TEXT("Nutrient"));
     Scan(LightCoarse.Shadow, TEXT("LightShadow"));
     if (!Bad) UE_LOG(LogEco, Log, TEXT("[Eco] CheckFinite OK (0 no-finitos)."));
+}
+
+void UEcosystemSubsystem::LogTickProfile() const
+{
+    // Memoria de las estructuras que la optimizacion vigila.
+    int64 ScratchBytes = 0;
+    for (const FTickScratch& Ctx : TickContexts) { ScratchBytes += Ctx.DeltaBytes(); }
+    const int64 LightBytes = LightCoarse.MemoryBytes();
+    const int64 FieldBytes = (int64)(WaterPool.Current.Data.Num() + WaterPool.Next.Data.Num()
+        + NutrientPool.Current.Data.Num() + NutrientPool.Next.Data.Num()
+        + DecompositionField.Data.Num()) * sizeof(float)
+        + WaterPool.ScratchBytes() + NutrientPool.ScratchBytes();
+
+    UE_LOG(LogEco, Log, TEXT("[Eco/Profile] Tick %lld | poblacion %d | %d tareas"),
+        TickCount, Agents_Read.Num(), TickContexts.Num());
+    UE_LOG(LogEco, Log, TEXT("[Eco/Profile] TOTAL %.3f ms = hash %.3f + luz %.3f + paralelo %.3f + reduccion %.3f + regen %.3f + germinacion %.3f"),
+        Profile.TotalMs, Profile.HashMs, Profile.LightMs, Profile.ParallelMs,
+        Profile.ReduceMs, Profile.RegenMs, Profile.GerminationMs);
+    UE_LOG(LogEco, Log, TEXT("[Eco/Profile] Memoria: scratch de deltas %.2f MB | grid de luz %.2f MB (%dx%dx%d) | campos 2D %.2f MB | hash %.2f MB"),
+        ScratchBytes / 1048576.0, LightBytes / 1048576.0,
+        LightCoarse.Width, LightCoarse.Height, LightCoarse.Layers,
+        FieldBytes / 1048576.0, Hash.ScratchBytes() / 1048576.0);
 }
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
@@ -263,7 +300,7 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     // Fase 5 (Paso 5): campo de descomposicion, misma geometria que los campos,
     // arranca a cero (aun no ha muerto nadie).
-    DecompositionField.Init(NutrientBase.Field.Width, NutrientBase.Field.Height,NutrientBase.Field.CellSize, NutrientBase.Field.Origin, 0.f);
+    DecompositionField.Init(NutrientBase.Field.Width, NutrientBase.Field.Height, NutrientBase.Field.CellSize, NutrientBase.Field.Origin, 0.f);
     // Fase 5 (Paso 1): anillo de muertes dimensionado UNA sola vez. Escritor
     // (RecordDeathEvent) y lector (CollectNewDeathEvents) tienen que usar el MISMO
     // modulo. Si el escritor lo leyera de los settings en cada muerte -y
@@ -274,24 +311,60 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     RecentDeaths.SetNum(FMath::Max(0, S->DeathEventBufferSize));
     DeathEventCounter = 0;
 
-    // 4) Grid de luz grueso: geometria derivada del relieve + settings.
     const FBox2D Bounds = HeightField.GetWorldBounds();
-    const int32 LightW = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.X - Bounds.Min.X) / S->LightCoarseCellSizeCm));
-    const int32 LightH = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.Y - Bounds.Min.Y) / S->LightCoarseCellSizeCm));
-    // Cubrir toda la altura del relieve + margen de copas (usa el setting antes muerto).
-    const double LightSpanZ = S->HeightScaleCm + S->LightCanopyHeadroomCm;
-    const int32  LightLayers = FMath::Max(1, FMath::CeilToInt32(LightSpanZ / S->LightCoarseCellSizeCm));
-    LightCoarse.Init(LightW, LightH, LightLayers, S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min, /*BaseZ*/ 0.0);
 
-    // 5) Spatial hash de agentes: geometria fijada una vez; se repuebla cada tick con Build().
-    Hash.Init(Bounds, S->SpatialHashCellSizeCm);
-
-    // 6) Cache de especies (una LoadSynchronous por especie, no por arbol/tick).
+    // 4) Cache de especies (una LoadSynchronous por especie, no por arbol/tick).
+    //    Va ANTES del grid de luz porque este dimensiona su altura a partir de la
+    //    especie mas alta (ver paso 5).
     ResolvedSpecies.Reset();
     for (const TSoftObjectPtr<USpeciesData>& SoftSp : S->Species)
     {
         ResolvedSpecies.Add(SoftSp.LoadSynchronous());
     }
+
+    // 5) Grid de luz grueso, RELATIVO AL TERRENO (optimizacion C2).
+    //    Antes cubria todo el desnivel del relieve en Z absoluta: con
+    //    HeightScaleCm = 30.000 cm y voxel de 400 cm salian 95 capas (~25 MB) de
+    //    las que cada columna usaba 5. Ahora la vertical se mide SOBRE EL SUELO,
+    //    asi que basta con cubrir el arbol mas alto + margenes: ~10 capas.
+    const int32 LightW = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.X - Bounds.Min.X) / S->LightCoarseCellSizeCm));
+    const int32 LightH = FMath::Max(1, FMath::CeilToInt32((Bounds.Max.Y - Bounds.Min.Y) / S->LightCoarseCellSizeCm));
+
+    float TallestSpeciesCm = 0.f;
+    for (const TObjectPtr<USpeciesData>& Sp : ResolvedSpecies)
+    {
+        if (Sp) { TallestSpeciesCm = FMath::Max(TallestSpeciesCm, Sp->MaxHeightCm); }
+    }
+    if (TallestSpeciesCm <= 0.f) { TallestSpeciesCm = 2000.f; } // sin especies: 20 m de cortesia
+
+    const double LightSpanZ = TallestSpeciesCm + S->LightCanopyHeadroomCm + S->LightGroundClearanceCm;
+    const int32  LightLayers = FMath::Max(2, FMath::CeilToInt32(LightSpanZ / S->LightCoarseCellSizeCm));
+    LightCoarse.Init(LightW, LightH, LightLayers,
+        S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min,
+        /*BaseZ = offset de la capa 0 bajo el suelo*/ -(double)S->LightGroundClearanceCm);
+
+    // Cota de terreno del centro de cada columna: es lo que convierte la rejilla
+    // en relativa al suelo. Se muestrea UNA vez (el relieve no cambia).
+    {
+        TArray<float> GroundZ;
+        GroundZ.SetNumUninitialized(LightW * LightH);
+        for (int32 Iy = 0; Iy < LightH; ++Iy)
+        {
+            const double Yc = Bounds.Min.Y + (Iy + 0.5) * S->LightCoarseCellSizeCm;
+            for (int32 Ix = 0; Ix < LightW; ++Ix)
+            {
+                const double Xc = Bounds.Min.X + (Ix + 0.5) * S->LightCoarseCellSizeCm;
+                GroundZ[Iy * LightW + Ix] = HeightField.SampleHeight(Xc, Yc);
+            }
+        }
+        LightCoarse.SetGroundHeights(MoveTemp(GroundZ));
+    }
+
+    UE_LOG(LogEco, Log, TEXT("[Eco] Grid de luz %dx%dx%d (%.1f MB, relativo al terreno; especie mas alta %.0f cm)."),
+        LightW, LightH, LightLayers, LightCoarse.MemoryBytes() / 1048576.0, TallestSpeciesCm);
+
+    // 6) Spatial hash de agentes: geometria fijada una vez; se repuebla cada tick con Build().
+    Hash.Init(Bounds, S->SpatialHashCellSizeCm);
 
     // 7) Visualizador de campos (heatmap).
     FieldViz = NewObject<UFieldVisualizer>(this);
@@ -303,6 +376,10 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 void UEcosystemSubsystem::Deinitialize()
 {
+    // Limpieza B13: se sueltan TODAS las referencias, no solo el decal. El GC se
+    // encargaria igual (son Transient), pero dejar punteros a objetos de un mundo
+    // que ya no existe es una fuente clasica de accesos tardios, y ademas el
+    // mismo patron de ReleaseEverything() del subsistema de render.
     ClearHeroTrees();
 
     if (HeatmapDecal)
@@ -310,6 +387,20 @@ void UEcosystemSubsystem::Deinitialize()
         HeatmapDecal->Destroy();
         HeatmapDecal = nullptr;
     }
+    HeatmapMID = nullptr;
+    FieldViz = nullptr;
+
+    OnStateLoaded.Clear(); // no dejar suscriptores de un mundo que se va
+
+    TickContexts.Reset();
+    NewbornPositions.Reset();
+    PendingSeeds.Reset();
+    PendingDeaths.Reset();
+    RecentDeaths.Reset();
+    ResolvedSpecies.Reset();
+    DebugAgents.Reset();
+    bWorldReady = false;
+
     Super::Deinitialize();
 }
 
@@ -323,12 +414,28 @@ void UEcosystemSubsystem::Tick(float DeltaTime)
         return;
     }
 
-    // Pasos manuales (Eco.Step): siempre se ejecutan, aunque este pausado.
-    while (PendingSteps > 0)
+    // Pasos manuales (Eco.Step): se ejecutan aunque este pausado, pero AMORTIZADOS
+    // (correccion B10). Antes se vaciaba PendingSteps entero en un frame mientras
+    // que el avance automatico si estaba capado: un `Eco.Step 500` -que es
+    // exactamente el flujo de "bake a un año objetivo" del Paso 6- congelaba el
+    // editor varios segundos sin ningun feedback. Ahora se reparten por frames y
+    // se loguea el progreso.
+    if (PendingSteps > 0)
     {
-        SimulateTick(YearsPerTick);
-        ++TickCount;
-        --PendingSteps;
+        const int32 Budget = FMath::Max(1, MaxStepsPerFrame);
+        const int32 ThisFrame = FMath::Min(PendingSteps, Budget);
+        for (int32 k = 0; k < ThisFrame; ++k)
+        {
+            SimulateTick(YearsPerTick);
+            ++TickCount;
+        }
+        PendingSteps -= ThisFrame;
+
+        if (PendingSteps > 0 && (PendingSteps % 50) < Budget)
+        {
+            UE_LOG(LogEco, Log, TEXT("[Eco] Eco.Step: quedan %d ticks (tick actual %lld, %d arboles)."),
+                PendingSteps, TickCount, Agents_Read.Num());
+        }
     }
 
     // Avance automatico (modo vivo).
@@ -385,19 +492,27 @@ static void GetChunkRange(int32 ChunkIndex, int32 NumChunks, int32 PopulationNum
 void UEcosystemSubsystem::SimulateTick(float DtYears)
 {
     const UEcosystemSettings* Settings = UEcosystemSettings::Get();
+    const double TickT0 = FPlatformTime::Seconds();
 
     // ================================================================
     // PRE (serial): estructuras derivadas del snapshot de lectura.
     // ================================================================
+    // El hash lo consume el espaciado minimo de germinacion del paso 3 y, a
+    // partir de la Fase 3, las consultas por rango del SCA. La competencia por
+    // recursos NO pasa por el: se resuelve a traves de los campos compartidos
+    // (consumo de agua/nutrientes + sombra de luz).
     Hash.Build(Agents_Read.Position, Agents_Read.Num());
-    // NOTA: el hash queda listo para consultas de vecindad, pero esta
-    // primera version de la Fase 2 resuelve la competencia enteramente a
-    // traves de los campos compartidos (consumo de agua/nutrientes + sombra
-    // de luz), no con consultas punto-a-punto. Se consumira directamente en
-    // la Fase 3 (busqueda de puntos de atraccion del SCA) y esta disponible
-    // ya para cualquier extension futura (p.ej. densidad local en germinacion).
+    const double AfterHash = FPlatformTime::Seconds();
 
-    RebuildCoarseLight();
+    // Cadencia de la luz gruesa (optimizacion C6): por defecto cada tick, que es
+    // el comportamiento exacto. Subir LightRebuildEveryNTicks ahorra la pasada
+    // serial a cambio de que las copas tarden en proyectar su sombra nueva.
+    const int32 LightEvery = FMath::Max(1, Settings->LightRebuildEveryNTicks);
+    if ((TickCount % LightEvery) == 0)
+    {
+        RebuildCoarseLight();
+    }
+    const double AfterLight = FPlatformTime::Seconds();
 
     Agents_Write.CopyFrom(Agents_Read);
     WaterPool.BeginTick();
@@ -418,24 +533,26 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     const int32 PopNum = Agents_Read.Num();
     const int32 GrainSize = FMath::Max(1, Settings->TickChunkGrainSize);
     const int32 NumChunks = FMath::Clamp(FMath::DivideAndRoundUp(PopNum, GrainSize), 1, kMaxTickChunks);
-    const int32 NumCells = WaterPool.Current.Num();
 
-    // Scratch PERSISTENTE (miembro): se dimensiona a NumChunks reutilizando la
-    // memoria de ticks anteriores. Cada contexto se pone a cero (ResetForNextTick)
-    // o se crea a tamano de campo la primera vez / si NumChunks crecio. Antes se
-    // reasignaban NumChunks arrays del tamano del campo EN CADA tick (cientos de
-    // KB-MB de churn de heap por tick); ahora es cero asignaciones en regimen.
+    // Scratch PERSISTENTE (miembro) y DISPERSO (optimizacion C1): cada tarea
+    // acumula pares (celda, cantidad) en vez de un campo denso del tamano del
+    // mundo. Ver la nota larga en FCellDelta: la version densa gastaba ~64 MB y
+    // 16,8 M sumas seriales por tick para mover ~360.000 valores reales.
+    // Aqui solo se vacian los buffers (Reset conserva la capacidad) y se reserva
+    // de una vez lo que se espera depositar, para que los Add() no realojen.
+    float MaxRootRadiusCm = 0.f;
+    for (const TObjectPtr<USpeciesData>& Sp : ResolvedSpecies)
+    {
+        if (Sp) { MaxRootRadiusCm = FMath::Max(MaxRootRadiusCm, Sp->RootRadius * 100.f); }
+    }
+    const int32 CellsPerTree = EcologyRules::KernelCellCount(WaterBase.Field, MaxRootRadiusCm);
+    const int32 TreesPerChunk = FMath::DivideAndRoundUp(PopNum, FMath::Max(1, NumChunks));
+
     TickContexts.SetNum(NumChunks);
     for (FTickScratch& Ctx : TickContexts)
     {
-        if (Ctx.WaterDeltas.Num() != NumCells)
-        {
-            Ctx.InitFromFieldSize(NumCells);
-        }
-        else
-        {
-            Ctx.ResetForNextTick();
-        }
+        Ctx.ResetForNextTick();
+        Ctx.ReserveForTrees(TreesPerChunk, CellsPerTree);
     }
 
     // ================================================================
@@ -478,9 +595,6 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 // Senescencia: se decide con el estres del tick ANTERIOR
                 // (Agents_Read.Stress) para no depender del estres que aun no se
                 // ha calculado este tick -> el orden sigue siendo determinista.
-                // Senescencia: se decide con el estres del tick ANTERIOR
-                // (Agents_Read.Stress) para no depender del estres que aun no se
-                // ha calculado este tick -> el orden sigue siendo determinista.
                 //
                 // Y es una puerta de UN SOLO SENTIDO: IsSenescent es funcion pura del
                 // estres ACTUAL, asi que por si sola haria que un arbol que se recupera
@@ -488,11 +602,10 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 // (el declive no se revierte). Se hace "pegajosa" leyendo el estado del
                 // snapshot de lectura, que es inmutable durante todo el tick: sigue
                 // siendo determinista bajo paralelismo.
-                const bool bSenescent = (Agents_Read.State[i] == ETreeState::Senescent) ||
-                                         EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction, Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
-                    
-                       
-                        
+                const bool bSenescent =
+                    (Agents_Read.State[i] == ETreeState::Senescent) ||
+                    EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
+                        Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
 
                 // En declive el arbol casi deja de crecer.
                 const float EffGrowthRate = Sp->GrowthRate *
@@ -511,11 +624,12 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     Settings->StressVigorThreshold, Settings->StressAccumulationRate,
                     Settings->StressRecoveryRate, DtYears);
 
-                // 2e) consumo -> SOLO al scratch de este chunk
+                // 2e) consumo -> SOLO al scratch de este chunk, en forma DISPERSA
+                //     (lista de (celda, cantidad), ver C1 en FCellDelta).
                 const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, NewBiomass, Sp->MaxBiomass);
-                EcologyRules::DepositKernel(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
+                EcologyRules::DepositKernelSparse(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
                     -NewBiomass * Sp->WaterDemand * DtYears);
-                EcologyRules::DepositKernel(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
+                EcologyRules::DepositKernelSparse(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
                     -NewBiomass * Sp->NutrientDemand * DtYears);
 
                 // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
@@ -539,7 +653,9 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     Pulse.HeightCm = Agents_Write.Height[i];
                     Ctx.DeathPulses.Add(Pulse);
                 }
-                else if (NewAge >= Sp->MaturityAge && (Agents_Write.State[i] == ETreeState::Mature ||Agents_Write.State[i] == ETreeState::Senescent))          
+                else if (NewAge >= Sp->MaturityAge &&
+                    (Agents_Write.State[i] == ETreeState::Mature ||
+                        Agents_Write.State[i] == ETreeState::Senescent))
                 {
                     // 2g) semillas (solo si sigue vivo y ha alcanzado la madurez).
                     //     El senescente SIGUE reproduciendose, con menos fuerza: cortarlo
@@ -548,9 +664,11 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     //     La comprobacion explicita de MaturityAge hace falta ahora porque
                     //     un SAPLING muy estresado tambien entra en Senescent, y una
                     //     plantula no se reproduce.
-                    const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f) : 1.f;
-                    const int32 NumSeeds = EcologyRules::ComputeSeedCount( Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
-                       
+                    const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)
+                        ? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f)
+                        : 1.f;
+                    const int32 NumSeeds = EcologyRules::ComputeSeedCount(
+                        Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
                     const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
 
                     for (int32 s = 0; s < NumSeeds; ++s)
@@ -567,15 +685,20 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
             }
         }, Flags);
 
+    const double AfterParallel = FPlatformTime::Seconds();
+
     // ================================================================
     // PASO 3 (serial): reduccion -> regeneracion -> pulsos de muerte -> germinacion.
     // ================================================================
-    TArray<FPendingSeed> PendingSeeds;
-    TArray<FPendingDeathPulse> PendingDeaths;
+    // PendingSeeds/PendingDeaths son MIEMBROS (C5): ReduceScratchInto los hace
+    // Reset(), asi que conservan la capacidad de ticks anteriores y una oleada de
+    // germinacion no vuelve a pedir memoria al heap.
     EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+    const double AfterReduce = FPlatformTime::Seconds();
 
     WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
     NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
+    const double AfterRegen = FPlatformTime::Seconds();
 
     // Fase 5 (Paso 5): envejece las manchas de descomposicion existentes
     // (decaimiento exponencial) antes de sumar las de este tick.
@@ -622,12 +745,11 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         FVector GerminationPos = Seed.Position;
         GerminationPos.Z = HeightField.SampleHeight(GerminationPos.X, GerminationPos.Y);
 
-        // Espaciado minimo: no germinar pegada a un arbol ya vivo. Aqui es donde
-        // el spatial hash (que se reconstruye cada tick pero hasta ahora no tenia
-        // consumidor) empieza a ganarse el coste. El hash indexa Agents_Read;
-        // consultamos Agents_Write.State para NO dejar que un arbol muerto ESTE
-        // tick bloquee el hueco que acaba de liberar. El booleano no depende del
-        // orden de visita -> sigue siendo determinista.
+        // Espaciado minimo: no germinar pegada a un arbol ya vivo. Es el consumidor
+        // principal del spatial hash. El hash indexa Agents_Read; consultamos
+        // Agents_Write.State para NO dejar que un arbol muerto ESTE tick bloquee el
+        // hueco que acaba de liberar. El booleano no depende del orden de visita ->
+        // sigue siendo determinista.
         bool bTooClose = false;
         Hash.ForEachNeighbor(GerminationPos, Settings->MinGerminationSpacingCm,
             [&](int32 NeighborIdx)
@@ -678,7 +800,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         if (EcoRand::NextUnit(SeedRng) < pGerm)
         {
             Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * kGerminationBiomassFraction);
-            NewbornPositions.Add(GerminationPos); 
+            NewbornPositions.Add(GerminationPos);
         }
     }
 
@@ -690,6 +812,17 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     Swap(Agents_Read, Agents_Write);
     WaterPool.SwapBuffers();
     NutrientPool.SwapBuffers();
+
+    // Instrumentacion (Eco.Profile): media exponencial del coste de cada etapa.
+    // Es lo que el doc. 6.4 exige tener ANTES de decidir que se optimiza.
+    const double TickT1 = FPlatformTime::Seconds();
+    FEcoTickProfile::Accumulate(Profile.HashMs, (AfterHash - TickT0) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.LightMs, (AfterLight - AfterHash) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.ParallelMs, (AfterParallel - AfterLight) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.ReduceMs, (AfterReduce - AfterParallel) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.RegenMs, (AfterRegen - AfterReduce) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.GerminationMs, (TickT1 - AfterRegen) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.TotalMs, (TickT1 - TickT0) * 1000.0);
 
     if ((TickCount % 20) == 0)
     {
@@ -838,7 +971,7 @@ void UEcosystemSubsystem::LogPopulationStats() const
     }
 
     UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion total: %d | %s"),
-        TickCount, Agents_Read.Num(), *Breakdown);
+        TickCount, GetLivePopulationCount(), *Breakdown);
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,7 +1322,7 @@ void UEcosystemSubsystem::DrawDebug()
     // para ver las manchas de muerte aparecer y desvanecerse en el terreno.
     if (CVarDecompLive.GetValueOnGameThread() != 0 && LastDecompPaintTick != TickCount)
     {
-        PaintDecompositionField();
+        PaintDecompositionField(/*bLogResult*/ false); // B9: sin spam de log por tick
         LastDecompPaintTick = TickCount;
     }
 
@@ -1294,7 +1427,7 @@ void UEcosystemSubsystem::PaintLightField()
     EnsureHeatmapDecal();
     UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de luz (ras de suelo) pintado."));
 }
-void UEcosystemSubsystem::PaintDecompositionField()
+void UEcosystemSubsystem::PaintDecompositionField(bool bLogResult)
 {
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     if (!FieldViz || !DecompositionField.IsValid()) { return; }
@@ -1302,12 +1435,24 @@ void UEcosystemSubsystem::PaintDecompositionField()
     // maximo del campo entre ticks (el auto-rango haria "latir" el heatmap).
     FieldViz->UpdateFromField(DecompositionField.Data, 0.f, FMath::Max(0.001f, S->DecompositionPaintMax));
     EnsureHeatmapDecal();
-    UE_LOG(LogEco, Log, TEXT("[Eco/F5] Heatmap de descomposicion (puntos de muerte) pintado."));
+    if (bLogResult)
+    {
+        UE_LOG(LogEco, Log, TEXT("[Eco/F5] Heatmap de descomposicion (puntos de muerte) pintado."));
+    }
 }
 void UEcosystemSubsystem::EnsureHeatmapDecal()
 {
     UWorld* World = GetWorld();
     if (!World || !FieldViz || !FieldViz->GetTexture()) return;
+
+    // Camino rapido: ya esta todo montado y el decal no se mueve. Evita repetir el
+    // LoadSynchronous del material y el SpawnActor en cada repintado, que en modo
+    // live (Eco.Decomp.Live 1) es una vez por tick.
+    if (HeatmapDecal && HeatmapMID)
+    {
+        HeatmapMID->SetTextureParameterValue(TEXT("FieldTex"), FieldViz->GetTexture());
+        return;
+    }
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     UMaterialInterface* Base = S->HeatmapDecalMaterial.LoadSynchronous();

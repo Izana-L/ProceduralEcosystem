@@ -2,6 +2,9 @@
 #include "Core/EcoCore.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TreePopulation.h"
+#include "Ecology/TickScratch.h"
+#include "Terrain/Field2D.h"
+#include "Terrain/LightFieldCoarse.h"
 #include "Render/TreeArchetype.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -30,7 +33,7 @@ bool FEcoVigor::RunTest(const FString&) {
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoNaN, "Eco.Robustez.NoNaN", EcoTestFlags)
 bool FEcoNaN::RunTest(const FString&) {
-    const float B = EcologyRules::GrowBiomassLogistic(0.f, 0.5f, 0.25f, 0.f, 1.f); 
+    const float B = EcologyRules::GrowBiomassLogistic(0.f, 0.5f, 0.25f, 0.f, 1.f);
     TestTrue(TEXT("GrowBiomass finito"), FMath::IsFinite(B));
     TestTrue(TEXT("Height finito"), FMath::IsFinite(EcologyRules::HeightFromBiomass(1.f, 0.f, 2000.f)));
     return true;
@@ -97,6 +100,190 @@ bool FEcoLodRemap::RunTest(const FString&) {
     TestEqual(TEXT("id en 2 == 14"), Mapping[2], 14u);
     TestEqual(TEXT("12 reubicado a 1"), NewIndexOf.FindRef(12u), 1);
     TestEqual(TEXT("14 reubicado a 2"), NewIndexOf.FindRef(14u), 2);
+    return true;
+}
+
+// =============================================================================
+//  Fase 5 (correccion B14): la fase se subio sin un solo test. Estos cubren las
+//  tres piezas que de verdad tenian logica sutil -y donde estaban los bugs-:
+//  la senescencia, el anillo de muertes y el kernel disperso de la Fase C1.
+// =============================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSenescence, "Eco.Fase5.Senescencia", EcoTestFlags)
+bool FEcoSenescence::RunTest(const FString&) {
+    const float Longevity = 200.f, AgeFrac = 0.75f, StressThr = 0.85f;
+
+    // Entrada por VEJEZ: 0.75*200 = 150 anios.
+    TestFalse(TEXT("joven y sin estres: no senescente"),
+        EcologyRules::IsSenescent(100.f, Longevity, AgeFrac, 0.f, StressThr));
+    TestTrue(TEXT("pasada la fraccion de longevidad: senescente"),
+        EcologyRules::IsSenescent(150.f, Longevity, AgeFrac, 0.f, StressThr));
+
+    // Entrada por ESTRES, aunque sea joven.
+    TestTrue(TEXT("estres por encima del umbral: senescente"),
+        EcologyRules::IsSenescent(10.f, Longevity, AgeFrac, 0.9f, StressThr));
+
+    // IsSenescent es pura sobre el estres ACTUAL: por si sola NO recuerda. La
+    // irreversibilidad la impone SimulateTick con un OR contra el estado previo;
+    // este test documenta el contrato para que nadie la use suelta.
+    TestFalse(TEXT("IsSenescent no recuerda: al recuperarse devuelve false"),
+        EcologyRules::IsSenescent(10.f, Longevity, AgeFrac, 0.1f, StressThr));
+
+    // El crecimiento se frena y la mortalidad se multiplica, ambos acotados.
+    TestEqual(TEXT("sano: crecimiento x1"), EcologyRules::SenescentGrowthFactor(false, 0.1f), 1.f);
+    TestEqual(TEXT("senescente: crecimiento x escala"), EcologyRules::SenescentGrowthFactor(true, 0.1f), 0.1f);
+    TestEqual(TEXT("sano: pDeath intacta"), EcologyRules::ApplySenescentMortality(0.2f, false, 3.f), 0.2f);
+    TestTrue(TEXT("senescente: pDeath x3"),
+        FMath::IsNearlyEqual(EcologyRules::ApplySenescentMortality(0.2f, true, 3.f), 0.6f, 1e-5f));
+    TestEqual(TEXT("pDeath nunca pasa de 1"), EcologyRules::ApplySenescentMortality(0.5f, true, 10.f), 1.f);
+    TestEqual(TEXT("multiplicador < 1 no reduce la mortalidad"),
+        EcologyRules::ApplySenescentMortality(0.2f, true, 0.5f), 0.2f);
+    return true;
+}
+
+/**
+ * Anillo de muertes: reproduce la logica de RecordDeathEvent /
+ * CollectNewDeathEvents con la capacidad FIJA de la correccion A9. Lo importante
+ * es el WRAP-AROUND: es la parte con indices modulares y era donde el escritor y
+ * el lector podian desincronizarse.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeathRing, "Eco.Fase5.AnilloDeMuertes", EcoTestFlags)
+bool FEcoDeathRing::RunTest(const FString&) {
+    const int32 Cap = 8;
+    TArray<int64> Ring; Ring.SetNumZeroed(Cap); // guardamos el id global de cada evento
+    int64 Counter = 0;
+
+    auto Record = [&](int64 Id) { Ring[static_cast<int32>(Counter % Cap)] = Id; ++Counter; };
+    auto Collect = [&](int64& Cursor, TArray<int64>& Out)
+        {
+            const int64 From = FMath::Max<int64>(Cursor, Counter - Cap);
+            for (int64 g = From; g < Counter; ++g) { Out.Add(Ring[static_cast<int32>(g % Cap)]); }
+            Cursor = Counter;
+        };
+
+    // 1) Fase de llenado: el consumidor ve exactamente lo que se escribio.
+    int64 Cursor = 0;
+    for (int64 i = 0; i < 5; ++i) { Record(i); }
+    TArray<int64> Out;
+    Collect(Cursor, Out);
+    TestEqual(TEXT("llenado: 5 eventos"), Out.Num(), 5);
+    for (int32 k = 0; k < Out.Num(); ++k) { TestEqual(TEXT("llenado: en orden"), Out[k], (int64)k); }
+
+    // 2) Nada nuevo -> nada que entregar (el cursor ya esta al dia).
+    Out.Reset(); Collect(Cursor, Out);
+    TestEqual(TEXT("sin muertes nuevas: 0 eventos"), Out.Num(), 0);
+
+    // 3) WRAP-AROUND: se escriben mas de Cap eventos sin consumir. Solo deben
+    //    entregarse los ultimos Cap, y en orden.
+    for (int64 i = 5; i < 30; ++i) { Record(i); }
+    Out.Reset(); Collect(Cursor, Out);
+    TestEqual(TEXT("wrap: solo caben Cap eventos"), Out.Num(), Cap);
+    TestEqual(TEXT("wrap: el mas antiguo disponible es Counter-Cap"), Out[0], (int64)(30 - Cap));
+    TestEqual(TEXT("wrap: el ultimo es el mas reciente"), Out.Last(), (int64)29);
+    for (int32 k = 1; k < Out.Num(); ++k)
+    {
+        TestEqual(TEXT("wrap: consecutivos"), Out[k], Out[k - 1] + 1);
+    }
+
+    // 4) El cursor queda al dia tras consumir.
+    TestEqual(TEXT("cursor al dia"), Cursor, Counter);
+    return true;
+}
+
+/**
+ * Kernel disperso (optimizacion C1): debe repartir EXACTAMENTE la misma cantidad
+ * que la version densa, celda a celda. Si esto pasa, la reduccion nueva produce
+ * el mismo campo que la vieja salvo por el orden de suma en punto flotante.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSparseKernel, "Eco.Fase5.KernelDisperso", EcoTestFlags)
+bool FEcoSparseKernel::RunTest(const FString&) {
+    FField2D Geometry;
+    Geometry.Init(16, 16, /*CellSize*/ 100.0, FVector2D::ZeroVector, 0.f);
+
+    const FVector Pos(750.0, 820.0, 0.0);
+    const float Radius = 350.f;
+    const float Amount = -12.5f;
+
+    // Denso
+    TArray<float> Dense; Dense.SetNumZeroed(Geometry.Num());
+    EcologyRules::DepositKernel(Geometry, Dense, Pos, Radius, Amount);
+
+    // Disperso -> aplicado sobre un campo equivalente
+    TArray<FCellDelta> Sparse;
+    EcologyRules::DepositKernelSparse(Geometry, Sparse, Pos, Radius, Amount);
+    TArray<float> FromSparse; FromSparse.SetNumZeroed(Geometry.Num());
+    for (const FCellDelta& D : Sparse)
+    {
+        TestTrue(TEXT("celda dentro de rango"), FromSparse.IsValidIndex(D.Cell));
+        FromSparse[D.Cell] += D.Amount;
+    }
+
+    TestTrue(TEXT("el kernel deposita en alguna celda"), Sparse.Num() > 0);
+    for (int32 c = 0; c < Dense.Num(); ++c)
+    {
+        TestTrue(TEXT("denso == disperso celda a celda"),
+            FMath::IsNearlyEqual(Dense[c], FromSparse[c], 1e-4f));
+    }
+
+    // Conservacion de masa: el kernel esta normalizado, asi que la suma de lo
+    // depositado es exactamente TotalAmount (esa es la razon de las dos pasadas).
+    float Total = 0.f;
+    for (const FCellDelta& D : Sparse) { Total += D.Amount; }
+    TestTrue(TEXT("se deposita exactamente TotalAmount"), FMath::IsNearlyEqual(Total, Amount, 1e-3f));
+
+    // Radio 0 o cantidad 0: no se emite nada (y no se peta).
+    Sparse.Reset();
+    EcologyRules::DepositKernelSparse(Geometry, Sparse, Pos, 0.f, Amount);
+    TestEqual(TEXT("radio 0 -> sin deltas"), Sparse.Num(), 0);
+    EcologyRules::DepositKernelSparse(Geometry, Sparse, Pos, Radius, 0.f);
+    TestEqual(TEXT("cantidad 0 -> sin deltas"), Sparse.Num(), 0);
+    return true;
+}
+
+/**
+ * Rejilla de luz relativa al terreno (optimizacion C2): dos columnas con cotas
+ * muy distintas deben comportarse IGUAL para la misma altura sobre el suelo. Es
+ * justo lo que la version absoluta no hacia.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLightTerrainRelative, "Eco.Fase5.LuzRelativaAlTerreno", EcoTestFlags)
+bool FEcoLightTerrainRelative::RunTest(const FString&) {
+    FLightFieldCoarse Light;
+    const int32 W = 8, H = 8, L = 10;
+    const double Cell = 400.0;
+    Light.Init(W, H, L, Cell, Cell, FVector2D::ZeroVector, /*BaseZ*/ -400.0);
+    TestFalse(TEXT("sin GroundZ es absoluta"), Light.IsTerrainRelative());
+
+    // Columna 1 en un valle (z=0), columna 6 en una cresta (z=10.000 cm).
+    TArray<float> Ground; Ground.SetNumZeroed(W * H);
+    for (int32 y = 0; y < H; ++y)
+        for (int32 x = 0; x < W; ++x)
+            Ground[y * W + x] = (x >= 4) ? 10000.f : 0.f;
+    Light.SetGroundHeights(MoveTemp(Ground));
+    TestTrue(TEXT("con GroundZ es relativa"), Light.IsTerrainRelative());
+
+    // Sin sombra: luz plena en cualquier sitio.
+    TestEqual(TEXT("sin sombra = luz plena"),
+        Light.SampleLight(FVector(600.0, 600.0, 300.0)), FLightFieldCoarse::FullSunlight);
+
+    // Dos copas identicas, una en cada altiplano, a la MISMA altura sobre el suelo.
+    const float CanopyR = 500.f, CanopyDepth = 1200.f;
+    Light.DepositCanopyShadow(FVector(600.0, 600.0, 0.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
+    Light.DepositCanopyShadow(FVector(2200.0, 600.0, 10000.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
+
+    // A ras de suelo, bajo cada copa, la luz debe ser la MISMA pese a los 100 m
+    // de diferencia de cota.
+    const float ValleyQ = Light.SampleLight(FVector(600.0, 600.0, 0.0 + 50.0));
+    const float RidgeQ = Light.SampleLight(FVector(2200.0, 600.0, 10000.0 + 50.0));
+    TestTrue(TEXT("misma altura sobre el suelo -> misma luz"),
+        FMath::IsNearlyEqual(ValleyQ, RidgeQ, 1e-4f));
+    TestTrue(TEXT("bajo la copa hay sombra"), ValleyQ < FLightFieldCoarse::FullSunlight);
+
+    // Y una copa NO puede sombrear la otra columna (estan lejos en XY).
+    const float FarQ = Light.SampleLight(FVector(3400.0, 2600.0, 10000.0 + 50.0));
+    TestEqual(TEXT("lejos de toda copa = luz plena"), FarQ, FLightFieldCoarse::FullSunlight);
+
+    // La rejilla es pequena: es el objetivo de la optimizacion.
+    TestTrue(TEXT("la rejilla cabe en pocas capas"), Light.Layers <= 16);
     return true;
 }
 #endif

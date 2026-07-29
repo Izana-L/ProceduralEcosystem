@@ -20,14 +20,14 @@ struct FLightFieldCoarse;
  * masa (Fase 4) sera instancias de una libreria.
  *
  * Flujo de Generate(): SCA en MUNDO (para leer la sombra de vecinos del grid
- * grueso) -> mallado -> los vertices se pasan a LOCAL (base del tronco = origen
+ * grueso)  mallado  los vertices se pasan a LOCAL (base del tronco = origen
  * del actor) y se suben a un UProceduralMeshComponent con dos secciones
  * (0 = madera, 1 = follaje), cada una con su material.
  *
  * Dos formas de uso:
- *   - Runtime, desde el ecosistema: UEcosystemSubsystem::SpawnHeroTree llama a
- *     Generate() con la especie, la semilla del arbol y la luz gruesa actual.
- *   - Suelto en editor: coloca el actor, asigna DebugSpecies y pulsa
+ *    Runtime, desde el ecosistema: UEcosystemSubsystem::SpawnHeroTree llama a
+ *    Generate() con la especie, la semilla del arbol y la luz gruesa actual.
+ *    Suelto en editor: coloca el actor, asigna DebugSpecies y pulsa
  *     "Regenerate" (crece sin contexto de vecinos, CoarseLight = nullptr).
  */
 UCLASS()
@@ -43,16 +43,16 @@ public:
     /**
      * Genera el arbol y sube la malla. WorldTrunkBase es la base del tronco en
      * mundo; el actor se coloca ahi y la malla queda relativa a el. CoarseLight
-     * puede ser nullptr (demo sin ecosistema -> sin sombra de vecinos).
+     * puede ser nullptr (demo sin ecosistema  sin sombra de vecinos).
      */
     void Generate(const USpeciesData* InSpecies, uint32 Seed,
         const FLightFieldCoarse* CoarseLight, const FVector& WorldTrunkBase);
 
-    /** Nº de nodos del ultimo esqueleto generado (para logs/tests). */
+   
     int32 GetNodeCount() const { return Skeleton.Num(); }
 
     /**
-     * Re-genera con los parametros actuales. Si nunca se llamo a Generate
+     * Regenera con los parametros actuales. Si nunca se llamo a Generate
      * (arbol suelto en editor), usa DebugSpecies/DebugSeed y la posicion del
      * actor, sin sombra de vecinos.
      */
@@ -81,10 +81,18 @@ public:
     bool bEnablePhototropism = true;
 
     // --- Debug draw (esqueleto + atractores) ---
+    /** Usa SetDrawDebug() en codigo: ademas de este flag, enciende/apaga el Tick
+        del actor (que solo existe para este dibujo, ver C7 en el constructor). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree|Debug")
     bool bDrawDebug = false;
 
+    /** Enciende/apaga el debug draw Y el Tick del actor a la vez. */
+    UFUNCTION(BlueprintCallable, Category = "Hero Tree|Debug")
+    void SetDrawDebug(bool bInDrawDebug);
+
 protected:
+    virtual void BeginPlay() override;
+
     /** Hace que el actor tambien tickee en el viewport del editor (sin darle a
         Play), para que el debug draw del esqueleto/atractores se vea al pulsar
         Regenerate. Sin esto, los AActor solo tickean en PIE. */

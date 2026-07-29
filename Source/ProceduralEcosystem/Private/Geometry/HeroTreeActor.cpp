@@ -6,10 +6,28 @@
 
 AHeroTreeActor::AHeroTreeActor()
 {
-    PrimaryActorTick.bCanEverTick = true; // solo para el debug draw
+    // El Tick de este actor SOLO sirve para el debug draw del esqueleto y los
+    // atractores. Optimizacion C7: arranca DESACTIVADO y lo enciende bDrawDebug.
+    // Con la cache LRU del gestor de LOD puede haber hasta 2*HeroBudget actores
+    // vivos (48 por defecto), y antes todos tickeaban cada frame solo para hacer
+    // un early-out. No son milisegundos, pero es coste puro y sale en stat game.
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bStartWithTickEnabled = false;
 
     Mesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("TreeMesh"));
     SetRootComponent(Mesh);
+}
+
+void AHeroTreeActor::SetDrawDebug(bool bInDrawDebug)
+{
+    bDrawDebug = bInDrawDebug;
+    SetActorTickEnabled(bDrawDebug);
+}
+
+void AHeroTreeActor::BeginPlay()
+{
+    Super::BeginPlay();
+    SetActorTickEnabled(bDrawDebug);
 }
 
 void AHeroTreeActor::Generate(const USpeciesData* InSpecies, uint32 Seed,
@@ -156,6 +174,10 @@ void AHeroTreeActor::Tick(float DeltaTime)
 void AHeroTreeActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    // C7: el Tick solo existe para el debug draw, asi que sigue al flag tambien
+    // cuando se marca desde el panel de detalles del editor.
+    SetActorTickEnabled(bDrawDebug);
 
     // Al tocar cualquier parametro en el editor, re-genera si hay especie de debug.
     if (DebugSpecies)

@@ -6,6 +6,7 @@
 #include "TreeSoilSubsystem.generated.h"
 
 class UEcosystemSubsystem;
+class UEcosystemSettings;
 class UStaticMesh;
 class UMaterialInterface;
 class UHierarchicalInstancedStaticMeshComponent;
@@ -53,6 +54,11 @@ struct FSoilSnag
  * modo que NUNCA se borran instancias -> se evita el baile de indices de
  * RemoveInstances (el riesgo Alto del Apendice B) y el coste esta acotado.
  *
+ * Y por el mismo motivo las ALTAS van en lote: un tick de auto-aclareo con unos
+ * cientos de muertes generaba >1000 llamadas sueltas a AddInstance, que es
+ * exactamente el "nunca instancia a instancia" del doc. 4.4. Ahora se acumulan y
+ * se aplican con AddInstances (plural) una vez por componente y por tick.
+ *
  * Las plantulas ("plantulas" del doc.) ya salen de la capa de render normal: son
  * los arboles en estado Sapling, que la libreria dibuja en los buckets pequenos.
  */
@@ -79,8 +85,12 @@ private:
     UHierarchicalInstancedStaticMeshComponent* CreateISM(UStaticMesh* Mesh, UMaterialInterface* Mat,
         bool bCastShadow, const TCHAR* Name);
 
-    void SpawnSnag(const FTreeDeathEvent& Death);
-    void SpawnLitterAround(const FVector& Base, float SpreadCm, int32 Count, uint32& RngState);
+    /** Encola el tocon de una muerte (no toca el ISM: eso lo hace FlushSpawns). */
+    void QueueSnag(const FTreeDeathEvent& Death, const UEcosystemSettings& S);
+    /** Encola las cards de hojarasca de una muerte (idem). */
+    void QueueLitterAround(const FVector& Base, const UEcosystemSettings& S, uint32& RngState);
+    /** Aplica en LOTE las altas encoladas este tick (ver nota B4 en el .cpp). */
+    void FlushSpawns();
     /** Avanza la linea temporal Standing -> Falling -> Log -> Gone de cada tocon. */
     void UpdateSnags(float DeltaTime);
     FTransform SnagTransform(const FSoilSnag& Snag) const;
@@ -90,10 +100,31 @@ private:
     UPROPERTY(Transient) TObjectPtr<UHierarchicalInstancedStaticMeshComponent> WoodISM = nullptr;
     UPROPERTY(Transient) TObjectPtr<UHierarchicalInstancedStaticMeshComponent> LitterISM = nullptr;
 
+    /**
+     * Dimensiones REALES de las mallas asignadas, leidas de sus bounds al
+     * inicializar (correccion B3). Antes el .cpp daba por hecho que SnagMesh era
+     * /Engine/BasicShapes/Cylinder (100 cm de alto, radio 50) y LitterMesh el
+     * Plane de 100x100: en cuanto asignabas tu propia malla, todos los troncos
+     * salian con el tamano mal y sin ningun aviso.
+     */
+    float SnagMeshHeightCm = 100.f;
+    float SnagMeshRadiusCm = 50.f;
+    float LitterMeshSizeCm = 100.f;
+
     TArray<FSoilSnag> Snags;
     int32 SnagCursor = 0;   // anillo de tocones
     int32 LitterCount = 0;  // cuantas cards de hojarasca hay ya (hasta MaxLitter)
     int32 LitterCursor = 0; // anillo de hojarasca
+
+    // --- Altas acumuladas del tick, para aplicarlas en LOTE (correccion B4) ---
+    TArray<FTransform> PendingSnagAdds;
+    TArray<int32>      PendingSnagSlots;  // indice en Snags al que asignar el indice de instancia
+    TArray<FTransform> PendingLitterAdds;
+    bool bWoodDirty = false;
+    bool bLitterDirty = false;
+
+    /** Buffer reutilizable de CollectNewDeathEvents (cero allocations por tick). */
+    TArray<FTreeDeathEvent> NewDeaths;
 
     int64 DeathCursor = 0;  // ultimo evento de muerte consumido de la simulacion
     bool  bInitialized = false;

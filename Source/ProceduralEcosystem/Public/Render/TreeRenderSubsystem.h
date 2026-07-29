@@ -41,6 +41,17 @@ struct FTreeRenderState
         representacion anterior (instancia/impostor). El cambio de nivel se
         consuma en ProcessHeroQueue, cuando el actor ya tiene geometria. */
     bool   bHeroPending = false;
+
+    /**
+     * true cuando PackedKey describe de verdad la representacion actual.
+     *
+     * Correccion B8: antes se usaba PackedKey == 0 como centinela de "no
+     * representado", pero 0 es tambien una clave PERFECTAMENTE VALIDA
+     * (Species=0, Bucket=0, Variant=0), es decir la plantula mas comun de la
+     * simulacion. Funcionaba de milagro porque el cambio de nivel lo tapaba;
+     * era una trampa esperando a que alguien reordenara las comprobaciones.
+     */
+    bool   bHasRepresentation = false;
 };
 
 /** Hero pendiente de generar (la cola amortigua el coste, doc. 4.4). */
@@ -88,9 +99,13 @@ struct FHeroSlot
  *     flush y por componente (doc. 4.4, riesgo Alto del Apendice B).
  *   - Un arbol cambia de nivel o de bucket rara vez; lo frecuente es solo su
  *     escala al crecer, que va en lote y con umbral.
- *   - Los hero trees se generan amortizados (MaxHeroPerFrame) y se cachean.
- *   - El re-nivelado completo corre cada N frames (los arboles se mueven
- *     despacio respecto a la camara); la seleccion de hero, cada frame.
+ *   - Los hero trees se generan amortizados (MaxHeroPerFrame), se cachean y el
+ *     cambio de nivel a hero es DIFERIDO: no se suelta la representacion
+ *     anterior hasta que la malla nueva esta lista.
+ *   - El re-nivelado completo (que incluye la seleccion de hero) corre cada
+ *     RelevelEveryNFrames frames: los arboles se mueven despacio respecto a la
+ *     camara. Lo unico que corre cada frame es la interpolacion de escala de los
+ *     hero, la cola de generacion y el reloj estacional.
  */
 UCLASS()
 class PROCEDURALECOSYSTEM_API UTreeRenderSubsystem : public UTickableWorldSubsystem
@@ -124,7 +139,7 @@ private:
 
     void UpdateLOD(const FVector& ViewLocation);
     void EnterTier(uint32 StableId, FTreeRenderState& State, ETreeRenderTier Want,
-                   const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness);
+        const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness);
     void LeaveTier(uint32 StableId, FTreeRenderState& State);
     void FlushInstanceOps();
 
@@ -175,10 +190,29 @@ private:
 
     TMap<uint64, FPendingComponentOps> Pending;
 
+    /** Buffers de trabajo de FlushInstanceOps (miembros: cero allocations por
+        flush). ResolvedUpdates lleva (indice de instancia, transform) ya resuelto
+        y ordenado; BatchXforms es la tirada contigua que se pasa a
+        BatchUpdateInstancesTransforms. */
+    TArray<TPair<int32, FTransform>> ResolvedUpdates;
+    TArray<FTransform> BatchXforms;
+
     TArray<uint32> HeroQueue;
     TMap<uint32, FPendingHero> HeroInfo;
     TSet<uint32> HeroSet;
-    TArray<TPair<float, int32>> HeroCandidates; // (distancia^2, indice de poblacion)
+
+    /**
+     * Los HeroBudget arboles mas cercanos, mantenido por SELECCION PARCIAL
+     * (optimizacion C4): un array acotado y ordenado de a lo sumo HeroBudget
+     * elementos, no la lista completa de candidatos ordenada entera. En bosque
+     * denso, dentro de HeroRadiusCm caben cientos de arboles y solo interesan 24.
+     * Cada candidato se descarta en O(1) si esta mas lejos que el peor actual.
+     */
+    TArray<TPair<float, int32>> HeroBest; // (distancia^2, indice de poblacion), ascendente
+
+    /** Distancia^2 a camara de cada arbol, cacheada en la pasada de seleccion de
+        hero para que la de reparto de niveles no la recalcule (C4). */
+    TArray<float> DistSqCache;
 
     uint32 VisitStamp = 0;
     int32  FramesSinceRelevel = 0;
@@ -196,4 +230,9 @@ private:
 
     // Fase 5 (estacional): fase de estacion [0,1) empujada al MPC cada frame.
     float SeasonPhase = 0.f;
+
+    /** MPC de estacion resuelto UNA vez en EnsureInitialized (correccion B6).
+        Antes se hacia SeasonMPC.LoadSynchronous() dentro de UpdateSeason, o sea
+        en cada frame. */
+    UPROPERTY(Transient) TObjectPtr<UMaterialParameterCollection> SeasonMPCCached = nullptr;
 };

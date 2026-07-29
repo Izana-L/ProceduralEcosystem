@@ -43,6 +43,7 @@ void UTreeSoilSubsystem::Deinitialize()
     if (Eco)
     {
         Eco->OnStateLoaded.RemoveAll(this);
+        Eco = nullptr;
     }
     if (Host)
     {
@@ -52,6 +53,10 @@ void UTreeSoilSubsystem::Deinitialize()
     WoodISM = nullptr;
     LitterISM = nullptr;
     Snags.Reset();
+    PendingSnagAdds.Reset();
+    PendingSnagSlots.Reset();
+    PendingLitterAdds.Reset();
+    NewDeaths.Reset();
     SnagCursor = 0;
     LitterCount = 0;
     LitterCursor = 0;
@@ -113,7 +118,16 @@ bool UTreeSoilSubsystem::EnsureInitialized()
 
     if (SnagMesh)
     {
+        // Correccion B3: las dimensiones salen de los BOUNDS REALES de la malla,
+        // no de constantes que asumian /Engine/BasicShapes/Cylinder. Asi, asignar
+        // una malla propia sigue dando troncos del tamano correcto.
+        const FVector Extent = SnagMesh->GetBoundingBox().GetExtent();
+        SnagMeshHeightCm = FMath::Max(1.f, static_cast<float>(Extent.Z * 2.0));
+        SnagMeshRadiusCm = FMath::Max(1.f, static_cast<float>(FMath::Max(Extent.X, Extent.Y)));
+
         WoodISM = CreateISM(SnagMesh, SnagMat, S->bSnagsCastShadow, TEXT("ISM_Snag"));
+        UE_LOG(LogEcoSoil, Log, TEXT("[Eco/Suelo] Malla de tocon '%s': alto %.0f cm, radio %.0f cm."),
+            *SnagMesh->GetName(), SnagMeshHeightCm, SnagMeshRadiusCm);
     }
     else
     {
@@ -122,6 +136,9 @@ bool UTreeSoilSubsystem::EnsureInitialized()
 
     if (LitterMesh)
     {
+        const FVector Extent = LitterMesh->GetBoundingBox().GetExtent();
+        LitterMeshSizeCm = FMath::Max(1.f, static_cast<float>(FMath::Max(Extent.X, Extent.Y) * 2.0));
+
         LitterISM = CreateISM(LitterMesh, LitterMat, /*bCastShadow*/ false, TEXT("ISM_Litter"));
     }
     else
@@ -177,8 +194,16 @@ UHierarchicalInstancedStaticMeshComponent* UTreeSoilSubsystem::CreateISM(UStatic
 // ---------------------------------------------------------------------------
 void UTreeSoilSubsystem::Tick(float DeltaTime)
 {
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    if (!S->bEnableSoilLayer)
+    const UEcosystemSettings& S = *UEcosystemSettings::Get();
+    if (!S.bEnableSoilLayer)
+    {
+        return;
+    }
+    // Coherencia con la ablacion de la Fase 7 (correccion B11): tocones y
+    // hojarasca son parte de la capa de render, asi que por defecto se apagan con
+    // ella (Eco.LOD.Enable 0 / bEnableTreeRendering). Antes seguian dibujandose y
+    // la comparacion "con y sin capa de render" no era limpia.
+    if (S.bSoilFollowsTreeRendering && !S.bEnableTreeRendering)
     {
         return;
     }
@@ -187,32 +212,35 @@ void UTreeSoilSubsystem::Tick(float DeltaTime)
         return;
     }
 
-    // 1) Consumir las muertes NUEVAS de la simulacion (cursor monotono).
-    TArray<FTreeDeathEvent> NewDeaths;
+    // 1) Consumir las muertes NUEVAS de la simulacion (cursor monotono) y ENCOLAR
+    //    su representacion. Nada toca el ISM todavia: ver FlushSpawns (B4).
+    NewDeaths.Reset();
     Eco->CollectNewDeathEvents(DeathCursor, NewDeaths);
     for (const FTreeDeathEvent& Death : NewDeaths)
     {
-        SpawnSnag(Death);
+        QueueSnag(Death, S);
         // Scatter estable por arbol: la misma muerte esparce siempre la misma hojarasca.
         uint32 Rng = EcoRand::Hash32(Death.StableId ^ 0xA53CB123u);
-        SpawnLitterAround(Death.Position, S->LitterRadiusCm, S->LitterPerDeath, Rng);
+        QueueLitterAround(Death.Position, S, Rng);
     }
 
-    // 2) Animar la caida de los tocones que aun estan de pie.
+    // 2) Aplicar en LOTE todas las altas del tick.
+    FlushSpawns();
+
+    // 3) Avanzar la linea temporal en pie -> caida -> tronco -> retirada.
     UpdateSnags(DeltaTime);
 }
 
 // ---------------------------------------------------------------------------
 //  Tocones / troncos
 // ---------------------------------------------------------------------------
-void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
+void UTreeSoilSubsystem::QueueSnag(const FTreeDeathEvent& Death, const UEcosystemSettings& S)
 {
     if (!WoodISM)
     {
         return;
     }
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const int32 Cap = FMath::Max(0, S->MaxSnags);
+    const int32 Cap = FMath::Max(0, S.MaxSnags);
     if (Cap == 0)
     {
         return;
@@ -220,14 +248,12 @@ void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
 
     FSoilSnag Snag;
     Snag.Base = Death.Position;
-    Snag.HeightCm = FMath::Max(20.f, Death.HeightCm * S->SnagHeightFraction);
+    Snag.HeightCm = FMath::Max(20.f, Death.HeightCm * S.SnagHeightFraction);
     Snag.RadiusCm = FMath::Max(4.f, Snag.HeightCm * 0.06f); // tronco corto y relativamente grueso
     Snag.Yaw = TreeArchetype::YawOf(Death.StableId);        // orientacion estable por arbol
     Snag.FallT = 0.f;
     Snag.PhaseSeconds = 0.f;
     Snag.Phase = ESnagPhase::Standing;   // arranca EN PIE (doc. 5.4), no cayendo
-
-    const FTransform Xform = SnagTransform(Snag);
 
     // 1) Ranura ya retirada (Gone): es la reutilizacion natural, y ademas mantiene
     //    coherente el criterio "se va el mas viejo por EDAD, no por presion".
@@ -237,15 +263,20 @@ void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
         {
             Snag.InstanceIndex = Candidate.InstanceIndex;
             Candidate = Snag;
-            WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, Xform, false, /*bMarkDirty*/ true, true);
+            WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, SnagTransform(Snag),
+                /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
+            bWoodDirty = true; // una sola invalidacion, en FlushSpawns
             return;
         }
     }
 
     if (Snags.Num() < Cap)
     {
-        Snag.InstanceIndex = WoodISM->AddInstance(Xform, /*bWorldSpace*/ false);
-        Snags.Add(Snag);
+        // Alta NUEVA: se encola. El indice de instancia se rellena en FlushSpawns,
+        // que es quien llama a AddInstances (plural) una sola vez por tick.
+        const int32 Slot = Snags.Add(Snag);
+        PendingSnagSlots.Add(Slot);
+        PendingSnagAdds.Add(SnagTransform(Snag));
     }
     else
     {
@@ -255,23 +286,24 @@ void UTreeSoilSubsystem::SpawnSnag(const FTreeDeathEvent& Death)
         FSoilSnag& Old = Snags[SnagCursor];
         Snag.InstanceIndex = Old.InstanceIndex;
         Old = Snag;
-        WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, Xform, false, /*bMarkDirty*/ true, true);
+        if (Snag.InstanceIndex >= 0)
+        {
+            WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, SnagTransform(Snag),
+                /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
+            bWoodDirty = true;
+        }
         SnagCursor = (SnagCursor + 1) % Cap;
     }
 }
 
 /**
- * Transforma un tocon segun su estado de caida FallT (0=en pie, 1=tumbado).
- *
- * Malla de referencia: cilindro basico del motor (100 cm de alto, radio 50,
- * pivote en el CENTRO). Si usas otra malla con pivote distinto, ajusta las dos
- * constantes de abajo y, si hace falta, el offset vertical.
+ * Transforma un tocon segun su fase y su estado de caida FallT (0=en pie,
+ * 1=tumbado). Las dimensiones de la malla (SnagMeshHeightCm/RadiusCm) se leen de
+ * sus bounds reales al inicializar, asi que esto funciona con cualquier malla
+ * cuyo pivote este en el centro (correccion B3).
  */
 FTransform UTreeSoilSubsystem::SnagTransform(const FSoilSnag& Snag) const
 {
-    static constexpr float EngineCylHeight = 100.f;
-    static constexpr float EngineCylRadius = 50.f;
-
     // Retirado: escala ~0 en vez de RemoveInstance, para no mover los indices del
     // resto (mismo criterio de diseno que el anillo: aqui NUNCA se borra una
     // instancia). La ranura queda libre para el proximo tocon.
@@ -281,9 +313,9 @@ FTransform UTreeSoilSubsystem::SnagTransform(const FSoilSnag& Snag) const
     }
 
     const float HalfH = Snag.HeightCm * 0.5f;
-    const FVector Scale(Snag.RadiusCm / EngineCylRadius,
-        Snag.RadiusCm / EngineCylRadius,
-        Snag.HeightCm / EngineCylHeight);
+    const FVector Scale(Snag.RadiusCm / SnagMeshRadiusCm,
+        Snag.RadiusCm / SnagMeshRadiusCm,
+        Snag.HeightCm / SnagMeshHeightCm);
 
     // En pie: eje +Z vertical, base en el suelo. Tumbado: eje +Z horizontal en la
     // direccion Yaw, tronco apoyado sobre el suelo (levantado su radio).
@@ -310,8 +342,11 @@ void UTreeSoilSubsystem::UpdateSnags(float DeltaTime)
     {
         return;
     }
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const float FallSeconds = FMath::Max(0.1f, S->SnagFallSeconds);
+    // Los settings se leen UNA vez por tick, no una por tocon (correccion B7).
+    const UEcosystemSettings& S = *UEcosystemSettings::Get();
+    const float FallSeconds = FMath::Max(0.1f, S.SnagFallSeconds);
+    const float StandingSeconds = S.SnagStandingSeconds;
+    const float LogSeconds = S.SnagLogSeconds;
 
     bool bAnyMoved = false;
     for (FSoilSnag& Snag : Snags)
@@ -327,7 +362,7 @@ void UTreeSoilSubsystem::UpdateSnags(float DeltaTime)
         switch (Snag.Phase)
         {
         case ESnagPhase::Standing:
-            if (Snag.PhaseSeconds >= S->SnagStandingSeconds)
+            if (Snag.PhaseSeconds >= StandingSeconds)
             {
                 Snag.Phase = ESnagPhase::Falling;
                 Snag.PhaseSeconds = 0.f;
@@ -346,8 +381,8 @@ void UTreeSoilSubsystem::UpdateSnags(float DeltaTime)
 
         case ESnagPhase::Log:
             // SnagLogSeconds == 0 -> la madera muerta se queda para siempre
-            // (comportamiento anterior, util para un beauty shot estatico).
-            if (S->SnagLogSeconds > 0.f && Snag.PhaseSeconds >= S->SnagLogSeconds)
+            // (util para un beauty shot estatico).
+            if (LogSeconds > 0.f && Snag.PhaseSeconds >= LogSeconds)
             {
                 Snag.Phase = ESnagPhase::Gone;
                 bDirty = true;
@@ -374,22 +409,19 @@ void UTreeSoilSubsystem::UpdateSnags(float DeltaTime)
 // ---------------------------------------------------------------------------
 //  Hojarasca
 // ---------------------------------------------------------------------------
-void UTreeSoilSubsystem::SpawnLitterAround(const FVector& Base, float SpreadCm, int32 Count, uint32& RngState)
+void UTreeSoilSubsystem::QueueLitterAround(const FVector& Base, const UEcosystemSettings& S, uint32& RngState)
 {
-    if (!LitterISM || Count <= 0)
-    {
-        return;
-    }
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const int32 Cap = FMath::Max(0, S->MaxLitter);
-    if (Cap == 0)
+    const int32 Count = S.LitterPerDeath;
+    const int32 Cap = FMath::Max(0, S.MaxLitter);
+    if (!LitterISM || Count <= 0 || Cap == 0)
     {
         return;
     }
 
-    static constexpr float EnginePlaneSize = 100.f; // /Engine/BasicShapes/Plane = 100x100 cm
-    static constexpr float CardCm = 70.f;
-    const float Sc = CardCm / EnginePlaneSize;
+    // Escala derivada de los bounds reales de LitterMesh (B3): LitterCardCm es el
+    // tamano que quieres ver en mundo, sea cual sea la malla asignada.
+    const float Sc = S.LitterCardCm / LitterMeshSizeCm;
+    const float SpreadCm = S.LitterRadiusCm;
 
     for (int32 k = 0; k < Count; ++k)
     {
@@ -401,22 +433,66 @@ void UTreeSoilSubsystem::SpawnLitterAround(const FVector& Base, float SpreadCm, 
         {
             P.Z = Eco->GetHeightField().SampleHeight(P.X, P.Y);
         }
-        P.Z += 3.f; // 3 cm sobre el suelo para evitar z-fighting
+        P.Z += S.LitterGroundOffsetCm; // evita z-fighting con el material del suelo
 
         const float YawDeg = EcoRand::NextRange(RngState, 0.f, 360.f);
         const FTransform Xform(FRotator(0.f, YawDeg, 0.f), P, FVector(Sc, Sc, Sc));
 
-        if (LitterCount < Cap)
+        if (LitterCount + PendingLitterAdds.Num() < Cap)
         {
-            LitterISM->AddInstance(Xform, /*bWorldSpace*/ false);
-            ++LitterCount;
+            PendingLitterAdds.Add(Xform); // alta nueva -> lote (B4)
         }
         else
         {
-            LitterISM->UpdateInstanceTransform(LitterCursor, Xform, false, /*bMarkDirty*/ true, true);
+            // Anillo lleno: reutiliza la card mas vieja, sin borrar instancias.
+            LitterISM->UpdateInstanceTransform(LitterCursor, Xform,
+                /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
             LitterCursor = (LitterCursor + 1) % Cap;
+            bLitterDirty = true;
         }
     }
+}
+
+/**
+ * Aplica en LOTE las altas encoladas este tick (correccion B4).
+ *
+ * El Apendice B marca como riesgo ALTO "reconstruir el HISM cada frame... nunca
+ * instancia a instancia". La version anterior llamaba a AddInstance (singular)
+ * una vez por tocon y una por card: en un tick de auto-aclareo con 200 muertes y
+ * LitterPerDeath=6 eso son 1.400 llamadas sueltas al HISM en un frame, ademas de
+ * un MarkRenderStateDirty por tocon. Aqui es UNA llamada AddInstances por
+ * componente y UNA invalidacion, igual que hace FlushInstanceOps en la capa de
+ * arboles.
+ */
+void UTreeSoilSubsystem::FlushSpawns()
+{
+    if (WoodISM && PendingSnagAdds.Num() > 0)
+    {
+        const TArray<int32> NewIndices = WoodISM->AddInstances(PendingSnagAdds, /*bShouldReturnIndices*/ true);
+        for (int32 k = 0; k < NewIndices.Num() && k < PendingSnagSlots.Num(); ++k)
+        {
+            if (Snags.IsValidIndex(PendingSnagSlots[k]))
+            {
+                Snags[PendingSnagSlots[k]].InstanceIndex = NewIndices[k];
+            }
+        }
+        bWoodDirty = true;
+    }
+    PendingSnagAdds.Reset();
+    PendingSnagSlots.Reset();
+
+    if (LitterISM && PendingLitterAdds.Num() > 0)
+    {
+        LitterISM->AddInstances(PendingLitterAdds, /*bShouldReturnIndices*/ false);
+        LitterCount += PendingLitterAdds.Num();
+        bLitterDirty = true;
+    }
+    PendingLitterAdds.Reset();
+
+    if (bWoodDirty && WoodISM) { WoodISM->MarkRenderStateDirty(); }
+    if (bLitterDirty && LitterISM) { LitterISM->MarkRenderStateDirty(); }
+    bWoodDirty = false;
+    bLitterDirty = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +503,11 @@ void UTreeSoilSubsystem::Clear()
     if (WoodISM) { WoodISM->ClearInstances(); }
     if (LitterISM) { LitterISM->ClearInstances(); }
     Snags.Reset();
+    PendingSnagAdds.Reset();
+    PendingSnagSlots.Reset();
+    PendingLitterAdds.Reset();
+    bWoodDirty = false;
+    bLitterDirty = false;
     SnagCursor = 0;
     LitterCount = 0;
     LitterCursor = 0;

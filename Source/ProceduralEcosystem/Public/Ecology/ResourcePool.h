@@ -28,11 +28,12 @@ struct PROCEDURALECOSYSTEM_API FResourcePool
     {
         Current = Base;
         Next = Base;
+        Snapshot.Reset();
     }
 
     float SampleCurrent(double Xcm, double Ycm) const { return Current.SampleBilinear(Xcm, Ycm); }
 
-    /** Copia Current -> Next: punto de partida de este tick antes de sumar deltas (ver clase 4). */
+    /** Copia Current -> Next: punto de partida de este tick antes de sumar deltas. */
     void BeginTick() { Next = Current; }
 
     /**
@@ -47,4 +48,17 @@ struct PROCEDURALECOSYSTEM_API FResourcePool
     void RegenerateTowardBase(const FField2D& Base, float RechargeRate, float DiffusionRate, float DtYears);
 
     void SwapBuffers() { Swap(Current, Next); }
+
+    /** Bytes del buffer auxiliar persistente (para Eco.Profile). */
+    int32 ScratchBytes() const { return Snapshot.Max() * sizeof(float); }
+
+private:
+    /**
+     * Buffer auxiliar PERSISTENTE de RegenerateTowardBase (optimizacion C5).
+     * Antes era un `const TArray<float> Snapshot = Next.Data;` local, o sea una
+     * allocation + copia del campo entero (1 MB a 512x512) por campo y por tick.
+     * Como miembro, la asignacion reutiliza la capacidad y a partir del segundo
+     * tick no hay ni una sola llamada al heap.
+     */
+    TArray<float> Snapshot;
 };

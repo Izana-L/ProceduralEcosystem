@@ -14,7 +14,10 @@ class UHierarchicalInstancedStaticMeshComponent;
 struct FTreeLibraryConfig
 {
     int32 NumAgeBuckets = 5;
-    int32 NumInstanceCustomDataFloats = 1; // 1 float por instancia -> fase estacional (Fase 5)
+    /** Fase 5 usa DOS: [0] fase estacional estable por arbol, [1] sequedad. Con 1
+        el material se queda sin el canal de sequedad y los senescentes se dibujan
+        verdes en silencio, asi que 2 es el minimo util (correccion B2). */
+    int32 NumInstanceCustomDataFloats = 2;
     bool  bInstancesCastShadow = true;
     bool  bImpostorsCastShadow = false;    // doc. 4.6: que la sombra lejana la ponga el HLOD
     float InstanceEndCullDistanceCm = 0.f; // 0 = sin cull por distancia del propio ISM

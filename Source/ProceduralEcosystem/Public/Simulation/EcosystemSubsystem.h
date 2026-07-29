@@ -19,13 +19,42 @@ class ADecalActor;
 class UMaterialInstanceDynamic;
 class USpeciesData;
 class AHeroTreeActor;
-class FArchive; 
+class FArchive;
 // Fase 5 (Paso 6): serializacion del bake
 /** Se emite cuando LoadState sustituye la poblacion entera. Las capas que
     mantienen estado indexado por StableId (render: instancias y heroes cacheados;
     suelo: tocones y hojarasca) DEBEN tirarlo: los StableId del bake son de otra
     corrida y reutilizarlos coloca representaciones de arboles viejos. */
 DECLARE_MULTICAST_DELEGATE(FOnEcoStateLoaded);
+
+/**
+ * Desglose del coste de UN tick, por etapas (comando Eco.Profile).
+ *
+ * El doc. 6.4 es tajante: "medir primero, optimizar despues". Antes de decidir
+ * si algo se sube a compute shader (doc. 6.5) hay que saber DONDE se va el
+ * tiempo, y a ojo no se sabe. Esto instrumenta las cinco etapas del bucle de
+ * 2.5 con una media exponencial (barata y estable, sin acumular historico).
+ *
+ * Coste de la propia instrumentacion: 6 llamadas a FPlatformTime::Seconds() por
+ * tick. Despreciable frente a un tick de milisegundos.
+ */
+struct FEcoTickProfile
+{
+    double HashMs = 0.0;      // reconstruccion del spatial hash
+    double LightMs = 0.0;     // ClearShadow + deposito de copas
+    double ParallelMs = 0.0;  // ParallelFor: crecimiento/estres/mortalidad/semillas
+    double ReduceMs = 0.0;    // reduccion serial de los scratch
+    double RegenMs = 0.0;     // recarga + difusion de los campos
+    double GerminationMs = 0.0; // pulsos de muerte + germinacion
+    double TotalMs = 0.0;
+
+    /** Media exponencial: Sample pesa Alpha, el historico 1-Alpha. */
+    static void Accumulate(double& InOutAvg, double SampleMs, double Alpha = 0.1)
+    {
+        InOutAvg = (InOutAvg <= 0.0) ? SampleMs : (InOutAvg * (1.0 - Alpha) + SampleMs * Alpha);
+    }
+};
+
 /**
  * Motor de la simulacion de ecosistema.
  *
@@ -81,6 +110,10 @@ public:
     void LogStateFingerprint() const;
     void LogFiniteCheck() const;
 
+    /** Desglose del coste del tick por etapas + memoria de las estructuras
+        (consola: Eco.Profile). Es el punto de partida obligatorio de la Fase 6. */
+    void LogTickProfile() const;
+
     // --- Eventos de muerte (Fase 5, Paso 1): la capa de suelo los consume ---
     void  LogRecentDeaths() const;
     int64 GetDeathEventCounter() const { return DeathEventCounter; }
@@ -92,7 +125,10 @@ public:
     void PaintNutrientField();
     void PaintVigorField();
     void PaintLightField();
-    void PaintDecompositionField(); // Fase 5 (Paso 5): puntos de muerte en el terreno
+    /** Fase 5 (Paso 5): puntos de muerte en el terreno. bLogResult=false para el
+        repintado automatico del modo live, que si no llenaria el log a 2 lineas
+        por segundo (correccion B9). */
+    void PaintDecompositionField(bool bLogResult = true);
     // --- Poblacion (Fase 2) ---
     /** Siembra Count plantulas aleatorias sobre el terreno (consola: Eco.SeedForest). */
     void SeedInitialPopulation(int32 Count);
@@ -186,11 +222,23 @@ private:
     FTreePopulation Agents_Write;
     FSpatialHash Hash;
 
-    /** Scratch por-tarea del paso paralelo. PERSISTENTE: se dimensiona y se
-        pone a cero una vez y se reutiliza cada tick (ResetForNextTick) en vez
-        de reasignar arrays del tamano del campo en cada SimulateTick. */
+    /** Scratch por-tarea del paso paralelo. PERSISTENTE: se reutiliza cada tick
+        (ResetForNextTick) en vez de reasignar en cada SimulateTick. Desde la
+        optimizacion C1 guarda listas DISPERSAS de (celda, cantidad) en vez de un
+        campo denso por tarea: ver FCellDelta. */
     TArray<FTickScratch> TickContexts;
+
+    /** Posiciones germinadas en el tick en curso (el hash indexa Agents_Read y no
+        las ve). Miembro para conservar la capacidad entre ticks. */
     TArray<FVector> NewbornPositions;
+
+    /** Salidas de la reduccion serial. Miembros, no locales: asi la capacidad
+        sobrevive al tick y la germinacion masiva no vuelve a pedir heap (C5). */
+    TArray<FPendingSeed> PendingSeeds;
+    TArray<FPendingDeathPulse> PendingDeaths;
+
+    /** Instrumentacion del tick (Eco.Profile). Ver FEcoTickProfile. */
+    FEcoTickProfile Profile;
 
     /** Cache de especies resueltas: evita LoadSynchronous miles de veces por tick. */
     UPROPERTY(Transient)

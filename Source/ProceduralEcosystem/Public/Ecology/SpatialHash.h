@@ -23,7 +23,7 @@
  * construccion por tick.
  *
  * DETERMINISMO: Build() es una pasada SERIAL (se llama una vez, antes del
- * ParallelFor del tick — ver doc. 2.5, "PRE"). Recorre los agentes en orden
+ * ParallelFor del tick - ver doc. 2.5, "PRE"). Recorre los agentes en orden
  * de indice creciente, asi que dentro de cada celda SortedIdx queda siempre
  * en el mismo orden para una misma poblacion de entrada. ForEachNeighbor()
  * hereda ese orden fijo: dos corridas con la misma poblacion visitan los
@@ -31,7 +31,10 @@
  * cada agente.
  *
  * Se reconstruye ENTERO cada tick (O(N)): nacimientos y muertes cambian el
- * conjunto de agentes, así que no compensa mantenerlo incrementalmente.
+ * conjunto de agentes, asi que no compensa mantenerlo incrementalmente.
+ *
+ * CONSUMIDORES: el espaciado minimo de germinacion (SimulateTick) y, a partir
+ * de la Fase 3, las consultas por rango del SCA.
  */
 struct PROCEDURALECOSYSTEM_API FSpatialHash
 {
@@ -40,14 +43,14 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
     int32     GridH = 0;
     FVector2D Origin = FVector2D::ZeroVector;
 
-    TArray<int32> CellStart; // tamaño GridW*GridH + 1
-    TArray<int32> SortedIdx; // tamaño Num (tras el ultimo Build)
+    TArray<int32> CellStart; // tamano GridW*GridH + 1
+    TArray<int32> SortedIdx; // tamano Num (tras el ultimo Build)
 
     bool IsValid() const { return GridW > 0 && GridH > 0; }
 
     /**
      * Fija la geometria del grid a partir de los limites del mundo simulado
-     * y el tamaño de celda. Llamar solo cuando cambie el mundo (no cada
+     * y el tamano de celda. Llamar solo cuando cambie el mundo (no cada
      * tick); Build() se encarga de repoblarlo con las posiciones actuales.
      *
      * @param WorldBounds  Extension del terreno simulable (cm), p.ej. la de
@@ -78,7 +81,7 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
     /**
      * Invoca Fn(AgentIndex) por cada agente en las celdas dentro de Radius
      * de P (radio en CELDAS, redondeado hacia arriba: revisa un cuadrado de
-     * (2r+1)x(2r+1) celdas, no un circulo exacto — falso-positivos baratos
+     * (2r+1)x(2r+1) celdas, no un circulo exacto - falsos positivos baratos
      * de descartar en Fn si hace falta distancia exacta).
      * Fn debe ser invocable como Fn(int32 AgentIndex).
      */
@@ -112,4 +115,18 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
             }
         }
     }
+
+    /** Bytes de los buffers persistentes (para Eco.Profile). */
+    int32 ScratchBytes() const
+    {
+        return (CellStart.Max() + SortedIdx.Max() + Cursor.Max()) * sizeof(int32);
+    }
+
+private:
+    /**
+     * Cursor de escritura del counting sort, PERSISTENTE (optimizacion C5).
+     * Antes era un `TArray<int32> Cursor = CellStart;` local: a 205x205 celdas
+     * son ~168 KB de allocation + copia por tick. Como miembro se reutiliza.
+     */
+    TArray<int32> Cursor;
 };
