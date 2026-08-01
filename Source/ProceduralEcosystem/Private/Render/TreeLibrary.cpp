@@ -1,6 +1,7 @@
 #include "Render/TreeLibrary.h"
 #include "Render/TreeMeshBaker.h"
 
+#include "Core/EcoStats.h" // Fase 6: instrumentacion (stat EcoRender / Insights)
 #include "Species/SpeciesData.h"
 #include "Geometry/SpaceColonization.h"
 #include "Geometry/TreeSkeleton.h"
@@ -95,13 +96,20 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     Sp->TrunkFraction = Base->TrunkFraction * FMath::Lerp(0.35f, 1.f, S); // copa mas baja de joven
     Sp->LeafSizeCm = Base->LeafSizeCm * FMath::Lerp(0.55f, 1.f, S);       // hoja relativamente MAYOR de joven
 
+    // --- Fase 6: un arbol joven es MAS flexible que uno adulto ---
+    // Un tronco de 2 m se dobla con el viento; uno de 20 m con 60 cm de diametro
+    // apenas. Como la rigidez se hornea en los canales UV de la malla (ver
+    // TreeWindData.h), basta con modularla aqui por bucket y cada arquetipo sale
+    // ya con el balanceo que le toca por su tamano, sin coste en runtime.
+    Sp->WindStiffness = FMath::Clamp(Base->WindStiffness * FMath::Lerp(0.45f, 1.f, S), 0.f, 1.f);
+
     // --- Variante: perturbacion pequena y ESTABLE de la morfologia ---
     // (doc. 4.2: "variacion parametrizada ... para que no haya dos identicos").
     uint32 VRng = EcoRand::Hash32(Key.Pack() * 0x9E3779B9u + 0x51ED270Bu);
     auto Jitter = [&VRng](float Value, float Amount)
-    {
-        return Value * (1.f + Amount * (2.f * EcoRand::NextUnit(VRng) - 1.f));
-    };
+        {
+            return Value * (1.f + Amount * (2.f * EcoRand::NextUnit(VRng) - 1.f));
+        };
     Sp->CrownRadiusCm = Jitter(Sp->CrownRadiusCm, 0.15f);
     Sp->CrownHeightCm = Jitter(Sp->CrownHeightCm, 0.12f);
     Sp->wGrav = Jitter(Sp->wGrav, 0.25f);
@@ -200,6 +208,12 @@ int32 UTreeLibrary::BakeAll()
 
 bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
 {
+    // Fase 6 (6.4): el horneado es EL pico de coste puntual del game thread.
+    // Marcarlo hace que salga como bloque propio en Unreal Insights y en
+    // `stat EcoRender`, que es donde se ve si MaxBakesPerFrame esta bien puesto.
+    SCOPE_CYCLE_COUNTER(STAT_EcoBake);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_BakeArchetype);
+
     const USpeciesData* Base = GetBaseSpecies(Key.Species);
     const USpeciesData* Sp = GetArchetypeSpecies(Key);
     if (!Base || !Sp)
@@ -222,8 +236,14 @@ bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
     SpaceColonization::GrowTree(*Sp, Rng, FVector::ZeroVector, /*CoarseLight*/ nullptr, Cfg,
         Skeleton, FineLight, Attractors);
 
+    // Fase 6 (6.2): aunque el arquetipo no conozca a sus vecinos, SI conoce su
+    // propia autosombra -la rejilla fina que dejo el SCA-, asi que el AO de copa
+    // por vertice se hornea igual. Es la parte del AO que no depende del sitio:
+    // el interior de la copa esta oscuro en cualquier arbol. La parte que SI
+    // depende del sitio (estar bajo el dosel de un vecino) viaja aparte, por
+    // instancia, en PerInstanceCustomData[2].
     FTreeMeshData MeshData;
-    TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData);
+    TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData, &FineLight);
 
     FBox LocalBounds;
     UStaticMesh* Mesh = TreeMeshBaker::BuildStaticMesh(this, MeshData, FVector::ZeroVector,
@@ -254,6 +274,54 @@ bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
 // ---------------------------------------------------------------------------
 //  Componentes de instancing
 // ---------------------------------------------------------------------------
+
+/**
+ * Fase 6 (doc. 6.1): ajustes de viento de UN componente.
+ *
+ * Las tres llamadas son el caveat de rendimiento del documento hecho codigo:
+ *
+ *   - SetEvaluateWorldPositionOffset: el interruptor duro. Con false el
+ *     componente ni siquiera ejecuta la parte de WPO del vertex shader; es lo
+ *     que deja los impostors del campo lejano completamente estaticos.
+ *
+ *   - SetWorldPositionOffsetDisableDistance: el corte por distancia dentro del
+ *     propio componente. Las instancias mas alla del radio dejan de moverse
+ *     solas, que es exactamente "solo se mueven los arboles cercanos".
+ *
+ *   - SetBoundsScale: el precio de mover vertices en el material es que el
+ *     culling trabaja con la caja SIN mover. Sin margen, un arbol en el borde de
+ *     la pantalla parpadea.
+ *
+ * NOTA DE COMPATIBILIDAD: SetWorldPositionOffsetDisableDistance existe desde
+ * UE 5.1. Si compilas contra una version anterior, borra esa linea (perderas el
+ * corte por distancia, no el resto).
+ */
+void UTreeLibrary::ConfigureWind(UHierarchicalInstancedStaticMeshComponent* Comp, bool bImpostor) const
+{
+    if (!Comp) { return; }
+
+    const bool bWind = bImpostor ? Config.bWindOnImpostors : Config.bWindOnInstances;
+
+    Comp->SetEvaluateWorldPositionOffset(bWind);
+    Comp->SetWorldPositionOffsetDisableDistance(
+        (bWind && Config.WindWpoCutoffCm > 0.f) ? FMath::RoundToInt(Config.WindWpoCutoffCm) : 0);
+    Comp->SetBoundsScale(bWind ? FMath::Max(1.f, Config.WindBoundsScale) : 1.f);
+}
+
+void UTreeLibrary::ApplyWindSettings(const FTreeLibraryConfig& InConfig)
+{
+    Config.bWindOnInstances = InConfig.bWindOnInstances;
+    Config.bWindOnImpostors = InConfig.bWindOnImpostors;
+    Config.WindWpoCutoffCm = InConfig.WindWpoCutoffCm;
+    Config.WindBoundsScale = InConfig.WindBoundsScale;
+
+    for (TPair<uint32, FTreeArchetypeEntry>& It : Entries)
+    {
+        ConfigureWind(It.Value.MeshISM.Get(), /*bImpostor*/ false);
+        ConfigureWind(It.Value.ImpostorISM.Get(), /*bImpostor*/ true);
+    }
+}
+
 UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(const FArchetypeKey& Key, bool bImpostor)
 {
     FTreeArchetypeEntry* Entry = Find(Key);
@@ -290,6 +358,9 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
     Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     Comp->SetCanEverAffectNavigation(false); // si no, cada alta/baja pide rebuild de navmesh
     Comp->SetCastShadow(bImpostor ? Config.bImpostorsCastShadow : Config.bInstancesCastShadow);
+
+    // Fase 6: viento + margen de bounds (ver ConfigureWind).
+    ConfigureWind(Comp, bImpostor);
 
     const float EndCull = bImpostor ? Config.ImpostorEndCullDistanceCm : Config.InstanceEndCullDistanceCm;
     if (EndCull > 0.f)

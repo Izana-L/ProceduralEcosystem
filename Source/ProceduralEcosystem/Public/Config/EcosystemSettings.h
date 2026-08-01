@@ -7,7 +7,7 @@
 class USpeciesData;
 class UMaterialInterface;
 class UStaticMesh;                  // Fase 5 (capa de suelo)
-class UMaterialParameterCollection; // Fase 5 (ciclo estacional)
+class UMaterialParameterCollection; // Fase 5 (ciclo estacional) y Fase 6 (viento)
 
 /**
  * Configuración central del proyecto. Aparece en
@@ -249,10 +249,14 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Render|LOD")
     bool bImpostorsCastShadow = false;
 
-    /** Floats de PerInstanceCustomData. Fase 5: [0]=fase estacional por arbol,
-        [1]=sequedad (0 sano, 1 seco/senescente). Por eso el minimo util es 2. */
+    /** Floats de PerInstanceCustomData.
+        [0] = fase estacional por arbol (Fase 5)
+        [1] = sequedad, 0 sano / 1 seco-senescente (Fase 5)
+        [2] = apertura de copa para el AO por instancia (Fase 6, doc. 6.2)
+        Por eso el minimo util pasa a ser 3. Bajarlo a 2 no rompe nada: el
+        material se queda sin el canal de AO y lo ve como 0. */
     UPROPERTY(EditAnywhere, config, Category = "Render|LOD", meta = (ClampMin = "0", ClampMax = "4"))
-    int32 NumInstanceCustomDataFloats = 2;
+    int32 NumInstanceCustomDataFloats = 3;
 
     // --- Especies ---
     UPROPERTY(EditAnywhere, config, Category = "Especies")
@@ -285,7 +289,8 @@ public:
     // --- Paso 3: ciclo estacional de follaje ---
     /** Material Parameter Collection con un escalar "Season" [0,1). El material
         de follaje lo lee para tintar/secar la hoja segun la estacion. Si es
-        null, el ciclo estacional simplemente no se aplica (no rompe nada). */
+        null, el ciclo estacional simplemente no se aplica (no rompe nada).
+        Fase 6: aqui tambien se escribe el escalar "Snow" (ver MaxSnowAmount). */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Estaciones")
     TSoftObjectPtr<UMaterialParameterCollection> SeasonMPC;
 
@@ -405,6 +410,153 @@ public:
         no cambien de intensidad al variar el maximo del campo entre ticks). */
     UPROPERTY(EditAnywhere, config, Category = "Fase5|Descomposicion", meta = (ClampMin = "0.001"))
     float DecompositionPaintMax = 20.f;
+
+    // ================================================================
+    // ================================================================
+    // --- FASE 6: realismo y optimizacion final ---
+    // ================================================================
+    // ================================================================
+
+    // ----------------------------------------------------------------
+    // 6.1 VIENTO (doc. 6.1)
+    // ----------------------------------------------------------------
+    // El movimiento en si lo hace el MATERIAL en el vertex shader (World
+    // Position Offset). Desde C++ solo se empuja, una vez por frame y para todo
+    // el bosque, el estado global del viento a un Material Parameter Collection:
+    // coste O(1), cero trabajo por arbol. La variedad por rama y por arbol ya
+    // viaja horneada en los canales UV de la malla (ver Geometry/TreeWindData.h).
+
+    /** MPC del viento. Escalares que escribe el subsistema de render:
+          WindStrength   fuerza total ya modulada por las rafagas
+          WindGust       [0,1] valor de rafaga crudo (por si el material lo quiere aparte)
+          WindTime       reloj propio del viento en segundos
+          WindWpoCutoff  distancia (cm) a partir de la cual no deberia haber sway
+        Vectores:
+          WindDirection  (X, Y, 0, 0) unitario en el plano horizontal
+        Si es null, el viento simplemente no se aplica (no rompe nada). Puedes
+        asignar el MISMO asset que SeasonMPC: los nombres de parametro no chocan. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento")
+    TSoftObjectPtr<UMaterialParameterCollection> WindMPC;
+
+    /** Interruptor maestro del viento. Apagado -> WindStrength = 0 (el material
+        deja de desplazar vertices y desaparece su coste de WPO). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento")
+    bool bEnableWind = true;
+
+    /** Direccion base del viento en grados (yaw de mundo). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "-360", ClampMax = "360"))
+    float WindDirectionDeg = 45.f;
+
+    /** Oscilacion lenta de la direccion, en grados a cada lado. Un viento de
+        direccion perfectamente fija se lee como artificial enseguida. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "0", ClampMax = "90"))
+    float WindDirectionWanderDeg = 12.f;
+
+    /** Fuerza base [0..1] (el material la escala a su amplitud en cm). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "0", ClampMax = "4"))
+    float WindStrength = 0.35f;
+
+    /** Amplitud de las rafagas como fraccion de la fuerza base. 0 = viento
+        constante (se nota falso), 1 = de calma total a el doble de fuerza. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "0", ClampMax = "1"))
+    float WindGustAmplitude = 0.5f;
+
+    /** Periodo (s) de la rafaga principal. El ruido temporal se compone con un
+        segundo seno de periodo inconmensurable para que no se oiga el bucle. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "0.1"))
+    float WindGustPeriodSeconds = 7.f;
+
+    /**
+     * CAVEAT DE RENDIMIENTO DEL DOC. 6.1, hecho ajuste:
+     * "el world-position-offset sobre Nanite masivo tiene coste [...] desactiva
+     *  el WPO de viento a distancia (solo se mueven los arboles cercanos; los
+     *  impostors lejanos quedan estaticos)".
+     * Distancia (cm) a partir de la cual los componentes de instancing dejan de
+     * evaluar el WPO. A 120 m un balanceo de 20 cm es sub-pixel: no se pierde
+     * nada visible y se recorta el coste del vertex shader en la mayor parte del
+     * bosque. 0 = sin corte (evaluar siempre, solo para medir la diferencia).
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "0"))
+    float WindWpoCutoffCm = 12000.f;   // 120 m
+
+    /** Los impostors se mueven con el viento. Por defecto NO (doc. 6.1): son el
+        campo lejano y su geometria es un crossboard, el sway se veria como un
+        cizallamiento raro. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento")
+    bool bWindOnImpostors = false;
+
+    // ----------------------------------------------------------------
+    // 6.2 MATERIALES
+    // ----------------------------------------------------------------
+
+    /**
+     * Escribe en PerInstanceCustomData[2] la APERTURA DE COPA de cada arbol
+     * (luz del grid grueso a media altura de su copa: 1 = a pleno sol, 0 = bajo
+     * dosel cerrado). El material la usa como termino de AO, de modo que un
+     * arbol del sotobosque se ve mas apagado que uno emergente SIN necesidad de
+     * GI cara (doc. 6.2: "AO por densidad de copa [...] alimentando el termino
+     * de AO con el campo de luz/copa gruesa").
+     *
+     * Coste: un muestreo trilineal por arbol INSTANCIADO y por re-nivelado (no
+     * por frame, no por impostor). Apagalo si el profiling lo senala.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Materiales")
+    bool bCanopyAOInstanceData = true;
+
+    /** Nieve maxima en pleno invierno [0..1]. Se escribe como escalar "Snow" en
+        SeasonMPC y el material la mezcla segun la normal hacia arriba (doc. 6.2).
+        0 = sin nieve (bosque templado/laurisilva: dejalo a 0). */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Materiales", meta = (ClampMin = "0", ClampMax = "1"))
+    float MaxSnowAmount = 0.f;
+
+    // ----------------------------------------------------------------
+    // 6.3 CO2 (doc. 6.3): capa de realismo barata
+    // ----------------------------------------------------------------
+    // Multiplicador analitico del vigor, sin sim volumetrica ni campo nuevo.
+    // Ver Ecology/CarbonModel.h para la formula y su justificacion.
+
+    /** OJO: cambia el resultado de la simulacion. Apagalo (o Eco.CO2.Enable 0)
+        para reproducir exactamente las corridas anteriores a la Fase 6 y para la
+        ablacion de la Fase 7. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|CO2")
+    bool bEnableCO2Factor = true;
+
+    /** Reduccion maxima del vigor bajo dosel cerrado, en fraccion. El Apendice A
+        lo marca como "~1, leve": 0.10-0.20 es el rango sensato. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|CO2", meta = (ClampMin = "0", ClampMax = "0.9"))
+    float CO2MaxReduction = 0.15f;
+
+    /** Altura (cm) por encima de la cual se considera aire bien mezclado y la
+        penalizacion desaparece. Ponla en la altura del dosel dominante. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|CO2", meta = (ClampMin = "1"))
+    float CO2FullMixingHeightCm = 2500.f;
+
+    // ----------------------------------------------------------------
+    // 6.4 PROFILING Y PRESUPUESTO DE FRAME (doc. 6.4)
+    // ----------------------------------------------------------------
+
+    /**
+     * Presupuesto de tiempo (ms) que el TICK de simulacion puede consumir dentro
+     * de un frame. Al agotarlo, los ticks que falten se dejan para el frame
+     * siguiente aunque no se haya llegado a MaxStepsPerFrame.
+     *
+     * Es la traduccion literal del doc. 6.4: "fija un objetivo (16.6 ms para
+     * 60 fps) y reparte; amortiza los ticks". MaxStepsPerFrame acota el NUMERO
+     * de ticks, que no es lo mismo: con 20k arboles un solo tick puede pasarse
+     * de presupuesto y con 200 caben veinte. Esto acota el TIEMPO, que es lo que
+     * de verdad se reparte. 0 = sin limite (comportamiento anterior).
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Profiling", meta = (ClampMin = "0"))
+    float TickBudgetMsPerFrame = 4.f;
+
+    /** Objetivo de frame (ms) contra el que se compara en Eco.Frame. 16.6 = 60 fps. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Profiling", meta = (ClampMin = "1"))
+    float FrameBudgetMs = 16.6f;
+
+    /** Muestra en pantalla el reparto del frame y la poblacion (equivalente a
+        Eco.Frame.HUD 1). Util para grabar video de la demo. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Profiling")
+    bool bShowFrameBudgetHUD = false;
 
     static const UEcosystemSettings* Get() { return GetDefault<UEcosystemSettings>(); }
 };

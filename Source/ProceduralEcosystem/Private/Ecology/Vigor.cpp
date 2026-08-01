@@ -18,7 +18,8 @@ namespace EcoVigor
         const FNutrientField& Nutrient,
         const FLightFieldCoarse& Light,
         float KlMax,
-        EEcoLimiter* OutLimiter)
+        EEcoLimiter* OutLimiter,
+        const EcoCarbon::FCO2Params* CO2)
     {
         // Agua y nutrientes son campos 2D: se muestrean por XY (la Z no cuenta).
         const float W = Water.SampleWater(WorldPos.X, WorldPos.Y);
@@ -34,11 +35,28 @@ namespace EcoVigor
         const float fW = WaterFactor(W, Species.WaterDemand);
         const float fN = NutrientFactor(N, Species.NutrientDemand);
 
+        float V;
         if (OutLimiter)
         {
-            return CombineWithLimiter(fL, fW, fN, *OutLimiter);
+            V = CombineWithLimiter(fL, fW, fN, *OutLimiter);
         }
-        return Combine(fL, fW, fN);
+        else
+        {
+            V = Combine(fL, fW, fN);
+        }
+
+        // Fase 6 (doc. 6.3): CO2 como MULTIPLICADOR, no como cuarto termino del
+        // min(). El limitante de Liebig que se devuelve en OutLimiter sigue siendo
+        // el de los tres recursos de verdad -el CO2 aqui no se simula como recurso
+        // consumible, solo modula la eficiencia-, asi que el mapa cualitativo de
+        // limitantes no cambia de significado.
+        if (CO2)
+        {
+            // Altura de copa 0: la idoneidad se evalua a ras de suelo, que es donde
+            // cae una semilla.
+            V *= EcoCarbon::CO2Factor(Q, /*CanopyHeightCm*/ 0.f, *CO2);
+        }
+        return V;
     }
 
     void BakeSuitabilityField(
@@ -49,7 +67,8 @@ namespace EcoVigor
         const USpeciesData& Species,
         float KlMax,
         FField2D& OutSuitability,
-        TArray<uint8>* OutLimiter)
+        TArray<uint8>* OutLimiter,
+        const EcoCarbon::FCO2Params* CO2)
     {
         const FField2D& Ref = Height.Field;
         if (!Ref.IsValid())
@@ -76,6 +95,12 @@ namespace EcoVigor
         const float WaterDem = Species.WaterDemand;
         const float NutriDem = Species.NutrientDemand;
 
+        // Fase 6: copia local de los parametros de CO2 (o desactivado). Se saca
+        // del puntero fuera del ParallelFor por el mismo motivo.
+        EcoCarbon::FCO2Params CO2Local;
+        CO2Local.bEnabled = false;
+        if (CO2) { CO2Local = *CO2; }
+
         // Una fila por tarea: cada fila escribe celdas disjuntas -> determinista y
         // seguro sin locks (mismo patron que FNutrientField / FWaterField).
         ParallelFor(H, [&](int32 y)
@@ -100,7 +125,14 @@ namespace EcoVigor
                     const float fN = NutrientFactor(Nv, NutriDem);
 
                     EEcoLimiter Lim;
-                    OutSuitability.Data[i] = CombineWithLimiter(fL, fW, fN, Lim);
+                    float V = CombineWithLimiter(fL, fW, fN, Lim);
+
+                    // Fase 6: el heatmap tiene que representar EL MISMO numero que
+                    // consume el tick, o dejaria de servir para explicar por que el
+                    // bosque crece donde crece.
+                    V *= EcoCarbon::CO2Factor(Q, /*CanopyHeightCm*/ 0.f, CO2Local);
+
+                    OutSuitability.Data[i] = V;
                     if (OutLimiter)
                     {
                         (*OutLimiter)[i] = static_cast<uint8>(Lim);

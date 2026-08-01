@@ -14,14 +14,33 @@ class UHierarchicalInstancedStaticMeshComponent;
 struct FTreeLibraryConfig
 {
     int32 NumAgeBuckets = 5;
-    /** Fase 5 usa DOS: [0] fase estacional estable por arbol, [1] sequedad. Con 1
-        el material se queda sin el canal de sequedad y los senescentes se dibujan
-        verdes en silencio, asi que 2 es el minimo util (correccion B2). */
-    int32 NumInstanceCustomDataFloats = 2;
+    /** Fase 5 usa DOS: [0] fase estacional estable por arbol, [1] sequedad. La
+        Fase 6 anade [2] apertura de copa (AO). Con menos de 3 el material se
+        queda sin alguno de esos canales y los ve como 0, que es un degradado
+        silencioso pero no rompe nada. */
+    int32 NumInstanceCustomDataFloats = 3;
     bool  bInstancesCastShadow = true;
     bool  bImpostorsCastShadow = false;    // doc. 4.6: que la sombra lejana la ponga el HLOD
     float InstanceEndCullDistanceCm = 0.f; // 0 = sin cull por distancia del propio ISM
     float ImpostorEndCullDistanceCm = 0.f;
+
+    // --- Fase 6 (doc. 6.1): viento en los componentes de instancing ---
+    /** Las instancias cercanas evaluan el World Position Offset (el balanceo). */
+    bool  bWindOnInstances = true;
+    /** Los impostors, por defecto NO (campo lejano; ver doc. 6.1). */
+    bool  bWindOnImpostors = false;
+    /**
+     * Distancia (cm) a partir de la cual el componente deja de evaluar el WPO.
+     * Es el caveat de rendimiento del doc. 6.1 hecho ajuste: a 120 m el balanceo
+     * es sub-pixel y evaluarlo solo cuesta vertex shader. 0 = sin corte.
+     */
+    float WindWpoCutoffCm = 12000.f;
+    /**
+     * Margen de la caja envolvente de los componentes con viento. El WPO mueve
+     * vertices que el culling no ve; sin margen, un arbol al borde del encuadre
+     * desaparece de golpe con las ramas todavia dentro.
+     */
+    float WindBoundsScale = 1.15f;
 };
 
 /**
@@ -116,11 +135,22 @@ public:
     /** Recuento agregado para Eco.LOD.Stats. */
     void GetStats(int32& OutMeshes, int32& OutComponents, int32& OutInstances, int32& OutTriangles) const;
 
+    /**
+     * Fase 6: reaplica los ajustes de viento (evaluar WPO, distancia de corte,
+     * margen de bounds) a TODOS los componentes ya creados. Lo llama el gestor de
+     * LOD cuando cambian los ajustes en vivo, para no tener que reconstruir la
+     * capa de render entera solo por mover un slider.
+     */
+    void ApplyWindSettings(const FTreeLibraryConfig& InConfig);
+
     const TMap<uint32, FTreeArchetypeEntry>& GetEntries() const { return Entries; }
 
 private:
     bool BakeArchetype(const FArchetypeKey& Key);
     const USpeciesData* GetBaseSpecies(uint16 SpeciesId) const;
+
+    /** Aplica a un componente los ajustes de viento/bounds de la Fase 6. */
+    void ConfigureWind(UHierarchicalInstancedStaticMeshComponent* Comp, bool bImpostor) const;
 
     /** Semilla fija del arquetipo: misma libreria en cada arranque (doc. 3.8). */
     static uint32 ArchetypeSeed(const FArchetypeKey& Key)

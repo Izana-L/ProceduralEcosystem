@@ -3,9 +3,11 @@
 #include "Render/TreeInstanceHost.h"
 
 #include "Config/EcosystemSettings.h"
+#include "Core/EcoStats.h"                 // Fase 6: instrumentacion
 #include "Simulation/EcosystemSubsystem.h"
 #include "Species/SpeciesData.h"
 #include "Geometry/HeroTreeActor.h"
+#include "Terrain/LightFieldCoarse.h"      // Fase 6: AO de copa por instancia
 
 #include "Ecology/TreePopulation.h"
 
@@ -42,6 +44,20 @@ static TAutoConsoleVariable<int32> CVarSmoothHero(TEXT("Eco.LOD.SmoothHero"), 1,
 // Fase 5 (estacional): fuerza la estacion para demos/capturas; -1 = avance automatico.
 static TAutoConsoleVariable<float> CVarSeason(TEXT("Eco.Season"), -1.f,
     TEXT("Fuerza la estacion [0,1) (0=primavera, .25=verano, .5=otono, .75=invierno). -1 = auto."));
+
+// --- Fase 6 (6.1): viento ---
+static TAutoConsoleVariable<int32> CVarWind(TEXT("Eco.Wind.Enable"), 1,
+    TEXT("1 = viento activo. 0 = fuerza 0 (el material deja de desplazar vertices: util para medir el coste del WPO)."));
+
+static TAutoConsoleVariable<float> CVarWindStrength(TEXT("Eco.Wind.Strength"), -1.f,
+    TEXT("Fuerza del viento [0..4]. -1 = usar Project Settings."));
+
+static TAutoConsoleVariable<float> CVarWindDir(TEXT("Eco.Wind.Dir"), -1.f,
+    TEXT("Direccion del viento en grados [0..360). -1 = usar Project Settings."));
+
+// --- Fase 6 (6.2): AO de copa por instancia ---
+static TAutoConsoleVariable<int32> CVarCanopyAO(TEXT("Eco.CanopyAO"), 1,
+    TEXT("1 = escribe la apertura de copa en PerInstanceCustomData[2] (AO por instancia). 0 = ablacion."));
 
 static UTreeRenderSubsystem* GetRender(UWorld* World)
 {
@@ -96,6 +112,15 @@ static FAutoConsoleCommandWithWorldAndArgs GLodFreeze(TEXT("Eco.LOD.Freeze"),
             }
         }));
 
+// --- Fase 6 ---
+static FAutoConsoleCommandWithWorld GWindApply(TEXT("Eco.Wind.Apply"),
+    TEXT("Reaplica a los componentes ISM los ajustes de viento de Project Settings (WPO, distancia de corte, bounds)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UTreeRenderSubsystem* S = GetRender(W)) S->ApplyWindSettings(); }));
+
+static FAutoConsoleCommandWithWorld GWindLog(TEXT("Eco.Wind.Log"),
+    TEXT("Loguea el estado actual del viento (direccion, fuerza, rafaga) y la configuracion de WPO."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UTreeRenderSubsystem* S = GetRender(W)) S->LogWindState(); }));
+
 // ---------------------------------------------------------------------------
 //  Ciclo de vida
 // ---------------------------------------------------------------------------
@@ -113,6 +138,16 @@ void UTreeRenderSubsystem::Deinitialize()
 TStatId UTreeRenderSubsystem::GetStatId() const
 {
     RETURN_QUICK_DECLARE_CYCLE_STAT(UTreeRenderSubsystem, STATGROUP_Tickables);
+}
+
+/** Rellena la parte de viento de la config de la libreria desde los settings. */
+static void FillWindConfig(const UEcosystemSettings& S, FTreeLibraryConfig& Cfg)
+{
+    const bool bWind = S.bEnableWind;
+    Cfg.bWindOnInstances = bWind;
+    Cfg.bWindOnImpostors = bWind && S.bWindOnImpostors;
+    Cfg.WindWpoCutoffCm = S.WindWpoCutoffCm;
+    Cfg.WindBoundsScale = 1.15f;
 }
 
 /**
@@ -159,6 +194,7 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     // radio del gestor para que el cambio de nivel no compita con el cull.
     Cfg.InstanceEndCullDistanceCm = S->ImpostorRadiusCm * 1.2f;
     Cfg.ImpostorEndCullDistanceCm = S->CullRadiusCm * 1.2f;
+    FillWindConfig(*S, Cfg); // Fase 6
 
     Library = NewObject<UTreeLibrary>(this);
     Library->Initialize(Host, Eco->GetSpeciesList(), Cfg);
@@ -175,7 +211,7 @@ bool UTreeRenderSubsystem::EnsureInitialized()
     Eco->OnStateLoaded.AddUObject(this, &UTreeRenderSubsystem::HandleStateLoaded);
 
     // MPC de estacion resuelto UNA vez (correccion B6): antes UpdateSeason hacia
-    // LoadSynchronous en cada frame.
+    // LoadSynchronous en cada frame. Fase 6: lo mismo para el MPC de viento.
     SeasonMPCCached = S->SeasonMPC.LoadSynchronous();
     if (!SeasonMPCCached)
     {
@@ -183,10 +219,18 @@ bool UTreeRenderSubsystem::EnsureInitialized()
             TEXT("[Eco/LOD] Sin SeasonMPC en Project Settings: el ciclo estacional no se aplicara."));
     }
 
+    WindMPCCached = S->WindMPC.LoadSynchronous();
+    if (!WindMPCCached)
+    {
+        UE_LOG(LogEcoRender, Log,
+            TEXT("[Eco/F6] Sin WindMPC en Project Settings: el viento no se aplicara. "
+                "Puedes asignar el MISMO asset que SeasonMPC (los nombres de parametro no chocan)."));
+    }
+
     bInitialized = true;
 
-    UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Capa de render lista (%d especies, %d buckets)."),
-        Eco->GetSpeciesList().Num(), S->NumAgeBuckets);
+    UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Capa de render lista (%d especies, %d buckets, %d floats por instancia)."),
+        Eco->GetSpeciesList().Num(), S->NumAgeBuckets, S->NumInstanceCustomDataFloats);
     return true;
 }
 
@@ -216,6 +260,7 @@ void UTreeRenderSubsystem::ReleaseEverything()
     ResolvedUpdates.Reset();
     BatchXforms.Reset();
     SeasonMPCCached = nullptr;
+    WindMPCCached = nullptr;
 
     if (Library)
     {
@@ -273,11 +318,13 @@ void UTreeRenderSubsystem::RebuildAll()
 
     bForceRelevel = true;
 }
+
 void UTreeRenderSubsystem::HandleStateLoaded()
 {
     RebuildAll();
     UE_LOG(LogEcoRender, Log, TEXT("[Eco/LOD] Bake cargado: estado de render reconstruido."));
 }
+
 void UTreeRenderSubsystem::BakeLibraryNow()
 {
     if (EnsureInitialized() && Library)
@@ -287,12 +334,57 @@ void UTreeRenderSubsystem::BakeLibraryNow()
     }
 }
 
+void UTreeRenderSubsystem::ApplyWindSettings()
+{
+    if (!EnsureInitialized() || !Library)
+    {
+        return;
+    }
+
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    FTreeLibraryConfig Cfg;
+    FillWindConfig(*S, Cfg);
+    Library->ApplyWindSettings(Cfg);
+
+    UE_LOG(LogEcoRender, Log, TEXT("[Eco/F6] Viento reaplicado: instancias=%s impostors=%s corte=%.0f cm."),
+        Cfg.bWindOnInstances ? TEXT("si") : TEXT("no"),
+        Cfg.bWindOnImpostors ? TEXT("si") : TEXT("no"),
+        Cfg.WindWpoCutoffCm);
+}
+
+void UTreeRenderSubsystem::LogWindState() const
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    UE_LOG(LogEcoRender, Log, TEXT("[Eco/F6] Viento: dir %.0f deg | fuerza %.3f (rafaga %.2f) | reloj %.1f s | MPC %s"),
+        WindDirDegNow, WindStrengthNow, WindGustNow, WindTime,
+        WindMPCCached ? TEXT("asignado") : TEXT("NO ASIGNADO"));
+    UE_LOG(LogEcoRender, Log, TEXT("[Eco/F6] WPO: corte %.0f cm | impostors %s | AO por instancia %s"),
+        S->WindWpoCutoffCm,
+        S->bWindOnImpostors ? TEXT("con viento") : TEXT("estaticos"),
+        (S->bCanopyAOInstanceData && CVarCanopyAO.GetValueOnGameThread() != 0) ? TEXT("ON") : TEXT("OFF"));
+}
+
 // ---------------------------------------------------------------------------
 //  Tick
 // ---------------------------------------------------------------------------
 void UTreeRenderSubsystem::Tick(float DeltaTime)
 {
-    if (!EnsureInitialized() || !bEnabled)
+    if (!EnsureInitialized())
+    {
+        return;
+    }
+
+    // FASE 6: los relojes GLOBALES de material (estacion y viento) se empujan
+    // SIEMPRE, aunque la capa instanciada este apagada. Motivos:
+    //   - Los hero trees sueltos (Eco.GrowHeroTree) existen al margen del gestor
+    //     de LOD y tambien tienen que moverse y cambiar de estacion.
+    //   - En la ablacion de la Fase 7 (Eco.LOD.Enable 0) se comparan capturas: el
+    //     bosque de referencia debe estar en la misma estacion.
+    // Coste: dos escrituras de parametro por frame. Literalmente nada.
+    UpdateSeason(DeltaTime);
+    UpdateWind(DeltaTime);
+
+    if (!bEnabled)
     {
         return;
     }
@@ -337,8 +429,15 @@ void UTreeRenderSubsystem::Tick(float DeltaTime)
     // objetivo para que crezcan de forma continua (barato: son decenas).
     UpdateHeroInterpolation(DeltaTime);
 
-    // Fase 5 (estacional): empuja la estacion global al MPC de los materiales.
-    UpdateSeason(DeltaTime);
+    // Fase 6 (6.4): contadores para `stat EcoRender` y para el CSV de la Fase 7.
+    SET_DWORD_STAT(STAT_EcoNumHero, NumHero);
+    SET_DWORD_STAT(STAT_EcoNumInstance, NumInstance);
+    SET_DWORD_STAT(STAT_EcoNumImpostor, NumImpostor);
+    SET_DWORD_STAT(STAT_EcoNumCulled, NumCulled);
+    CSV_CUSTOM_STAT(Eco, TreesHero, NumHero, ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Eco, TreesInstance, NumInstance, ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Eco, TreesImpostor, NumImpostor, ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Eco, RelevelMs, (float)LastRelevelMs, ECsvCustomStatOp::Set);
 }
 
 bool UTreeRenderSubsystem::GetViewLocation(FVector& OutLocation) const
@@ -373,6 +472,9 @@ bool UTreeRenderSubsystem::GetViewLocation(FVector& OutLocation) const
 // ---------------------------------------------------------------------------
 void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
 {
+    SCOPE_CYCLE_COUNTER(STAT_EcoRelevel);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_UpdateLOD);
+
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     const FTreePopulation& Pop = Eco->GetPopulation();
     const int32 PopNum = Pop.Num();
@@ -387,6 +489,16 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
 
     const int32 NumBuckets = FMath::Max(1, S->NumAgeBuckets);
     ++VisitStamp;
+
+    // Fase 6 (6.2): AO de copa por instancia. Se muestrea el grid de luz GRUESO a
+    // media altura de la copa de cada arbol INSTANCIADO (no de los impostors: a
+    // esa distancia no se aprecia y son la mayoria). Es un muestreo trilineal por
+    // arbol dibujado y por re-nivelado -o sea, cada RelevelEveryNFrames frames-,
+    // no por frame ni por vertice.
+    const FLightFieldCoarse& Light = Eco->GetLightCoarse();
+    const bool bCanopyAO = S->bCanopyAOInstanceData
+        && CVarCanopyAO.GetValueOnGameThread() != 0
+        && Light.IsValid();
 
     // --- 1) Seleccion de hero: los HeroBudget mas cercanos dentro de R_hero ---
     // SELECCION PARCIAL (C4), no un sort completo: en bosque denso dentro de
@@ -452,10 +564,6 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         const USpeciesData* Sp = Eco->GetSpeciesById(Pop.SpeciesId[i]);
         if (!Sp) { continue; }
 
-        // Sequedad: la necesitan TANTO la rama estable (actualizar) COMO EnterTier
-        // (sembrar la custom data de la instancia nueva), asi que se calcula aqui.
-        const float Dryness = DrynessOf(Pop.State[i], Pop.Stress[i]);
-
         FTreeRenderState& State = States.FindOrAdd(StableId);
         State.Stamp = VisitStamp;
 
@@ -470,6 +578,23 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         case ETreeRenderTier::Instance: ++NumInstance; break;
         default:                        ++NumImpostor; break;
         }
+
+        // --- Datos por instancia (Fase 5 + Fase 6) ---
+        // Se calculan aqui porque los necesitan TANTO la rama estable (actualizar)
+        // COMO EnterTier (sembrar la custom data de una instancia nueva).
+        const float Dryness = DrynessOf(Pop.State[i], Pop.Stress[i]);
+
+        float CanopyAO = 1.f;
+        if (bCanopyAO && Want == ETreeRenderTier::Instance)
+        {
+            // A media altura de copa: ni el suelo (siempre sombrio) ni el apice
+            // (siempre al sol). Es la banda donde de verdad se nota si el arbol
+            // esta bajo el dosel de un vecino o es el que domina.
+            const FVector Probe = Pop.Position[i] + FVector(0.f, 0.f, Pop.Height[i] * 0.6f);
+            CanopyAO = FMath::Clamp(Light.SampleLightSmooth(Probe) / FLightFieldCoarse::FullSunlight, 0.f, 1.f);
+        }
+        const FVector2f CustomData(Dryness, CanopyAO);
+
         // Estaba encolado como hero y ha dejado de serlo mientras esperaba: cancela
         // la generacion. Si no, ProcessHeroQueue le montaria un actor a un arbol que
         // ya no es hero (y ademas se colaria delante de los que si lo son).
@@ -479,6 +604,7 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
             HeroInfo.Remove(StableId);
             State.bHeroPending = false;
         }
+
         // Arquetipo: bucket con histeresis + variante estable.
         const float Ratio = TreeArchetype::HeightRatio(Pop.Biomass[i], Sp->MaxBiomass);
         const int32 Bucket = TreeArchetype::BucketWithHysteresis(Ratio, State.Bucket, NumBuckets, S->BucketHysteresis);
@@ -535,25 +661,32 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
                 State.LastScale = ScaleInBucket;
             }
 
-            // Fase 5 (estacional): actualiza la "sequedad" por instancia (float1) si
-            // cambio de banda. Solo aqui, en la rama estable (sin cambio de nivel/bucket),
-            // donde el indice de instancia no se va a mover en este flush. El caso
+            // Datos por instancia (Fase 5: sequedad; Fase 6: apertura de copa).
+            // Solo aqui, en la rama estable (sin cambio de nivel/bucket), donde el
+            // indice de instancia no se va a mover en este flush. El caso
             // "instancia recien creada" lo cubre EnterTier/FlushInstanceOps.
+            //
+            // Se reescribe SOLO si alguno de los dos cruza de banda (16 niveles):
+            // sin ese umbral estariamos tocando la custom data de todas las
+            // instancias en cada re-nivelado, que es el trap del doc. 4.4.
             if (State.InstanceIndex >= 0 &&
                 (State.Tier == ETreeRenderTier::Instance || State.Tier == ETreeRenderTier::Impostor))
             {
-                const uint8 Q = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Dryness * 15.f), 0, 15));
-                if (Q != State.LastVitalityQ)
+                const uint8 Qd = Quantize16(Dryness);
+                const uint8 Qc = Quantize16(CanopyAO);
+                if (Qd != State.LastVitalityQ || Qc != State.LastCanopyQ)
                 {
                     const uint64 CompKey = MakeComponentKey(State.PackedKey, State.Tier == ETreeRenderTier::Impostor);
-                    Pending.FindOrAdd(CompKey).CustomData1.Add(TPair<uint32, float>(StableId, Dryness));
-                    State.LastVitalityQ = Q;
+                    Pending.FindOrAdd(CompKey).CustomUpdates.Add(TPair<uint32, FVector2f>(StableId, CustomData));
+                    State.LastVitalityQ = Qd;
+                    State.LastCanopyQ = Qc;
                 }
             }
 
             State.Bucket = Bucket;
             continue;
         }
+
         if (Want == ETreeRenderTier::Hero)
         {
             FPendingHero Info;
@@ -569,7 +702,7 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
         }
 
         LeaveTier(StableId, State);
-        EnterTier(StableId, State, Want, Key, Xform, ScaleInBucket, Dryness);
+        EnterTier(StableId, State, Want, Key, Xform, ScaleInBucket, Dryness, CanopyAO);
         State.Bucket = Bucket;
     }
 
@@ -614,13 +747,15 @@ void UTreeRenderSubsystem::LeaveTier(uint32 StableId, FTreeRenderState& State)
     State.bHasRepresentation = false; // B8: la clave guardada ya no describe nada
     // La proxima instancia sera OTRA instancia (posiblemente en otro componente)
     // y nacera con custom data a 0. Sin este reset, el comparador de banda
-    // (Q != LastVitalityQ) da falso y la sequedad no se vuelve a escribir jamas.
+    // (Q != LastQ) da falso y los datos por instancia no se vuelven a escribir jamas.
     State.LastVitalityQ = 255;
+    State.LastCanopyQ = 255;
     State.bHeroPending = false;
 }
 
 void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, ETreeRenderTier Want,
-    const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness)
+    const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket,
+    float Dryness, float CanopyAO)
 {
     State.LastScale = ScaleInBucket;
 
@@ -660,15 +795,16 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
     FPendingComponentOps& Ops = Pending.FindOrAdd(MakeComponentKey(Key.Pack(), bImpostor));
     Ops.AddIds.Add(StableId);
     Ops.AddXforms.Add(Xform);
-    Ops.AddDryness.Add(Dryness);   // la instancia nace ya con su estado sanitario
+    Ops.AddCustom.Add(FVector2f(Dryness, CanopyAO)); // nace ya con su estado sanitario y su AO
 
     State.Tier = Want;
     State.PackedKey = Key.Pack();
     State.bHasRepresentation = true;
     State.InstanceIndex = -1; // lo asigna el flush
-    // Sincroniza el centinela con lo que el flush va a escribir, para que el
+    // Sincroniza los centinelas con lo que el flush va a escribir, para que el
     // siguiente re-nivelado no reescriba lo mismo.
-    State.LastVitalityQ = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Dryness * 15.f), 0, 15));
+    State.LastVitalityQ = Quantize16(Dryness);
+    State.LastCanopyQ = Quantize16(CanopyAO);
 }
 
 /**
@@ -681,9 +817,13 @@ void UTreeRenderSubsystem::EnterTier(uint32 StableId, FTreeRenderState& State, E
  *      se re-mapea, los indices guardados apuntan al arbol equivocado.
  *   2. Altas (AddInstances por lote), que devuelven los indices nuevos.
  *   3. Actualizaciones de transform, ya con los indices correctos.
+ *   4. Datos por instancia (sequedad + apertura de copa).
  */
 void UTreeRenderSubsystem::FlushInstanceOps()
 {
+    SCOPE_CYCLE_COUNTER(STAT_EcoFlushInstances);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_FlushInstances);
+
     if (!Library)
     {
         Pending.Reset();
@@ -745,15 +885,24 @@ void UTreeRenderSubsystem::FlushInstanceOps()
                 // Datos por instancia (PerInstanceCustomData, sin draw calls extra):
                 //   [0] = fase estacional estable por arbol -> el material desincroniza
                 //         el cambio de estacion para que no cambien todos al unisono.
-                //   [1] = sequedad inicial (0 sano, 1 seco/senescente).
+                //   [1] = sequedad (0 sano, 1 seco/senescente).
+                //   [2] = apertura de copa para el AO (Fase 6): 1 a pleno sol,
+                //         0 bajo dosel cerrado.
                 if (Comp->NumCustomDataFloats > 0)
                 {
                     Comp->SetCustomDataValue(Index, 0,
                         TreeArchetype::StableUnit(Id, TreeArchetype::SaltPhase), /*bMarkRenderStateDirty*/ false);
                 }
-                if (Comp->NumCustomDataFloats > 1 && Ops.AddDryness.IsValidIndex(k))
+                if (Ops.AddCustom.IsValidIndex(k))
                 {
-                    Comp->SetCustomDataValue(Index, 1, Ops.AddDryness[k], /*bMarkRenderStateDirty*/ false);
+                    if (Comp->NumCustomDataFloats > 1)
+                    {
+                        Comp->SetCustomDataValue(Index, 1, Ops.AddCustom[k].X, /*bMarkRenderStateDirty*/ false);
+                    }
+                    if (Comp->NumCustomDataFloats > 2)
+                    {
+                        Comp->SetCustomDataValue(Index, 2, Ops.AddCustom[k].Y, /*bMarkRenderStateDirty*/ false);
+                    }
                 }
             }
         }
@@ -798,22 +947,27 @@ void UTreeRenderSubsystem::FlushInstanceOps()
             }
         }
 
-        // --- 3b) DATO POR INSTANCIA: "sequedad" estacional en float1 (Fase 5) ---
+        // --- 4) DATOS POR INSTANCIA: sequedad (Fase 5) + apertura de copa (Fase 6) ---
         if (Comp->NumCustomDataFloats > 1)
         {
-            for (const TPair<uint32, float>& CD : Ops.CustomData1)
+            const bool bHasAO = Comp->NumCustomDataFloats > 2;
+            for (const TPair<uint32, FVector2f>& CD : Ops.CustomUpdates)
             {
                 if (const FTreeRenderState* Found = States.Find(CD.Key))
                 {
                     if (Found->InstanceIndex >= 0)
                     {
-                        Comp->SetCustomDataValue(Found->InstanceIndex, 1, CD.Value, /*bMarkRenderStateDirty*/ false);
+                        Comp->SetCustomDataValue(Found->InstanceIndex, 1, CD.Value.X, /*bMarkRenderStateDirty*/ false);
+                        if (bHasAO)
+                        {
+                            Comp->SetCustomDataValue(Found->InstanceIndex, 2, CD.Value.Y, /*bMarkRenderStateDirty*/ false);
+                        }
                     }
                 }
             }
         }
 
-        // --- 4) UNA sola invalidacion por componente ---
+        // --- 5) UNA sola invalidacion por componente ---
         Comp->MarkRenderStateDirty();
     }
 
@@ -830,6 +984,13 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
     {
         return;
     }
+    if (HeroQueue.Num() == 0 && Pending.Num() == 0)
+    {
+        return; // nada que hacer: ni siquiera abrimos el ambito de profiling
+    }
+
+    SCOPE_CYCLE_COUNTER(STAT_EcoHeroGen);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_ProcessHeroQueue);
 
     int32 Done = 0;
     while (HeroQueue.Num() > 0 && Done < FMath::Max(1, MaxThisFrame))
@@ -893,6 +1054,11 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         // libreria instanciada no puede hacer esto (es generica); por eso los
         // arboles cercanos se ven "conscientes de su sitio" y los lejanos no
         // hace falta que lo esten.
+        //
+        // Fase 6: de esa misma rejilla fina sale ademas el AO de copa por
+        // vertice del hero (ver AHeroTreeActor::BuildNow), asi que un hero
+        // apretado contra un vecino no solo crece ladeado: tambien se ve mas
+        // oscuro por el lado que le da sombra.
         Slot.Actor->Generate(ArchetypeSp, EcoRand::Hash32(StableId), &Eco->GetLightCoarse(), Info.Position);
         Slot.Actor->SetActorRotation(FRotator::ZeroRotator); // ver nota de A3 en el SpawnActor
         Slot.Actor->SetActorScale3D(FVector(Info.Scale));
@@ -1069,7 +1235,7 @@ void UTreeRenderSubsystem::UpdateHeroInterpolation(float DeltaTime)
 }
 
 // ---------------------------------------------------------------------------
-//  Ciclo estacional (Fase 5): estacion global -> Material Parameter Collection
+//  Ciclo estacional (Fase 5) + nieve (Fase 6): estacion -> MPC
 // ---------------------------------------------------------------------------
 //
 // La estacion es un escalar [0,1) que avanza solo con el tiempo real (o se fija
@@ -1116,5 +1282,92 @@ void UTreeRenderSubsystem::UpdateSeason(float DeltaTime)
     if (UMaterialParameterCollectionInstance* Inst = World->GetParameterCollectionInstance(SeasonMPCCached))
     {
         Inst->SetScalarParameterValue(TEXT("Season"), SeasonPhase);
+
+        // Fase 6 (6.2): nieve derivada de la estacion. Pico en invierno (0.75) y
+        // cero el resto del ano; la curva al cuadrado hace que llegue y se vaya
+        // deprisa en vez de haber medio invierno permanente. El material la mezcla
+        // segun la normal hacia arriba, asi que basta con este escalar global.
+        const float Winter = FMath::Cos(2.f * PI * (SeasonPhase - 0.75f));
+        const float Snow = FMath::Clamp(S->MaxSnowAmount, 0.f, 1.f)
+            * FMath::Square(FMath::Max(0.f, Winter));
+        Inst->SetScalarParameterValue(TEXT("Snow"), Snow);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  VIENTO (Fase 6, doc. 6.1): estado global -> Material Parameter Collection
+// ---------------------------------------------------------------------------
+//
+// Todo el movimiento lo hace el material en el vertex shader. Desde C++ solo se
+// publica, una vez por frame, el ESTADO del viento; no hay ni un bucle sobre
+// arboles. Las dos escalas de movimiento del documento se reparten asi:
+//
+//   - Balanceo de baja frecuencia del arbol: el material rota cada rama sobre el
+//     pivote que trae en UV1/UV2, con la amplitud de UV3.x y el desfase de UV3.y.
+//     La jerarquia (subramas heredando el movimiento del padre) sale de que el
+//     nivel de rama viaja en UV2.y: los niveles altos suman el desplazamiento de
+//     los bajos.
+//   - Aleteo de alta frecuencia de las hojas: la seccion de follaje usa el mismo
+//     UV3 pero con una frecuencia mucho mayor y amplitud pequena.
+//
+// Y las tres dependencias que pide el doc:
+//   - TIEMPO: reloj propio (WindTime), no el de simulacion.
+//   - POSICION DE MUNDO: la anade el material (dot(WorldPosition, WindDirection)
+//     dentro del seno) para que la racha "viaje" por el bosque y no se muevan
+//     todos al unisono.
+//   - DIRECCION/FUERZA GLOBAL + RAFAGAS: lo que se escribe aqui.
+void UTreeRenderSubsystem::UpdateWind(float DeltaTime)
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    UWorld* World = GetWorld();
+    if (!World) { return; }
+
+    WindTime += FMath::Max(0.f, DeltaTime);
+
+    const bool bWindOn = S->bEnableWind && (CVarWind.GetValueOnGameThread() != 0);
+
+    const float StrengthOverride = CVarWindStrength.GetValueOnGameThread();
+    const float BaseStrength = (StrengthOverride >= 0.f) ? StrengthOverride : S->WindStrength;
+
+    const float DirOverride = CVarWindDir.GetValueOnGameThread();
+    const float BaseDirDeg = (DirOverride >= 0.f) ? DirOverride : S->WindDirectionDeg;
+
+    // --- Rafagas: ruido temporal barato y REPRODUCIBLE ---
+    // Dos senos de periodos inconmensurables (P y P*0.37): la suma no se repite
+    // en ningun ciclo audible/visible pero es puramente analitica -sin RNG, sin
+    // estado, sin textura de ruido- y por tanto igual en cada corrida, que es lo
+    // que pide el proyecto para poder comparar capturas.
+    const float P = FMath::Max(0.1f, S->WindGustPeriodSeconds);
+    const float Raw = 0.5f * (FMath::Sin(2.f * PI * WindTime / P)
+        + FMath::Sin(2.f * PI * WindTime / (P * 0.37f)));   // [-1, 1]
+    const float Gust01 = 0.5f + 0.5f * Raw;                  // [0, 1]
+
+    const float Amp = FMath::Clamp(S->WindGustAmplitude, 0.f, 1.f);
+    const float Strength = bWindOn
+        ? FMath::Max(0.f, BaseStrength * (1.f + Amp * (2.f * Gust01 - 1.f)))
+        : 0.f;
+
+    // --- Deriva lenta de la direccion ---
+    // Un viento de direccion perfectamente fija canta a artificial en cuanto lo
+    // miras diez segundos. Un vaiven lento y pequeno lo arregla.
+    const float WanderDeg = FMath::Clamp(S->WindDirectionWanderDeg, 0.f, 90.f)
+        * FMath::Sin(2.f * PI * WindTime / (P * 2.9f));
+    const float DirDeg = BaseDirDeg + WanderDeg;
+    const float DirRad = FMath::DegreesToRadians(DirDeg);
+
+    WindStrengthNow = Strength;
+    WindGustNow = Gust01;
+    WindDirDegNow = DirDeg;
+
+    if (!WindMPCCached) { return; }
+
+    if (UMaterialParameterCollectionInstance* Inst = World->GetParameterCollectionInstance(WindMPCCached))
+    {
+        Inst->SetVectorParameterValue(TEXT("WindDirection"),
+            FLinearColor(FMath::Cos(DirRad), FMath::Sin(DirRad), 0.f, 0.f));
+        Inst->SetScalarParameterValue(TEXT("WindStrength"), Strength);
+        Inst->SetScalarParameterValue(TEXT("WindGust"), Gust01);
+        Inst->SetScalarParameterValue(TEXT("WindTime"), WindTime);
+        Inst->SetScalarParameterValue(TEXT("WindWpoCutoff"), S->WindWpoCutoffCm);
     }
 }

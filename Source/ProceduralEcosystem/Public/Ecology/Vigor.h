@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Ecology/CarbonModel.h" // Fase 6: multiplicador de CO2
 
 struct FField2D;
 struct FHeightField;
@@ -21,6 +22,12 @@ class  USpeciesData;
  *     fN = (N/NutrientDemand)/ ((N/NutrientDemand)+ 1)     nutrientes (Monod)
  *     vigor = min(fL, fW, fN)          <- el recurso mas ESCASO limita
  *
+ * FASE 6 (doc. 6.3): sobre ese minimo se aplica ademas un multiplicador
+ * analitico de CO2 (Ecology/CarbonModel.h), que baja levemente el vigor dentro
+ * de un dosel denso y a poca altura. Se pasa como puntero OPCIONAL: si es
+ * nullptr no se aplica, de modo que todo el codigo anterior a la Fase 6 sigue
+ * dando exactamente los mismos numeros.
+ *
  * Un arbol en suelo rico pero a la sombra sigue limitado por la luz -> realista,
  * y ademas genera variedad: distintas zonas del paisaje quedan limitadas por
  * distinto recurso (ver EEcoLimiter).
@@ -32,7 +39,7 @@ class  USpeciesData;
  * formula.
  */
 
-/** Que recurso esta limitando el vigor en un punto (el argmin de Liebig). */
+ /** Que recurso esta limitando el vigor en un punto (el argmin de Liebig). */
 enum class EEcoLimiter : uint8
 {
     Light,
@@ -90,6 +97,9 @@ namespace EcoVigor
      * @param WorldPos  Punto en mundo (cm). La Z importa: la luz se muestrea en 3D,
      *                  asi que pasa la Z del suelo (o de la copa) segun el caso.
      * @param KlMax     Semisaturacion de luz global (heliofila); ver EcosystemSettings.
+     * @param CO2       Fase 6: si no es nullptr, se aplica el multiplicador de CO2
+     *                  (doc. 6.3) evaluado a nivel de suelo (altura de copa 0, que
+     *                  es lo correcto para "idoneidad para una plantula").
      */
     PROCEDURALECOSYSTEM_API float VigorAtWorld(
         const FVector& WorldPos,
@@ -98,7 +108,8 @@ namespace EcoVigor
         const FNutrientField& Nutrient,
         const FLightFieldCoarse& Light,
         float KlMax,
-        EEcoLimiter* OutLimiter = nullptr);
+        EEcoLimiter* OutLimiter = nullptr,
+        const EcoCarbon::FCO2Params* CO2 = nullptr);
 
     /**
      * Rellena un campo de IDONEIDAD (vigor en [0,1]) para una especie sobre toda
@@ -111,6 +122,10 @@ namespace EcoVigor
      *
      * @param OutLimiter  Opcional: si no es null, se rellena con el limitante por
      *                     nodo (0=luz,1=agua,2=nutrientes) para un mapa cualitativo.
+     * @param CO2         Fase 6: mismo criterio que en VigorAtWorld. Pasarlo es
+     *                     importante para que el heatmap siga representando el
+     *                     MISMO numero que usa el tick; si no, el mapa de
+     *                     idoneidad y el crecimiento real dejarian de cuadrar.
      */
     PROCEDURALECOSYSTEM_API void BakeSuitabilityField(
         const FHeightField& Height,
@@ -120,5 +135,6 @@ namespace EcoVigor
         const USpeciesData& Species,
         float KlMax,
         FField2D& OutSuitability,
-        TArray<uint8>* OutLimiter = nullptr);
+        TArray<uint8>* OutLimiter = nullptr,
+        const EcoCarbon::FCO2Params* CO2 = nullptr);
 }

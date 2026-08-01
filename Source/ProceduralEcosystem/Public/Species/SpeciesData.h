@@ -238,6 +238,29 @@ public:
        los dominantes viejos son la PRINCIPAL fuente de semilla. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
     float SenescentSeedScale = 0.4f;
+
+    // ================================================================
+    // --- Fase 6: viento (doc. 6.1) ---
+    // ================================================================
+    // Estos dos parametros NO los lee ningun material: los "dobla" el mallador
+    // dentro del canal UV3 de cada vertice (ver Geometry/TreeWindData.h). Es
+    // deliberado y tiene una ventaja concreta: el material de corteza y el de
+    // hoja son UNO para todo el bosque -un solo shader, un solo draw call por
+    // arquetipo- y aun asi cada especie se mueve distinto, porque la diferencia
+    // viaja en la geometria y no en parametros por instancia.
+
+    /** Rigidez frente al viento. 0 = rama larga y flexible (sauce, abedul),
+        1 = practicamente rigido (conifera de tronco recto, arbol joven grueso).
+        Escala a la baja TODO el balanceo del arbol. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase6|Viento", meta = (ClampMin = "0", ClampMax = "1"))
+    float WindStiffness = 0.4f;
+
+    /** Amplitud del aleteo de las hojas, relativa al balanceo de su rama. 0 = la
+        hoja se mueve solo con la rama (conifera: aciculas cortas y rigidas);
+        1 = aleteo normal; >1 = hoja grande y suelta (chopo, alamo temblon). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase6|Viento", meta = (ClampMin = "0", ClampMax = "2"))
+    float LeafFlutterScale = 1.0f;
+
 #if WITH_EDITOR
     /** Validación de datos: avisa de configuraciones incoherentes al editar el asset. */
     virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;

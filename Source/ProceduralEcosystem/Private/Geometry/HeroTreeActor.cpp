@@ -4,6 +4,20 @@
 #include "ProceduralMeshComponent.h"
 #include "DrawDebugHelpers.h"
 
+namespace
+{
+    /**
+     * Fase 6 (6.1): margen de la caja envolvente para el viento.
+     *
+     * El balanceo es un desplazamiento de vertices en el material (WPO): la malla
+     * "real" que el culling conoce no se entera de que las ramas se han movido.
+     * Sin margen, un arbol al borde del encuadre desaparece de golpe mientras sus
+     * ramas todavia deberian verse. Un 15% cubre de sobra el recorrido de un
+     * balanceo creible y cuesta cero (solo agranda un test de visibilidad).
+     */
+    constexpr float WindBoundsScale = 1.15f;
+}
+
 AHeroTreeActor::AHeroTreeActor()
 {
     // El Tick de este actor SOLO sirve para el debug draw del esqueleto y los
@@ -16,6 +30,10 @@ AHeroTreeActor::AHeroTreeActor()
 
     Mesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("TreeMesh"));
     SetRootComponent(Mesh);
+
+    // Fase 6: margen de bounds para que el viento (WPO) no provoque culling
+    // prematuro. Ver la nota de arriba.
+    Mesh->SetBoundsScale(WindBoundsScale);
 }
 
 void AHeroTreeActor::SetDrawDebug(bool bInDrawDebug)
@@ -89,7 +107,11 @@ void AHeroTreeActor::BuildNow()
     SpaceColonization::GrowTree(*Sp, Rng, TrunkBaseWorld, CoarseLightPtr, Config,
         Skeleton, FineLight, Attractors);
 
-    TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData);
+    // Fase 6 (6.2): se le pasa al mallador la rejilla de luz FINA que acaba de
+    // dejar el SCA. De ahi sale el AO de copa por vertice: los mismos voxels que
+    // decidieron la autopoda oscurecen ahora el interior de la copa. Es la
+    // coherencia "material atado al campo de la simulacion" que pide el doc.
+    TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData, &FineLight);
 
     UploadSection(0, MeshData.Wood, BarkMaterial);
     UploadSection(1, MeshData.Leaves, LeafMaterial);
@@ -109,7 +131,9 @@ void AHeroTreeActor::UploadSection(int32 SectionIndex, const FTreeMeshBuffers& B
     }
 
     // Mundo -> local: la malla se guarda relativa a la base del tronco (que es
-    // la ubicacion del actor), no en coordenadas absolutas.
+    // la ubicacion del actor), no en coordenadas absolutas. Los pivotes de rama
+    // de la Fase 6 ya vienen en ESE mismo espacio local (ver TreeWindData.h), asi
+    // que no hay nada que convertir en ellos.
     const FVector Origin = TrunkBaseWorld;
     TArray<FVector> LocalVerts;
     LocalVerts.SetNumUninitialized(Buffers.Vertices.Num());
@@ -127,9 +151,23 @@ void AHeroTreeActor::UploadSection(int32 SectionIndex, const FTreeMeshBuffers& B
         Tangents[i] = FProcMeshTangent(Buffers.Tangents[i], false);
     }
 
+    // FASE 6: se sube la malla con los CUATRO canales UV y el color de vertice.
+    // El UProceduralMeshComponent soporta exactamente UV0..UV3, que es justo el
+    // motivo de haber empaquetado los datos de viento en 4 canales y no en mas:
+    // asi el hero tree y la instancia horneada comparten material y un arbol no
+    // cambia de aspecto -ni deja de moverse- al cruzar de nivel de detalle.
     Mesh->CreateMeshSection_LinearColor(
-        SectionIndex, LocalVerts, Buffers.Triangles, Buffers.Normals, Buffers.UVs,
-        TArray<FLinearColor>(), Tangents, /*bCreateCollision*/ false);
+        SectionIndex,
+        LocalVerts,
+        Buffers.Triangles,
+        Buffers.Normals,
+        Buffers.UVs,   // UV0: textura
+        Buffers.UV1,   // UV1: pivote.XY de la rama (metros, local)
+        Buffers.UV2,   // UV2: (pivote.Z, nivel de rama)
+        Buffers.UV3,   // UV3: (peso de balanceo, desfase)
+        Buffers.Colors,// (AO de copa, tinte, nivel, 1)
+        Tangents,
+        /*bCreateCollision*/ false);
 
     if (Material)
     {

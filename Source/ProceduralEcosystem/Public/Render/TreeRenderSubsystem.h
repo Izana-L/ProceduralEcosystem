@@ -11,7 +11,7 @@ class UEcosystemSubsystem;
 class USpeciesData;
 class UTreeLibrary;
 class UHierarchicalInstancedStaticMeshComponent;
-class UMaterialParameterCollection; // Fase 5 (ciclo estacional)
+class UMaterialParameterCollection; // Fase 5 (estacional) y Fase 6 (viento)
 
 /** Nivel de representacion de un arbol (doc. Fase 4, 4.1). */
 UENUM()
@@ -36,7 +36,16 @@ struct FTreeRenderState
     int32  Bucket = -1;        // ultimo bucket (para la histeresis)
     float  LastScale = 0.f;    // ultima escala subida (umbral de actualizacion)
     uint32 Stamp = 0;          // pasada de re-nivelado en que se vio vivo por ultima vez
-    uint8  LastVitalityQ = 255; // Fase 5: ultima "sequedad" cuantizada escrita en float1 (255 = nunca)
+
+    /** Fase 5: ultima "sequedad" cuantizada escrita en float1 (255 = nunca). */
+    uint8  LastVitalityQ = 255;
+
+    /** Fase 6: ultima "apertura de copa" cuantizada escrita en float2 (255 = nunca).
+        Se cuantiza a 16 bandas por el mismo motivo que la sequedad: sin banda, el
+        AO cambiaria unas milesimas en cada re-nivelado y escribiriamos custom data
+        de TODAS las instancias cada vez, que es justo el trap del doc. 4.4. */
+    uint8  LastCanopyQ = 255;
+
     /** El arbol esta en HeroQueue esperando su malla, pero SIGUE dibujado con su
         representacion anterior (instancia/impostor). El cambio de nivel se
         consuma en ProcessHeroQueue, cuando el actor ya tiene geometria. */
@@ -105,7 +114,13 @@ struct FHeroSlot
  *   - El re-nivelado completo (que incluye la seleccion de hero) corre cada
  *     RelevelEveryNFrames frames: los arboles se mueven despacio respecto a la
  *     camara. Lo unico que corre cada frame es la interpolacion de escala de los
- *     hero, la cola de generacion y el reloj estacional.
+ *     hero, la cola de generacion y los relojes globales (estacion y viento).
+ *
+ * FASE 6: este subsistema es tambien el que empuja los PARAMETROS GLOBALES DE
+ * MATERIAL (estacion, nieve, viento) a sus Material Parameter Collections. Son
+ * dos escrituras por frame para TODO el bosque: el movimiento y el cambio de
+ * estacion salen gratis en CPU, y lo que cuesta -el vertex shader del viento- se
+ * acota por distancia en los propios componentes (ver UTreeLibrary).
  */
 UCLASS()
 class PROCEDURALECOSYSTEM_API UTreeRenderSubsystem : public UTickableWorldSubsystem
@@ -130,6 +145,23 @@ public:
     void BakeLibraryNow();
     void LogStats() const;
 
+    /** Fase 6: reaplica a los componentes ya creados los ajustes de viento de
+        Project Settings (WPO on/off, distancia de corte, margen de bounds), sin
+        reconstruir la capa de render. Lo usa Eco.Wind.Apply. */
+    void ApplyWindSettings();
+
+    /** Fase 6: estado del viento para el HUD/log de profiling. */
+    void LogWindState() const;
+
+    /** Fase 6 (6.4): reparto de la ultima pasada, para el HUD y el CSV de frame. */
+    void GetTierCounts(int32& OutHero, int32& OutInstance, int32& OutImpostor, int32& OutCulled) const
+    {
+        OutHero = NumHero; OutInstance = NumInstance; OutImpostor = NumImpostor; OutCulled = NumCulled;
+    }
+
+    /** Fase 6 (6.4): coste (ms) del ultimo re-nivelado completo. */
+    double GetLastRelevelMs() const { return LastRelevelMs; }
+
     UTreeLibrary* GetLibrary() const { return Library; }
 
 private:
@@ -139,7 +171,8 @@ private:
 
     void UpdateLOD(const FVector& ViewLocation);
     void EnterTier(uint32 StableId, FTreeRenderState& State, ETreeRenderTier Want,
-        const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket, float Dryness);
+        const FArchetypeKey& Key, const FTransform& Xform, float ScaleInBucket,
+        float Dryness, float CanopyAO);
     void LeaveTier(uint32 StableId, FTreeRenderState& State);
     void FlushInstanceOps();
 
@@ -153,8 +186,13 @@ private:
     void UpdateHeroInterpolation(float DeltaTime);
 
     /** Fase 5 (estacional): avanza la fase de estacion global y la empuja al
-        Material Parameter Collection que leen los materiales de follaje. */
+        Material Parameter Collection que leen todos los materiales de arbol.
+        Fase 6: escribe ademas el escalar "Snow" derivado de la estacion. */
     void UpdateSeason(float DeltaTime);
+
+    /** Fase 6 (6.1): avanza el reloj del viento, compone las rafagas y empuja
+        direccion/fuerza al MPC de viento. O(1) por frame para todo el bosque. */
+    void UpdateWind(float DeltaTime);
 
     void DrawTierDebug(const FVector& ViewLocation) const;
     bool GetViewLocation(FVector& OutLocation) const;
@@ -164,6 +202,12 @@ private:
         return (static_cast<uint64>(PackedKey) << 1) | (bImpostor ? 1ull : 0ull);
     }
 
+    /** Cuantizacion a 16 bandas de un valor [0,1] (umbral de reescritura de custom data). */
+    static FORCEINLINE uint8 Quantize16(float Value01)
+    {
+        return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Value01 * 15.f), 0, 15));
+    }
+
     /** Cambios acumulados de UN componente, para aplicarlos en lote. */
     struct FPendingComponentOps
     {
@@ -171,12 +215,20 @@ private:
         TArray<uint32>     AddIds;
         TArray<FTransform> AddXforms;
         TArray<TPair<uint32, FTransform>> Updates; // (StableId, transform): el indice se resuelve tras las bajas
-        TArray<TPair<uint32, float>>      CustomData1; // Fase 5: (StableId, sequedad) para PerInstanceCustomData[1]
-        /** Sequedad inicial de cada alta, paralelo a AddIds/AddXforms. Una instancia
-            recien creada nace con TODA su custom data a 0 (= sana): si no se escribe
-            aqui, un arbol senescente que acaba de cambiar de bucket se dibuja verde
-            hasta que su sequedad cambie de banda... que puede no pasar nunca. */
-        TArray<float>                     AddDryness;
+
+        /**
+         * Datos por instancia (Fase 5 + Fase 6), empaquetados juntos:
+         *   X = sequedad     [1] 0 sano, 1 seco/senescente
+         *   Y = apertura     [2] 1 a pleno sol, 0 bajo dosel cerrado (AO)
+         *
+         * AddCustom va en PARALELO a AddIds/AddXforms (valor inicial de cada alta).
+         * Es imprescindible: una instancia recien creada nace con TODA su custom
+         * data a 0, asi que sin esto un arbol senescente que acaba de cambiar de
+         * bucket se dibujaria verde y sin AO hasta que alguno de los dos valores
+         * cambiase de banda... que puede no pasar nunca.
+         */
+        TArray<FVector2f>                   AddCustom;
+        TArray<TPair<uint32, FVector2f>>    CustomUpdates; // (StableId, (sequedad, apertura))
     };
 
     UPROPERTY(Transient) TObjectPtr<UTreeLibrary> Library = nullptr;
@@ -235,4 +287,18 @@ private:
         Antes se hacia SeasonMPC.LoadSynchronous() dentro de UpdateSeason, o sea
         en cada frame. */
     UPROPERTY(Transient) TObjectPtr<UMaterialParameterCollection> SeasonMPCCached = nullptr;
+
+    // --- Fase 6 (viento) ---
+    /** MPC de viento, resuelto una vez igual que el de estacion. */
+    UPROPERTY(Transient) TObjectPtr<UMaterialParameterCollection> WindMPCCached = nullptr;
+
+    /** Reloj PROPIO del viento (s). No usa el reloj de simulacion a proposito:
+        con la sim pausada (bake estatico / beauty shot) el bosque tiene que
+        seguir moviendose, y con la sim acelerada el viento no debe acelerarse. */
+    float WindTime = 0.f;
+
+    // Ultimos valores empujados al MPC (los lee el log/HUD de profiling).
+    float WindStrengthNow = 0.f;
+    float WindGustNow = 0.f;
+    float WindDirDegNow = 0.f;
 };

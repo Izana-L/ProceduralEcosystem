@@ -7,6 +7,9 @@
 
 namespace
 {
+    /** Fase 6: canales UV que lleva la malla (0 textura + 3 de viento). */
+    constexpr int32 kNumUVChannels = 4;
+
     /**
      * Vuelca una seccion (madera u hojas) en el FMeshDescription como un
      * polygon group propio -> una slot de material propia -> una seccion de
@@ -16,6 +19,13 @@ namespace
      * Un vertex instance por vertice: los buffers de la Fase 3 ya duplican los
      * vertices donde los atributos difieren (costura del anillo, esquinas de
      * hoja), asi que no hay que partir nada aqui.
+     *
+     * FASE 6: ademas de UV0 se copian UV1/UV2/UV3 (pivote de rama, nivel,
+     * balanceo y desfase) y el color de vertice (AO de copa + tinte). Es lo que
+     * hace que la MISMA malla instanciada se mueva con el viento y tenga la
+     * oclusion de copa horneada, sin datos extra por instancia. Si un buffer no
+     * trae esos canales -por ejemplo el impostor, que no debe moverse- se
+     * escriben ceros y blanco: el material los interpreta como "sin balanceo".
      */
     void AppendSection(FMeshDescription& MeshDesc, FStaticMeshAttributes& Attributes,
         const FTreeMeshBuffers& Buffers, const FVector& OriginWorld, FName SlotName,
@@ -55,9 +65,22 @@ namespace
             Tangents[VI] = Buffers.Tangents.IsValidIndex(i)
                 ? FVector3f(Buffers.Tangents[i]) : FVector3f(1.f, 0.f, 0.f);
             BinormalSigns[VI] = 1.f;
+
             UVs.Set(VI, 0, Buffers.UVs.IsValidIndex(i)
                 ? FVector2f(Buffers.UVs[i]) : FVector2f::ZeroVector);
-            Colors[VI] = FVector4f(1.f, 1.f, 1.f, 1.f);
+
+            // --- Fase 6: canales de viento (ver Geometry/TreeMeshBuilder.h) ---
+            UVs.Set(VI, 1, Buffers.UV1.IsValidIndex(i)
+                ? FVector2f(Buffers.UV1[i]) : FVector2f::ZeroVector);
+            UVs.Set(VI, 2, Buffers.UV2.IsValidIndex(i)
+                ? FVector2f(Buffers.UV2[i]) : FVector2f::ZeroVector);
+            UVs.Set(VI, 3, Buffers.UV3.IsValidIndex(i)
+                ? FVector2f(Buffers.UV3[i]) : FVector2f::ZeroVector);
+
+            // --- Fase 6: AO de copa y variacion de tinte en el color de vertice ---
+            Colors[VI] = Buffers.Colors.IsValidIndex(i)
+                ? FVector4f(Buffers.Colors[i].R, Buffers.Colors[i].G, Buffers.Colors[i].B, Buffers.Colors[i].A)
+                : FVector4f(1.f, 1.f, 1.f, 1.f);
         }
 
         for (int32 t = 0; t + 2 < Buffers.Triangles.Num(); t += 3)
@@ -95,7 +118,9 @@ namespace TreeMeshBaker
         FMeshDescription MeshDesc;
         FStaticMeshAttributes Attributes(MeshDesc);
         Attributes.Register();
-        Attributes.GetVertexInstanceUVs().SetNumChannels(1);
+        // Fase 6: 4 canales. UV0 = textura; UV1..UV3 = pivote de rama, nivel,
+        // balanceo y desfase (viento sin Pivot Painter, doc. 6.1).
+        Attributes.GetVertexInstanceUVs().SetNumChannels(kNumUVChannels);
 
         OutLocalBounds.Init(); // caja realmente vacia (IsValid = 0)
 
@@ -131,13 +156,28 @@ namespace TreeMeshBaker
             return nullptr;
         }
 
+        // NOTA (Fase 6): el material de viento desplaza vertices (WPO), asi que
+        // la caja envolvente "geometrica" de la malla se queda corta y UE puede
+        // cullar un arbol cuyas ramas todavia asoman en pantalla (parpadeo en el
+        // borde del encuadre). El margen NO se pone aqui sino en el COMPONENTE,
+        // con SetBoundsScale(): es una sola llamada por componente ISM en vez de
+        // por malla, y vale igual para el UProceduralMeshComponent del hero.
+        // Ver UTreeLibrary::GetOrCreateComponent y AHeroTreeActor.
+
         return Mesh;
     }
+
     // NOTA: esto es un CROSSBOARD fijo (2 tarjetas perpendiculares), no un
     // impostor octaedrico ni billboard que encare camara. Es suficiente con una
     // textura de follaje masked y es lo mas barato. Si en el pulido quieres el
     // octaedrico del doc, hace falta UNA card orientada a camara + material con
     // UV dependientes de la vista (Impostor Baker); esta geometria NO lo sirve.
+    //
+    // FASE 6: el impostor NO recibe canales de viento a proposito. El doc. 6.1 es
+    // explicito en el caveat: "desactiva el WPO de viento a distancia (solo se
+    // mueven los arboles cercanos; los impostors lejanos quedan estaticos)". Al
+    // no traer UV1..UV3 el bakeador escribe ceros -> SwayWeight = 0 -> el mismo
+    // material no produce ningun desplazamiento aunque se reutilice.
     UStaticMesh* BuildImpostorMesh(UObject* Outer, const FBox& LocalBounds, UMaterialInterface* ImpostorMaterial)
     {
         if (!LocalBounds.IsValid)
@@ -154,30 +194,32 @@ namespace TreeMeshBaker
         FTreeMeshBuffers Cards;
 
         auto AddCard = [&Cards, Center, HalfWidth, Z0, Z1](const FVector& Right, const FVector& Normal)
-        {
-            const int32 Base = Cards.Vertices.Num();
-            const FVector CenterXY(Center.X, Center.Y, 0.0);
-
-            Cards.Vertices.Add(CenterXY + FVector(0, 0, Z0) - Right * HalfWidth);
-            Cards.Vertices.Add(CenterXY + FVector(0, 0, Z0) + Right * HalfWidth);
-            Cards.Vertices.Add(CenterXY + FVector(0, 0, Z1) + Right * HalfWidth);
-            Cards.Vertices.Add(CenterXY + FVector(0, 0, Z1) - Right * HalfWidth);
-
-            for (int32 i = 0; i < 4; ++i)
             {
-                Cards.Normals.Add(Normal);
-                Cards.Tangents.Add(Right);
-            }
+                const int32 Base = Cards.Vertices.Num();
+                const FVector CenterXY(Center.X, Center.Y, 0.0);
 
-            // v = 0 arriba (convenio de UV de UE para una textura de arbol).
-            Cards.UVs.Add(FVector2D(0.f, 1.f));
-            Cards.UVs.Add(FVector2D(1.f, 1.f));
-            Cards.UVs.Add(FVector2D(1.f, 0.f));
-            Cards.UVs.Add(FVector2D(0.f, 0.f));
+                Cards.Vertices.Add(CenterXY + FVector(0, 0, Z0) - Right * HalfWidth);
+                Cards.Vertices.Add(CenterXY + FVector(0, 0, Z0) + Right * HalfWidth);
+                Cards.Vertices.Add(CenterXY + FVector(0, 0, Z1) + Right * HalfWidth);
+                Cards.Vertices.Add(CenterXY + FVector(0, 0, Z1) - Right * HalfWidth);
 
-            Cards.Triangles.Add(Base + 0); Cards.Triangles.Add(Base + 1); Cards.Triangles.Add(Base + 2);
-            Cards.Triangles.Add(Base + 0); Cards.Triangles.Add(Base + 2); Cards.Triangles.Add(Base + 3);
-        };
+                for (int32 i = 0; i < 4; ++i)
+                {
+                    Cards.Normals.Add(Normal);
+                    Cards.Tangents.Add(Right);
+                    // Blanco: sin AO horneado (el impostor ya es una silueta plana).
+                    Cards.Colors.Add(FLinearColor::White);
+                }
+
+                // v = 0 arriba (convenio de UV de UE para una textura de arbol).
+                Cards.UVs.Add(FVector2D(0.f, 1.f));
+                Cards.UVs.Add(FVector2D(1.f, 1.f));
+                Cards.UVs.Add(FVector2D(1.f, 0.f));
+                Cards.UVs.Add(FVector2D(0.f, 0.f));
+
+                Cards.Triangles.Add(Base + 0); Cards.Triangles.Add(Base + 1); Cards.Triangles.Add(Base + 2);
+                Cards.Triangles.Add(Base + 0); Cards.Triangles.Add(Base + 2); Cards.Triangles.Add(Base + 3);
+            };
 
         AddCard(FVector::RightVector, FVector::ForwardVector); // tarjeta en el plano XZ
         AddCard(FVector::ForwardVector, FVector::RightVector); // tarjeta en el plano YZ

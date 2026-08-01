@@ -12,6 +12,7 @@
 #include "Ecology/ResourcePool.h"
 #include "Ecology/TickScratch.h"
 #include "Ecology/TreeDeathEvent.h"
+#include "Ecology/CarbonModel.h"   // Fase 6 (6.3): multiplicador de CO2
 #include "EcosystemSubsystem.generated.h"
 
 class UFieldVisualizer;
@@ -37,6 +38,10 @@ DECLARE_MULTICAST_DELEGATE(FOnEcoStateLoaded);
  *
  * Coste de la propia instrumentacion: 6 llamadas a FPlatformTime::Seconds() por
  * tick. Despreciable frente a un tick de milisegundos.
+ *
+ * Fase 6: ademas de esta media propia, las mismas etapas se publican como
+ * contadores del motor (`stat EcoSim`) y como ambitos de Unreal Insights, para
+ * poder verlas junto al resto del frame. Ver Core/EcoStats.h.
  */
 struct FEcoTickProfile
 {
@@ -64,6 +69,9 @@ struct FEcoTickProfile
  *  Fase 2: poblacion de arboles en SoA, spatial hash, competencia por
  *          recursos compartidos, crecimiento/estres/mortalidad/reproduccion
  *          deterministas bajo paralelismo.
+ *  Fase 5: senescencia, eventos de muerte y bake a un ano objetivo.
+ *  Fase 6: multiplicador de CO2 en el vigor, presupuesto de tiempo del tick
+ *          dentro del frame e instrumentacion para las herramientas del motor.
  */
 UCLASS()
 class PROCEDURALECOSYSTEM_API UEcosystemSubsystem : public UTickableWorldSubsystem
@@ -99,7 +107,8 @@ public:
     // --- Terreno ---
     const FHeightField& GetHeightField() const { return HeightField; }
     // --- Luz gruesa (Fase 3): la lee el hero tree para sembrar su rejilla fina
-    //     con la sombra de los vecinos (conexion micro<-macro). Se rellena en
+    //     con la sombra de los vecinos (conexion micro<-macro). Fase 6: tambien
+    //     la lee el gestor de LOD para el AO de copa por instancia. Se rellena en
     //     cada SimulateTick, asi que refleja el estado del ultimo tick corrido. ---
     const FLightFieldCoarse& GetLightCoarse() const { return LightCoarse; }
 
@@ -113,6 +122,18 @@ public:
     /** Desglose del coste del tick por etapas + memoria de las estructuras
         (consola: Eco.Profile). Es el punto de partida obligatorio de la Fase 6. */
     void LogTickProfile() const;
+
+    /** Fase 6 (6.4): lo lee el perfilador de frame para decir que fraccion del
+        frame se lleva la simulacion. */
+    const FEcoTickProfile& GetTickProfile() const { return Profile; }
+
+    /** Fase 6 (6.4): ticks ejecutados en el ultimo frame (0 si estaba pausada). */
+    int32 GetTicksLastFrame() const { return TicksLastFrame; }
+
+    /** Fase 6 (6.3): parametros del multiplicador de CO2, ya resueltos contra la
+        consola (Eco.CO2.Enable). Lo usan el tick, la germinacion y el heatmap de
+        idoneidad, para que los tres evaluen EXACTAMENTE la misma funcion. */
+    EcoCarbon::FCO2Params GetCO2Params() const;
 
     // --- Eventos de muerte (Fase 5, Paso 1): la capa de suelo los consume ---
     void  LogRecentDeaths() const;
@@ -187,6 +208,9 @@ private:
     int64  TickCount = 0;
     int32  PendingSteps = 0;
     bool   bPaused = true;
+
+    /** Fase 6 (6.4): ticks ejecutados en el frame actual (para stat/HUD). */
+    int32  TicksLastFrame = 0;
 
     /** Se pone a true al final de OnWorldBeginPlay; gatea el Tick para no correr
         antes de que el relieve y los campos esten listos. */

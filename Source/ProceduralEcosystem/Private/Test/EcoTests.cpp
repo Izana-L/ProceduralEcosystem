@@ -3,9 +3,13 @@
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TreePopulation.h"
 #include "Ecology/TickScratch.h"
+#include "Ecology/CarbonModel.h"      // Fase 6
 #include "Terrain/Field2D.h"
 #include "Terrain/LightFieldCoarse.h"
 #include "Render/TreeArchetype.h"
+#include "Geometry/TreeSkeleton.h"    // Fase 6
+#include "Geometry/TreeWindData.h"    // Fase 6
+#include "Species/SpeciesData.h"      // Fase 6
 
 #if WITH_DEV_AUTOMATION_TESTS
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
@@ -284,6 +288,166 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
 
     // La rejilla es pequena: es el objetivo de la optimizacion.
     TestTrue(TEXT("la rejilla cabe en pocas capas"), Light.Layers <= 16);
+    return true;
+}
+
+// =============================================================================
+//  FASE 6 — realismo y optimizacion final
+// =============================================================================
+
+/**
+ * CO2 (doc. 6.3). Lo importante que hay que garantizar es que la capa sea
+ * INOFENSIVA: acotada, sin discontinuidades, y con un "off" que devuelve 1.0
+ * EXACTO -sin ese exacto, la ablacion de la Fase 7 no seria comparable bit a
+ * bit con las corridas anteriores-.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoCO2, "Eco.Fase6.CO2", EcoTestFlags)
+bool FEcoCO2::RunTest(const FString&) {
+    EcoCarbon::FCO2Params P;
+    P.bEnabled = true;
+    P.MaxReduction = 0.15f;
+    P.FullMixingHeightCm = 2500.f;
+    P.FullSunlight = 1.f;
+
+    // A pleno sol no hay penalizacion, este el arbol a la altura que este.
+    TestTrue(TEXT("pleno sol -> factor 1"),
+        FMath::IsNearlyEqual(EcoCarbon::CO2Factor(1.f, 0.f, P), 1.f, 1e-5f));
+    TestTrue(TEXT("pleno sol, arbol alto -> factor 1"),
+        FMath::IsNearlyEqual(EcoCarbon::CO2Factor(1.f, 3000.f, P), 1.f, 1e-5f));
+
+    // Peor caso: oscuridad total a ras de suelo -> exactamente 1 - MaxReduction.
+    TestTrue(TEXT("dosel cerrado a ras de suelo -> 1 - MaxReduction"),
+        FMath::IsNearlyEqual(EcoCarbon::CO2Factor(0.f, 0.f, P), 1.f - P.MaxReduction, 1e-5f));
+
+    // La altura recupera el factor: por encima de FullMixingHeightCm no penaliza.
+    TestTrue(TEXT("por encima del dosel no hay penalizacion"),
+        FMath::IsNearlyEqual(EcoCarbon::CO2Factor(0.f, P.FullMixingHeightCm, P), 1.f, 1e-5f));
+    TestTrue(TEXT("a media altura la penalizacion es intermedia"),
+        EcoCarbon::CO2Factor(0.f, P.FullMixingHeightCm * 0.5f, P) > EcoCarbon::CO2Factor(0.f, 0.f, P));
+
+    // Monotono en la luz y acotado en TODO el dominio (incluidos valores absurdos).
+    float Prev = -1.f;
+    for (float Q = 0.f; Q <= 1.001f; Q += 0.05f)
+    {
+        const float F = EcoCarbon::CO2Factor(Q, 0.f, P);
+        TestTrue(TEXT("factor en [1-MaxReduction, 1]"), F >= 1.f - P.MaxReduction - 1e-4f && F <= 1.f + 1e-4f);
+        TestTrue(TEXT("mas luz nunca da menos CO2"), F >= Prev - 1e-4f);
+        Prev = F;
+    }
+    TestTrue(TEXT("Q negativo no rompe"), FMath::IsFinite(EcoCarbon::CO2Factor(-5.f, 0.f, P)));
+    TestTrue(TEXT("altura negativa no rompe"), FMath::IsFinite(EcoCarbon::CO2Factor(0.5f, -100.f, P)));
+
+    // ABLACION: apagado devuelve 1.0 EXACTO (no "casi 1"), que es lo que permite
+    // reproducir bit a bit los resultados anteriores a la Fase 6.
+    P.bEnabled = false;
+    TestEqual(TEXT("desactivado -> 1.0 exacto"), EcoCarbon::CO2Factor(0.f, 0.f, P), 1.f);
+    P.bEnabled = true; P.MaxReduction = 0.f;
+    TestEqual(TEXT("MaxReduction 0 -> 1.0 exacto"), EcoCarbon::CO2Factor(0.f, 0.f, P), 1.f);
+    return true;
+}
+
+/**
+ * Datos de viento (doc. 6.1). Se construye un esqueleto minimo con UNA
+ * bifurcacion y se comprueban las cuatro propiedades de las que depende que el
+ * balanceo se vea bien:
+ *   1. La base del tronco NO se mueve (esta empotrada en el suelo).
+ *   2. El movimiento crece hacia las puntas.
+ *   3. Los nodos de una MISMA rama comparten pivote y desfase (si no, el tubo se
+ *      retuerce en vez de balancearse).
+ *   4. Ramas distintas tienen desfases distintos (si no, el arbol entero se mueve
+ *      como una sola pieza).
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoWindData, "Eco.Fase6.DatosDeViento", EcoTestFlags)
+bool FEcoWindData::RunTest(const FString&) {
+    USpeciesData* Sp = NewObject<USpeciesData>(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->WindStiffness = 0.f;      // maxima flexibilidad: aisla la forma de la curva
+    Sp->LeafFlutterScale = 1.f;
+
+    // Tronco de 4 nodos y, en el ultimo, una bifurcacion en dos ramas de 2 nodos.
+    //        5   6      <- rama B
+    //         \ /
+    //  0-1-2-3-4        <- tronco (rama A) ... 4 abre las dos hijas
+    FTreeSkeleton Sk;
+    Sk.InitRoot(FVector::ZeroVector, FVector::UpVector);
+    int32 Prev = 0;
+    for (int32 i = 1; i <= 3; ++i)
+    {
+        Prev = Sk.AddChild(Prev, FVector(0, 0, i * 100.0), FVector::UpVector);
+    }
+    const int32 Fork = Prev;                                   // nodo 3: aqui bifurca
+    const int32 A0 = Sk.AddChild(Fork, FVector(80, 0, 380.0), FVector(1, 0, 0.5).GetSafeNormal());
+    const int32 A1 = Sk.AddChild(A0, FVector(160, 0, 440.0), FVector(1, 0, 0.4).GetSafeNormal());
+    const int32 B0 = Sk.AddChild(Fork, FVector(-80, 0, 380.0), FVector(-1, 0, 0.5).GetSafeNormal());
+
+    // Radios como los dejaria el pipe model: gruesos abajo, finos arriba.
+    for (int32 i = 0; i < Sk.Num(); ++i)
+    {
+        Sk.Nodes[i].Radius = FMath::Lerp(10.f, 1.f, (float)i / FMath::Max(1, Sk.Num() - 1));
+    }
+
+    FTreeWindData Wind;
+    Wind.Build(Sk, *Sp, /*FineLight*/ nullptr, /*Seed*/ 12345u);
+
+    TestTrue(TEXT("un dato por nodo"), Wind.IsValidFor(Sk));
+
+    // 1) La base no se mueve.
+    TestTrue(TEXT("la base del tronco no se balancea"), Wind.Nodes[0].SwayWeight <= KINDA_SMALL_NUMBER);
+
+    // 2) El balanceo crece hacia la punta.
+    TestTrue(TEXT("la punta se balancea mas que el tronco"),
+        Wind.Nodes[A1].SwayWeight > Wind.Nodes[0].SwayWeight);
+    TestTrue(TEXT("el balanceo crece a lo largo de la rama"),
+        Wind.Nodes[A1].SwayWeight >= Wind.Nodes[A0].SwayWeight);
+    for (const FTreeWindNode& N : Wind.Nodes)
+    {
+        TestTrue(TEXT("balanceo acotado a [0,1]"), N.SwayWeight >= 0.f && N.SwayWeight <= 1.f);
+        TestTrue(TEXT("desfase acotado a [0,1)"), N.Phase01 >= 0.f && N.Phase01 < 1.f);
+        TestTrue(TEXT("AO neutro sin rejilla de luz"), FMath::IsNearlyEqual(N.CanopyAO, 1.f, 1e-4f));
+    }
+
+    // 3) Nodos de la MISMA rama: mismo pivote y mismo desfase.
+    TestTrue(TEXT("misma rama -> mismo pivote"),
+        Wind.Nodes[A0].PivotLocalCm.Equals(Wind.Nodes[A1].PivotLocalCm, 0.01));
+    TestEqual(TEXT("misma rama -> mismo desfase"), Wind.Nodes[A0].Phase01, Wind.Nodes[A1].Phase01);
+
+    // El tronco es la rama 0 y su pivote es la base.
+    TestTrue(TEXT("el pivote del tronco es su base"),
+        Wind.Nodes[2].PivotLocalCm.Equals(FVector::ZeroVector, 0.01));
+    TestTrue(TEXT("el tronco es el nivel 0"), FMath::IsNearlyEqual(Wind.Nodes[2].BranchLevel01, 0.f, 1e-4f));
+
+    // 4) Ramas hermanas: nacen de la MISMA horquilla, asi que comparten pivote
+    //    (es el punto de insercion, no el primer nodo), pero se mueven con
+    //    desfases distintos y su nivel es mayor que el del tronco.
+    TestTrue(TEXT("las hijas son de nivel mayor que el tronco"),
+        Wind.Nodes[A0].BranchLevel01 > Wind.Nodes[2].BranchLevel01);
+    TestTrue(TEXT("ramas hermanas -> mismo pivote (la horquilla)"),
+        Wind.Nodes[A0].PivotLocalCm.Equals(Wind.Nodes[B0].PivotLocalCm, 0.01));
+    TestTrue(TEXT("el pivote es la horquilla, no el primer nodo de la rama"),
+        Wind.Nodes[A0].PivotLocalCm.Equals(Sk.Nodes[Fork].Pos, 0.01));
+    TestTrue(TEXT("ramas hermanas -> desfases distintos"),
+        !FMath::IsNearlyEqual(Wind.Nodes[A0].Phase01, Wind.Nodes[B0].Phase01, 1e-5f));
+
+    // 5) DETERMINISMO: misma semilla, mismos datos; semilla distinta, desfases distintos.
+    FTreeWindData Again;
+    Again.Build(Sk, *Sp, nullptr, 12345u);
+    for (int32 i = 0; i < Wind.Nodes.Num(); ++i)
+    {
+        TestEqual(TEXT("misma semilla -> mismo desfase"), Again.Nodes[i].Phase01, Wind.Nodes[i].Phase01);
+        TestEqual(TEXT("misma semilla -> mismo balanceo"), Again.Nodes[i].SwayWeight, Wind.Nodes[i].SwayWeight);
+    }
+    FTreeWindData Other;
+    Other.Build(Sk, *Sp, nullptr, 999u);
+    TestTrue(TEXT("otra semilla -> otro desfase"),
+        !FMath::IsNearlyEqual(Other.Nodes[A0].Phase01, Wind.Nodes[A0].Phase01, 1e-5f));
+
+    // 6) La rigidez de la especie escala el balanceo a la baja.
+    Sp->WindStiffness = 1.f;
+    FTreeWindData Rigid;
+    Rigid.Build(Sk, *Sp, nullptr, 12345u);
+    TestTrue(TEXT("mas rigidez -> menos balanceo"),
+        Rigid.Nodes[A1].SwayWeight < Wind.Nodes[A1].SwayWeight);
+
     return true;
 }
 #endif

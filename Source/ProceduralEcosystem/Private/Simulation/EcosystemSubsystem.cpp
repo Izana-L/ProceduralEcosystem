@@ -1,10 +1,12 @@
 #include "Simulation/EcosystemSubsystem.h"
 #include "Config/EcosystemSettings.h"
+#include "Core/EcoStats.h"          // Fase 6 (6.4): stat groups, Insights, CSV
 #include "Debug/FieldVisualizer.h"
 #include "Species/SpeciesData.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TickScratch.h"
 #include "Ecology/Vigor.h"
+#include "Ecology/CarbonModel.h"    // Fase 6 (6.3): multiplicador de CO2
 #include "Geometry/HeroTreeActor.h"
 
 #include "Engine/World.h"
@@ -33,6 +35,14 @@ static UEcosystemSubsystem* GetEco(UWorld* World)
 }
 static TAutoConsoleVariable<int32> CVarForceST(
     TEXT("Eco.ForceSingleThread"), 0, TEXT("1 = tick en un solo hilo (validar determinismo)."));
+
+// --- Fase 6 (6.3): CO2 como capa de realismo barata ---
+// -1 = usar Project Settings; 0/1 = forzar. Sirve para la ABLACION: apagarlo
+// devuelve exactamente los resultados anteriores a la Fase 6 (el multiplicador
+// pasa a valer 1.0 exacto), asi que dos corridas con la misma semilla se pueden
+// comparar cuantitativamente en la memoria.
+static TAutoConsoleVariable<int32> CVarCO2(TEXT("Eco.CO2.Enable"), -1,
+    TEXT("Multiplicador de CO2 sobre el vigor (doc. 6.3). -1 = Project Settings, 0 = off, 1 = on."));
 
 static FAutoConsoleCommandWithWorldAndArgs GEcoStep(TEXT("Eco.Step"),
     TEXT("Avanza N ticks de simulacion (por defecto 1). Uso: Eco.Step [N]"),
@@ -205,6 +215,28 @@ void UEcosystemSubsystem::LogFiniteCheck() const
     if (!Bad) UE_LOG(LogEco, Log, TEXT("[Eco] CheckFinite OK (0 no-finitos)."));
 }
 
+// ---------------------------------------------------------------------------
+//  Fase 6 (6.3): parametros del multiplicador de CO2
+// ---------------------------------------------------------------------------
+//
+// UN SOLO SITIO donde se resuelven, y de ahi los leen las TRES cosas que
+// evaluan vigor: el tick (crecimiento), la germinacion y el heatmap de
+// idoneidad. Si cada uno los montara por su cuenta, el mapa que le ensenas al
+// tribunal dejaria de representar la funcion que de verdad hace crecer al
+// bosque en cuanto alguien tocase un valor.
+EcoCarbon::FCO2Params UEcosystemSubsystem::GetCO2Params() const
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+
+    EcoCarbon::FCO2Params P;
+    const int32 Override = CVarCO2.GetValueOnGameThread();
+    P.bEnabled = (Override < 0) ? S->bEnableCO2Factor : (Override != 0);
+    P.MaxReduction = S->CO2MaxReduction;
+    P.FullMixingHeightCm = S->CO2FullMixingHeightCm;
+    P.FullSunlight = FLightFieldCoarse::FullSunlight;
+    return P;
+}
+
 void UEcosystemSubsystem::LogTickProfile() const
 {
     // Memoria de las estructuras que la optimizacion vigila.
@@ -225,6 +257,15 @@ void UEcosystemSubsystem::LogTickProfile() const
         ScratchBytes / 1048576.0, LightBytes / 1048576.0,
         LightCoarse.Width, LightCoarse.Height, LightCoarse.Layers,
         FieldBytes / 1048576.0, Hash.ScratchBytes() / 1048576.0);
+
+    // Fase 6: contexto que hace falta para interpretar los numeros de arriba.
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    const EcoCarbon::FCO2Params CO2 = GetCO2Params();
+    UE_LOG(LogEco, Log, TEXT("[Eco/Profile] Presupuesto del tick: %.1f ms/frame (%d ticks el ultimo frame, tope %d) | CO2 %s (max -%.0f%%)"),
+        S->TickBudgetMsPerFrame, TicksLastFrame, MaxStepsPerFrame,
+        CO2.bEnabled ? TEXT("ON") : TEXT("OFF"), CO2.MaxReduction * 100.f);
+    UE_LOG(LogEco, Log, TEXT("[Eco/Profile] Siguiente paso (doc. 6.4): 'Eco.Frame' para el reparto del frame, "
+        "'stat EcoSim' / 'stat Unit' / 'stat GPU' en pantalla, y Unreal Insights (-trace=cpu,frame,counters) para la timeline."));
 }
 // ---------------------------------------------------------------------------
 //  CVars (toggles de debug: se activan/desactivan en vivo desde la consola)
@@ -414,6 +455,29 @@ void UEcosystemSubsystem::Tick(float DeltaTime)
         return;
     }
 
+    // =====================================================================
+    // FASE 6 (doc. 6.4): PRESUPUESTO DE TIEMPO DEL TICK DENTRO DEL FRAME
+    // =====================================================================
+    // "Fija un objetivo (16.6 ms para 60 fps) y reparte; amortiza los ticks (no
+    //  corras un tick por frame si es caro: cadencia + interpolacion de 5.2)."
+    //
+    // MaxStepsPerFrame ya acotaba el NUMERO de ticks, pero el numero no es lo que
+    // hay que repartir: un tick con 200 arboles cuesta microsegundos y con 20.000
+    // puede costar varios milisegundos. Aqui se acota el TIEMPO: en cuanto los
+    // ticks de este frame se comen su presupuesto, el resto espera al siguiente.
+    // El efecto visible es que la simulacion se ralentiza un poco en vez de tirar
+    // el framerate al suelo, que es exactamente el comportamiento que se quiere
+    // durante una demo o una captura.
+    const UEcosystemSettings* Settings = UEcosystemSettings::Get();
+    const double BudgetMs = FMath::Max(0.f, Settings->TickBudgetMsPerFrame);
+    const double FrameT0 = FPlatformTime::Seconds();
+    auto OverBudget = [BudgetMs, FrameT0]() -> bool
+        {
+            return BudgetMs > 0.0 && (FPlatformTime::Seconds() - FrameT0) * 1000.0 >= BudgetMs;
+        };
+
+    TicksLastFrame = 0;
+
     // Pasos manuales (Eco.Step): se ejecutan aunque este pausado, pero AMORTIZADOS
     // (correccion B10). Antes se vaciaba PendingSteps entero en un frame mientras
     // que el avance automatico si estaba capado: un `Eco.Step 500` -que es
@@ -422,16 +486,22 @@ void UEcosystemSubsystem::Tick(float DeltaTime)
     // se loguea el progreso.
     if (PendingSteps > 0)
     {
-        const int32 Budget = FMath::Max(1, MaxStepsPerFrame);
-        const int32 ThisFrame = FMath::Min(PendingSteps, Budget);
-        for (int32 k = 0; k < ThisFrame; ++k)
+        const int32 StepCap = FMath::Max(1, MaxStepsPerFrame);
+        int32 Done = 0;
+        while (PendingSteps > 0 && Done < StepCap)
         {
             SimulateTick(YearsPerTick);
             ++TickCount;
-        }
-        PendingSteps -= ThisFrame;
+            --PendingSteps;
+            ++Done;
+            ++TicksLastFrame;
 
-        if (PendingSteps > 0 && (PendingSteps % 50) < Budget)
+            // Al menos UNO por frame siempre: si no, con un presupuesto muy
+            // apretado un Eco.Step no avanzaria nunca.
+            if (OverBudget()) { break; }
+        }
+
+        if (PendingSteps > 0 && (PendingSteps % 50) < StepCap)
         {
             UE_LOG(LogEco, Log, TEXT("[Eco] Eco.Step: quedan %d ticks (tick actual %lld, %d arboles)."),
                 PendingSteps, TickCount, Agents_Read.Num());
@@ -442,6 +512,19 @@ void UEcosystemSubsystem::Tick(float DeltaTime)
     if (!bPaused)
     {
         Accumulator += DeltaTime;
+
+        // Tope del acumulador (Fase 6): tras un hitch -compilar shaders, hornear
+        // la libreria, cargar un bake- el acumulador podia quedarse con varios
+        // segundos de deuda y hacer que la simulacion corriese a MaxStepsPerFrame
+        // durante minutos, con el framerate hundido, sin que nadie entendiera por
+        // que. La deuda que no se puede pagar se descarta: el tiempo simulado se
+        // ralentiza un instante, que es preferible a arrastrar el problema.
+        const double MaxDebt = static_cast<double>(SecondsPerTick) * FMath::Max(1, MaxStepsPerFrame);
+        if (Accumulator > MaxDebt)
+        {
+            Accumulator = MaxDebt;
+        }
+
         int32 Steps = 0;
         while (Accumulator >= SecondsPerTick && Steps < MaxStepsPerFrame)
         {
@@ -449,8 +532,17 @@ void UEcosystemSubsystem::Tick(float DeltaTime)
             ++TickCount;
             Accumulator -= SecondsPerTick;
             ++Steps;
+            ++TicksLastFrame;
+
+            if (OverBudget()) { break; }
         }
     }
+
+    // Fase 6 (6.4): contadores para `stat EcoSim` y para el CSV profiler.
+    SET_DWORD_STAT(STAT_EcoPopulation, Agents_Read.Num());
+    SET_DWORD_STAT(STAT_EcoTicksThisFrame, TicksLastFrame);
+    CSV_CUSTOM_STAT(Eco, TickMs, (float)Profile.TotalMs, ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Eco, TicksPerFrame, TicksLastFrame, ECsvCustomStatOp::Set);
 
     DrawDebug();
 }
@@ -491,8 +583,20 @@ static void GetChunkRange(int32 ChunkIndex, int32 NumChunks, int32 PopulationNum
 
 void UEcosystemSubsystem::SimulateTick(float DtYears)
 {
+    // Fase 6 (6.4): el tick entero como un bloque nombrado. Sale en `stat EcoSim`
+    // y como un bloque en la timeline de Unreal Insights, anidado dentro del
+    // frame: asi se ve de un vistazo si el tick es el que se lleva el frame o si
+    // es ruido al lado del render (que es lo que el doc. 6.4 dice que sera).
+    SCOPE_CYCLE_COUNTER(STAT_EcoTickTotal);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_SimulateTick);
+
     const UEcosystemSettings* Settings = UEcosystemSettings::Get();
     const double TickT0 = FPlatformTime::Seconds();
+
+    // Fase 6 (6.3): parametros de CO2, resueltos UNA vez por tick y capturados
+    // por valor en el lambda paralelo (nada de tocar settings ni cvars desde
+    // dentro del ParallelFor).
+    const EcoCarbon::FCO2Params CO2 = GetCO2Params();
 
     // ================================================================
     // PRE (serial): estructuras derivadas del snapshot de lectura.
@@ -501,7 +605,11 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // partir de la Fase 3, las consultas por rango del SCA. La competencia por
     // recursos NO pasa por el: se resuelve a traves de los campos compartidos
     // (consumo de agua/nutrientes + sombra de luz).
-    Hash.Build(Agents_Read.Position, Agents_Read.Num());
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoHash);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_BuildHash);
+        Hash.Build(Agents_Read.Position, Agents_Read.Num());
+    }
     const double AfterHash = FPlatformTime::Seconds();
 
     // Cadencia de la luz gruesa (optimizacion C6): por defecto cada tick, que es
@@ -510,6 +618,8 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     const int32 LightEvery = FMath::Max(1, Settings->LightRebuildEveryNTicks);
     if ((TickCount % LightEvery) == 0)
     {
+        SCOPE_CYCLE_COUNTER(STAT_EcoLight);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_CoarseLight);
         RebuildCoarseLight();
     }
     const double AfterLight = FPlatformTime::Seconds();
@@ -562,128 +672,148 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // ================================================================
     const EParallelForFlags Flags = CVarForceST.GetValueOnGameThread()
         ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None;
-    ParallelFor(NumChunks, [&](int32 ChunkIndex)
-        {
-            int32 Begin, End;
-            GetChunkRange(ChunkIndex, NumChunks, PopNum, Begin, End);
-            FTickScratch& Ctx = TickContexts[ChunkIndex];
 
-            for (int32 i = Begin; i < End; ++i)
+    // Fase 6 (6.4): el ambito envuelve al ParallelFor ENTERO (el reparto y la
+    // espera), no a cada tarea. Es lo que interesa medir: el tiempo de pared que
+    // el game thread se queda aqui bloqueado.
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoParallel);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_TickParallel);
+        ParallelFor(NumChunks, [&](int32 ChunkIndex)
             {
-                if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+                int32 Begin, End;
+                GetChunkRange(ChunkIndex, NumChunks, PopNum, Begin, End);
+                FTickScratch& Ctx = TickContexts[ChunkIndex];
 
-                const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
-                if (!Sp) { continue; }
-
-                const FVector P = Agents_Read.Position[i];
-                uint32& RngState = Agents_Write.RngState[i]; // stream propio -> determinista
-
-                // 2a) recursos locales
-                const float W = WaterPool.SampleCurrent(P.X, P.Y);
-                const float N = NutrientPool.SampleCurrent(P.X, P.Y);
-                const float Q = LightCoarse.SampleLightSmooth(P);
-
-                // 2b) factores + vigor (Liebig)
-                const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
-                const float fW = EcologyRules::DemandFactor(W, Sp->WaterDemand);
-                const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
-                const float VigorValue = EcologyRules::Vigor(fL, fW, fN);
-
-                // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, Fase 5 Paso 1)
-                const float NewAge = Agents_Read.Age[i] + DtYears;
-
-                // Senescencia: se decide con el estres del tick ANTERIOR
-                // (Agents_Read.Stress) para no depender del estres que aun no se
-                // ha calculado este tick -> el orden sigue siendo determinista.
-                //
-                // Y es una puerta de UN SOLO SENTIDO: IsSenescent es funcion pura del
-                // estres ACTUAL, asi que por si sola haria que un arbol que se recupera
-                // volviese de Senescent a Mature, cosa que biologicamente no ocurre
-                // (el declive no se revierte). Se hace "pegajosa" leyendo el estado del
-                // snapshot de lectura, que es inmutable durante todo el tick: sigue
-                // siendo determinista bajo paralelismo.
-                const bool bSenescent =
-                    (Agents_Read.State[i] == ETreeState::Senescent) ||
-                    EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
-                        Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
-
-                // En declive el arbol casi deja de crecer.
-                const float EffGrowthRate = Sp->GrowthRate *
-                    EcologyRules::SenescentGrowthFactor(bSenescent, Sp->SenescentGrowthScale);
-                const float NewBiomass = EcologyRules::GrowBiomassLogistic(
-                    Agents_Read.Biomass[i], VigorValue, EffGrowthRate, Sp->MaxBiomass, DtYears);
-
-                Agents_Write.Biomass[i] = NewBiomass;
-                Agents_Write.Height[i] = EcologyRules::HeightFromBiomass(NewBiomass, Sp->MaxBiomass, Sp->MaxHeightCm);
-                Agents_Write.Age[i] = NewAge;
-                Agents_Write.State[i] = bSenescent ? ETreeState::Senescent
-                    : (NewAge >= Sp->MaturityAge ? ETreeState::Mature : ETreeState::Sapling);
-
-                // 2d) estres
-                Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
-                    Settings->StressVigorThreshold, Settings->StressAccumulationRate,
-                    Settings->StressRecoveryRate, DtYears);
-
-                // 2e) consumo -> SOLO al scratch de este chunk, en forma DISPERSA
-                //     (lista de (celda, cantidad), ver C1 en FCellDelta).
-                const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, NewBiomass, Sp->MaxBiomass);
-                EcologyRules::DepositKernelSparse(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
-                    -NewBiomass * Sp->WaterDemand * DtYears);
-                EcologyRules::DepositKernelSparse(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
-                    -NewBiomass * Sp->NutrientDemand * DtYears);
-
-                // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
-                //     La senescencia multiplica la probabilidad de morir (Fase 5 Paso 1).
-                float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
-                    Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
-                pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
-
-                if (EcoRand::NextUnit(RngState) < pDeath)
+                for (int32 i = Begin; i < End; ++i)
                 {
-                    Agents_Write.State[i] = ETreeState::Dead;
+                    if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
 
-                    FPendingDeathPulse Pulse;
-                    Pulse.Position = P;
-                    Pulse.RadiusCm = RootRadiusCm;
-                    Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings->NutrientDecompositionFactor);
-                    // Fase 5: datos para la caida/tocon/hojarasca del render.
-                    Pulse.SpeciesId = Agents_Read.SpeciesId[i];
-                    Pulse.StableId = Agents_Read.StableId[i];
-                    Pulse.Biomass = NewBiomass;
-                    Pulse.HeightCm = Agents_Write.Height[i];
-                    Ctx.DeathPulses.Add(Pulse);
-                }
-                else if (NewAge >= Sp->MaturityAge &&
-                    (Agents_Write.State[i] == ETreeState::Mature ||
-                        Agents_Write.State[i] == ETreeState::Senescent))
-                {
-                    // 2g) semillas (solo si sigue vivo y ha alcanzado la madurez).
-                    //     El senescente SIGUE reproduciendose, con menos fuerza: cortarlo
-                    //     a cero eliminaba la ventana de maxima fecundidad y cambiaba en
-                    //     silencio el balance de sucesion que ajusto la Fase 2.
-                    //     La comprobacion explicita de MaturityAge hace falta ahora porque
-                    //     un SAPLING muy estresado tambien entra en Senescent, y una
-                    //     plantula no se reproduce.
-                    const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)
-                        ? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f)
-                        : 1.f;
-                    const int32 NumSeeds = EcologyRules::ComputeSeedCount(
-                        Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
-                    const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
+                    const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
+                    if (!Sp) { continue; }
 
-                    for (int32 s = 0; s < NumSeeds; ++s)
+                    const FVector P = Agents_Read.Position[i];
+                    uint32& RngState = Agents_Write.RngState[i]; // stream propio -> determinista
+
+                    // 2a) recursos locales
+                    const float W = WaterPool.SampleCurrent(P.X, P.Y);
+                    const float N = NutrientPool.SampleCurrent(P.X, P.Y);
+                    const float Q = LightCoarse.SampleLightSmooth(P);
+
+                    // 2b) factores + vigor (Liebig)
+                    const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
+                    const float fW = EcologyRules::DemandFactor(W, Sp->WaterDemand);
+                    const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
+
+                    // FASE 6 (doc. 6.3): CO2 como multiplicador analitico del vigor.
+                    // Coste: dos clamps y una multiplicacion, con dos valores que ya
+                    // estaban en registros (Q y la altura cacheada). Ni un campo nuevo
+                    // ni un muestreo extra, que es exactamente lo que pide el
+                    // documento ("mismo sabor, coste ~0").
+                    //
+                    // La altura se toma del SNAPSHOT DE LECTURA (la del principio del
+                    // tick), no de la que se acaba de calcular: el vigor decide cuanto
+                    // crece el arbol, asi que no puede depender de lo que ha crecido.
+                    // Ademas mantiene la regla de la Fase 2 de leer solo del snapshot.
+                    const float CO2Factor = EcoCarbon::CO2Factor(Q, Agents_Read.Height[i], CO2);
+                    const float VigorValue = EcologyRules::Vigor(fL, fW, fN) * CO2Factor;
+
+                    // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, Fase 5 Paso 1)
+                    const float NewAge = Agents_Read.Age[i] + DtYears;
+
+                    // Senescencia: se decide con el estres del tick ANTERIOR
+                    // (Agents_Read.Stress) para no depender del estres que aun no se
+                    // ha calculado este tick -> el orden sigue siendo determinista.
+                    //
+                    // Y es una puerta de UN SOLO SENTIDO: IsSenescent es funcion pura del
+                    // estres ACTUAL, asi que por si sola haria que un arbol que se recupera
+                    // volviese de Senescent a Mature, cosa que biologicamente no ocurre
+                    // (el declive no se revierte). Se hace "pegajosa" leyendo el estado del
+                    // snapshot de lectura, que es inmutable durante todo el tick: sigue
+                    // siendo determinista bajo paralelismo.
+                    const bool bSenescent =
+                        (Agents_Read.State[i] == ETreeState::Senescent) ||
+                        EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
+                            Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
+
+                    // En declive el arbol casi deja de crecer.
+                    const float EffGrowthRate = Sp->GrowthRate *
+                        EcologyRules::SenescentGrowthFactor(bSenescent, Sp->SenescentGrowthScale);
+                    const float NewBiomass = EcologyRules::GrowBiomassLogistic(
+                        Agents_Read.Biomass[i], VigorValue, EffGrowthRate, Sp->MaxBiomass, DtYears);
+
+                    Agents_Write.Biomass[i] = NewBiomass;
+                    Agents_Write.Height[i] = EcologyRules::HeightFromBiomass(NewBiomass, Sp->MaxBiomass, Sp->MaxHeightCm);
+                    Agents_Write.Age[i] = NewAge;
+                    Agents_Write.State[i] = bSenescent ? ETreeState::Senescent
+                        : (NewAge >= Sp->MaturityAge ? ETreeState::Mature : ETreeState::Sapling);
+
+                    // 2d) estres
+                    Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
+                        Settings->StressVigorThreshold, Settings->StressAccumulationRate,
+                        Settings->StressRecoveryRate, DtYears);
+
+                    // 2e) consumo -> SOLO al scratch de este chunk, en forma DISPERSA
+                    //     (lista de (celda, cantidad), ver C1 en FCellDelta).
+                    const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, NewBiomass, Sp->MaxBiomass);
+                    EcologyRules::DepositKernelSparse(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
+                        -NewBiomass * Sp->WaterDemand * DtYears);
+                    EcologyRules::DepositKernelSparse(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
+                        -NewBiomass * Sp->NutrientDemand * DtYears);
+
+                    // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
+                    //     La senescencia multiplica la probabilidad de morir (Fase 5 Paso 1).
+                    float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
+                        Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
+                    pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
+
+                    if (EcoRand::NextUnit(RngState) < pDeath)
                     {
-                        const FVector2D Offset = EcologyRules::SampleSeedOffsetCm(DispersalRadiusCm, RngState);
+                        Agents_Write.State[i] = ETreeState::Dead;
 
-                        FPendingSeed Seed;
-                        Seed.Position = P + FVector(Offset.X, Offset.Y, 0.f);
-                        Seed.SpeciesId = Agents_Read.SpeciesId[i];
-                        Seed.RngSeed = EcoRand::SeedForIndex(RngState, s);
-                        Ctx.Seeds.Add(Seed);
+                        FPendingDeathPulse Pulse;
+                        Pulse.Position = P;
+                        Pulse.RadiusCm = RootRadiusCm;
+                        Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings->NutrientDecompositionFactor);
+                        // Fase 5: datos para la caida/tocon/hojarasca del render.
+                        Pulse.SpeciesId = Agents_Read.SpeciesId[i];
+                        Pulse.StableId = Agents_Read.StableId[i];
+                        Pulse.Biomass = NewBiomass;
+                        Pulse.HeightCm = Agents_Write.Height[i];
+                        Ctx.DeathPulses.Add(Pulse);
+                    }
+                    else if (NewAge >= Sp->MaturityAge &&
+                        (Agents_Write.State[i] == ETreeState::Mature ||
+                            Agents_Write.State[i] == ETreeState::Senescent))
+                    {
+                        // 2g) semillas (solo si sigue vivo y ha alcanzado la madurez).
+                        //     El senescente SIGUE reproduciendose, con menos fuerza: cortarlo
+                        //     a cero eliminaba la ventana de maxima fecundidad y cambiaba en
+                        //     silencio el balance de sucesion que ajusto la Fase 2.
+                        //     La comprobacion explicita de MaturityAge hace falta ahora porque
+                        //     un SAPLING muy estresado tambien entra en Senescent, y una
+                        //     plantula no se reproduce.
+                        const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)
+                            ? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f)
+                            : 1.f;
+                        const int32 NumSeeds = EcologyRules::ComputeSeedCount(
+                            Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
+                        const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
+
+                        for (int32 s = 0; s < NumSeeds; ++s)
+                        {
+                            const FVector2D Offset = EcologyRules::SampleSeedOffsetCm(DispersalRadiusCm, RngState);
+
+                            FPendingSeed Seed;
+                            Seed.Position = P + FVector(Offset.X, Offset.Y, 0.f);
+                            Seed.SpeciesId = Agents_Read.SpeciesId[i];
+                            Seed.RngSeed = EcoRand::SeedForIndex(RngState, s);
+                            Ctx.Seeds.Add(Seed);
+                        }
                     }
                 }
-            }
-        }, Flags);
+            }, Flags);
+    } // fin del ambito de STAT_EcoParallel
 
     const double AfterParallel = FPlatformTime::Seconds();
 
@@ -693,12 +823,24 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // PendingSeeds/PendingDeaths son MIEMBROS (C5): ReduceScratchInto los hace
     // Reset(), asi que conservan la capacidad de ticks anteriores y una oleada de
     // germinacion no vuelve a pedir memoria al heap.
-    EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoReduce);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Reduce);
+        EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+    }
     const double AfterReduce = FPlatformTime::Seconds();
 
-    WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
-    NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoRegen);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Regen);
+        WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
+        NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
+    }
     const double AfterRegen = FPlatformTime::Seconds();
+
+    // Fase 6 (6.4): pulsos de muerte + germinacion, la ultima etapa del tick.
+    SCOPE_CYCLE_COUNTER(STAT_EcoGermination);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Germination);
 
     // Fase 5 (Paso 5): envejece las manchas de descomposicion existentes
     // (decaimiento exponencial) antes de sumar las de este tick.
@@ -793,7 +935,13 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         const float fL = EcologyRules::LightFactor(LightHere, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
         const float fW = EcologyRules::DemandFactor(WHere, Sp->WaterDemand);
         const float fN = EcologyRules::DemandFactor(NHere, Sp->NutrientDemand);
-        const float VigorHere = EcologyRules::Vigor(fL, fW, fN);
+        // Fase 6: la semilla cae al SUELO, o sea altura de copa 0: es donde el
+        // termino de CO2 pesa mas (aire poco mezclado bajo un dosel cerrado).
+        // Aplicarlo tambien aqui es lo que hace que el efecto tenga consecuencias
+        // ecologicas -menos reclutamiento bajo dosel denso- y no sea solo un
+        // adorno sobre el crecimiento.
+        const float VigorHere = EcologyRules::Vigor(fL, fW, fN)
+            * EcoCarbon::CO2Factor(LightHere, /*CanopyHeightCm*/ 0.f, CO2);
 
         uint32 SeedRng = Seed.RngSeed;
         const float pGerm = EcologyRules::GerminationProbability(VigorHere, Settings->GerminationRate);
@@ -1407,11 +1555,17 @@ void UEcosystemSubsystem::PaintVigorField()
     const USpeciesData* Sp = ResolveSpecies((uint16)FMath::Max(0, S->HeatmapSpeciesIndex));
     if (!FieldViz || !Sp || !HeightField.IsValid()) return;
     FField2D Suit;
+    // Fase 6: se le pasan los MISMOS parametros de CO2 que usa el tick, para que
+    // el mapa de idoneidad siga representando exactamente la funcion que hace
+    // crecer al bosque (ver GetCO2Params).
+    const EcoCarbon::FCO2Params CO2 = GetCO2Params();
     EcoVigor::BakeSuitabilityField(HeightField, WaterBase, NutrientBase, LightCoarse,
-        *Sp, S->LightHalfSaturationMax /* el mismo Kl que el tick */, Suit);
+        *Sp, S->LightHalfSaturationMax /* el mismo Kl que el tick */, Suit,
+        /*OutLimiter*/ nullptr, &CO2);
     FieldViz->UpdateFromField(Suit.Data);
     EnsureHeatmapDecal();
-    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de vigor (%s) pintado."), *Sp->SpeciesName.ToString());
+    UE_LOG(LogEco, Log, TEXT("[Eco] Heatmap de vigor (%s) pintado%s."),
+        *Sp->SpeciesName.ToString(), CO2.bEnabled ? TEXT(" (con CO2)") : TEXT(" (sin CO2)"));
 }
 void UEcosystemSubsystem::PaintLightField()
 {
