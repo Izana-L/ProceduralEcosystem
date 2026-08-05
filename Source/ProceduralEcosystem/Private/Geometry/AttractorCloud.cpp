@@ -102,31 +102,15 @@ void FAttractorCloud::BuildIndex(float InCellSize)
     }
     GridOrigin = Bounds.Min;
     constexpr int32 MaxCellsPerAxis = 256;
-    const FVector Size = (Bounds.Max - Bounds.Min).ComponentMax(FVector(CellSize)); // >=1 celda/eje
-    
-    GridW = FMath::Clamp(FMath::CeilToInt32(Size.X / CellSize), 1, MaxCellsPerAxis);
-    GridH = FMath::Clamp(FMath::CeilToInt32(Size.Y / CellSize), 1, MaxCellsPerAxis);
-    GridD = FMath::Clamp(FMath::CeilToInt32(Size.Z / CellSize), 1, MaxCellsPerAxis);
+    EcoGrid::DimensionsFromBounds(Bounds, CellSize, MaxCellsPerAxis, GridW, GridH, GridD);
 
-    // Counting sort (CSR): contar, prefijo acumulado, volcar. O(N). Orden fijo.
-    const int32 NC = GridW * GridH * GridD;
-    CellStart.SetNumZeroed(NC + 1);
-    for (int32 i = 0; i < N; ++i)
-    {
-        CellStart[CellOf(Attractors[i].Pos) + 1]++;
-    }
-    for (int32 c = 0; c < NC; ++c)
-    {
-        CellStart[c + 1] += CellStart[c];
-    }
-
-    TArray<int32> Cursor = CellStart;
-    SortedIdx.SetNumUninitialized(N);
-    for (int32 i = 0; i < N; ++i)
-    {
-        const int32 C = CellOf(Attractors[i].Pos);
-        SortedIdx[Cursor[C]++] = i;
-    }
+    // Counting sort (CSR) compartido: contar, prefijo acumulado, volcar. O(N).
+    // Orden fijo (indice creciente) -> determinista. El indice se construye una
+    // vez por arbol, asi que el cursor puede ser un scratch local.
+    TArray<int32> Cursor;
+    EcoGrid::BuildCSR(GridW * GridH * GridD, N,
+        [this](int32 i) { return CellOf(Attractors[i].Pos); },
+        CellStart, SortedIdx, Cursor);
 }
 
 void FAttractorCloud::CullByShade(const FTreeLightGridFine& Light, float LightThreshold)

@@ -140,7 +140,6 @@ public:
     void SetEnabled(bool bInEnabled);
     bool IsEnabled() const { return bEnabled; }
     void SetFrozen(bool bInFrozen) { bFrozen = bInFrozen; }
-    void ForceRelevel() { bForceRelevel = true; }
     void RebuildAll();
     void BakeLibraryNow();
     void LogStats() const;
@@ -161,8 +160,6 @@ public:
 
     /** Fase 6 (6.4): coste (ms) del ultimo re-nivelado completo. */
     double GetLastRelevelMs() const { return LastRelevelMs; }
-
-    UTreeLibrary* GetLibrary() const { return Library; }
 
 private:
     void HandleStateLoaded();
@@ -260,11 +257,13 @@ private:
      * denso, dentro de HeroRadiusCm caben cientos de arboles y solo interesan 24.
      * Cada candidato se descarta en O(1) si esta mas lejos que el peor actual.
      */
-    TArray<TPair<float, int32>> HeroBest; // (distancia^2, indice de poblacion), ascendente
+    TArray<TPair<double, int32>> HeroBest; // (distancia^2, indice de poblacion), ascendente
 
     /** Distancia^2 a camara de cada arbol, cacheada en la pasada de seleccion de
-        hero para que la de reparto de niveles no la recalcule (C4). */
-    TArray<float> DistSqCache;
+        hero para que la de reparto de niveles no la recalcule (C4). En double:
+        con CullRadius de 1,2 km, la distancia^2 (~1.4e10) excede la precision de
+        un float (mantisa de 24 bits) y las coordenadas de mundo de UE5 son double. */
+    TArray<double> DistSqCache;
 
     uint32 VisitStamp = 0;
     int32  FramesSinceRelevel = 0;

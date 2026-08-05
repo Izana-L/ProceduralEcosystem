@@ -91,27 +91,6 @@ namespace EcoVigor
     }
 
     /**
-     * Vigor en una posicion de mundo. Muestrea los tres campos y aplica Liebig.
-     * Esta es la forma de Fase 1 del VigorAt(pos, especie, W, N, L) del diseno.
-     *
-     * @param WorldPos  Punto en mundo (cm). La Z importa: la luz se muestrea en 3D,
-     *                  asi que pasa la Z del suelo (o de la copa) segun el caso.
-     * @param KlMax     Semisaturacion de luz global (heliofila); ver EcosystemSettings.
-     * @param CO2       Fase 6: si no es nullptr, se aplica el multiplicador de CO2
-     *                  (doc. 6.3) evaluado a nivel de suelo (altura de copa 0, que
-     *                  es lo correcto para "idoneidad para una plantula").
-     */
-    PROCEDURALECOSYSTEM_API float VigorAtWorld(
-        const FVector& WorldPos,
-        const USpeciesData& Species,
-        const FWaterField& Water,
-        const FNutrientField& Nutrient,
-        const FLightFieldCoarse& Light,
-        float KlMax,
-        EEcoLimiter* OutLimiter = nullptr,
-        const EcoCarbon::FCO2Params* CO2 = nullptr);
-
-    /**
      * Rellena un campo de IDONEIDAD (vigor en [0,1]) para una especie sobre toda
      * la rejilla del relieve: en cada nodo muestrea agua/nutrientes/luz al nivel
      * del suelo y evalua Liebig. Es lo que pinta el heatmap de la Fase 1.
@@ -122,10 +101,12 @@ namespace EcoVigor
      *
      * @param OutLimiter  Opcional: si no es null, se rellena con el limitante por
      *                     nodo (0=luz,1=agua,2=nutrientes) para un mapa cualitativo.
-     * @param CO2         Fase 6: mismo criterio que en VigorAtWorld. Pasarlo es
-     *                     importante para que el heatmap siga representando el
-     *                     MISMO numero que usa el tick; si no, el mapa de
-     *                     idoneidad y el crecimiento real dejarian de cuadrar.
+     * @param CO2         Fase 6: si no es nullptr se aplica el multiplicador de
+     *                     CO2 (doc. 6.3) a ras de suelo, igual que hace el tick.
+     *                     Pasarlo es importante para que el heatmap siga
+     *                     representando el MISMO numero que usa el tick; si no,
+     *                     el mapa de idoneidad y el crecimiento real dejarian
+     *                     de cuadrar.
      */
     PROCEDURALECOSYSTEM_API void BakeSuitabilityField(
         const FHeightField& Height,

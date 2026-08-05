@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Core/GridMath.h"
 
 class USpeciesData;          // Species/SpeciesData.h        (se incluye en el .cpp)
 struct FTreeLightGridFine;   // Geometry/TreeLightGridFine.h (se incluye en el .cpp)
@@ -87,9 +88,9 @@ struct PROCEDURALECOSYSTEM_API FAttractorCloud
             return;
         }
 
-        const int32 Cx = FMath::FloorToInt32((P.X - GridOrigin.X) / CellSize);
-        const int32 Cy = FMath::FloorToInt32((P.Y - GridOrigin.Y) / CellSize);
-        const int32 Cz = FMath::FloorToInt32((P.Z - GridOrigin.Z) / CellSize);
+        const int32 Cx = EcoGrid::WorldToCell(P.X, GridOrigin.X, CellSize);
+        const int32 Cy = EcoGrid::WorldToCell(P.Y, GridOrigin.Y, CellSize);
+        const int32 Cz = EcoGrid::WorldToCell(P.Z, GridOrigin.Z, CellSize);
         const int32 R = FMath::CeilToInt(Radius / CellSize);
 
         for (int32 Dz = -R; Dz <= R; ++Dz)
@@ -121,9 +122,9 @@ private:
     /** Mundo -> celda lineal con clamp (para construir el indice). */
     FORCEINLINE int32 CellOf(const FVector& P) const
     {
-        const int32 Cx = FMath::Clamp(FMath::FloorToInt((P.X - GridOrigin.X) / CellSize), 0, GridW - 1);
-        const int32 Cy = FMath::Clamp(FMath::FloorToInt((P.Y - GridOrigin.Y) / CellSize), 0, GridH - 1);
-        const int32 Cz = FMath::Clamp(FMath::FloorToInt((P.Z - GridOrigin.Z) / CellSize), 0, GridD - 1);
-        return (Cz * GridH + Cy) * GridW + Cx;
+        const int32 Cx = EcoGrid::WorldToCellClamped(P.X, GridOrigin.X, CellSize, GridW);
+        const int32 Cy = EcoGrid::WorldToCellClamped(P.Y, GridOrigin.Y, CellSize, GridH);
+        const int32 Cz = EcoGrid::WorldToCellClamped(P.Z, GridOrigin.Z, CellSize, GridD);
+        return EcoGrid::VoxelIndex(Cx, Cy, Cz, GridW, GridH);
     }
 };

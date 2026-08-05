@@ -1,18 +1,5 @@
 #include "Ecology/TreePopulation.h"
 
-void FTreePopulation::Reset()
-{
-    Position.Reset();
-    SpeciesId.Reset();
-    Age.Reset();
-    Biomass.Reset();
-    Height.Reset();
-    Stress.Reset();
-    State.Reset();
-    RngState.Reset();
-    StableId.Reset();
-}
-
 void FTreePopulation::Reserve(int32 ExpectedNum)
 {
     Position.Reserve(ExpectedNum);

@@ -7,8 +7,12 @@ void FLightFieldCoarse::Init(int32 InWidth, int32 InHeight, int32 InLayers,
     Width = FMath::Max(1, InWidth);
     Height = FMath::Max(1, InHeight);
     Layers = FMath::Clamp(InLayers, 1, 512);
-    CellSizeXY = InCellSizeXY;
-    CellSizeZ = InCellSizeZ;
+    // Ambos tamanos son divisores en WorldToColumnClamped / WorldToVoxelClamped
+    // / SampleLightSmooth: un 0 llegado de config produce indices no finitos y
+    // corrompe el muestreo de luz. Misma guarda que FTreeLightGridFine (que ya
+    // hace Max(InVoxelSizeCm, 1.f)) y FSpatialHash.
+    CellSizeXY = FMath::Max(InCellSizeXY, 1.0);
+    CellSizeZ = FMath::Max(InCellSizeZ, 1.0);
     Origin = InOrigin;
     BaseZ = InBaseZ;
 
@@ -43,7 +47,7 @@ void FLightFieldCoarse::WorldToVoxelClamped(const FVector& WorldPos, int32& OutI
 
     // Altura RELATIVA a la cota de referencia de esta columna (terreno si lo hay).
     const double RelZ = WorldPos.Z - ReferenceZ(OutIx, OutIy) - BaseZ;
-    OutIz = FMath::Clamp(FMath::FloorToInt32(RelZ / CellSizeZ), 0, Layers - 1);
+    OutIz = EcoGrid::WorldToCellClamped(RelZ, 0.0, CellSizeZ, Layers);
 }
 
 void FLightFieldCoarse::DepositCanopyShadow(const FVector& ApexWorldPos, float CanopyRadiusCm,
@@ -113,7 +117,7 @@ float FLightFieldCoarse::SampleLight(const FVector& WorldPos) const
     WorldToVoxelClamped(WorldPos, ix, iy, iz);
 
     const float S = Shadow[IndexOf(ix, iy, iz)];
-    return FMath::Max(FullSunlight - S, 0.f);
+    return EcoGrid::LightFromShadow(S, FullSunlight);
 }
 
 float FLightFieldCoarse::SampleLightSmooth(const FVector& WorldPos) const
@@ -158,5 +162,5 @@ float FLightFieldCoarse::SampleLightSmooth(const FVector& WorldPos) const
     const float c1 = FMath::Lerp(c01, c11, fx);
     const float shadow = FMath::Lerp(c0, c1, fy);
 
-    return FMath::Max(FullSunlight - shadow, 0.f);
+    return EcoGrid::LightFromShadow(shadow, FullSunlight);
 }

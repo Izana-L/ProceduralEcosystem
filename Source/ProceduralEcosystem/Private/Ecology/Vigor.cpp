@@ -11,54 +11,6 @@
 
 namespace EcoVigor
 {
-    float VigorAtWorld(
-        const FVector& WorldPos,
-        const USpeciesData& Species,
-        const FWaterField& Water,
-        const FNutrientField& Nutrient,
-        const FLightFieldCoarse& Light,
-        float KlMax,
-        EEcoLimiter* OutLimiter,
-        const EcoCarbon::FCO2Params* CO2)
-    {
-        // Agua y nutrientes son campos 2D: se muestrean por XY (la Z no cuenta).
-        const float W = Water.SampleWater(WorldPos.X, WorldPos.Y);
-        const float N = Nutrient.SampleNutrient(WorldPos.X, WorldPos.Y);
-
-        // La luz es 3D: usa la Z de WorldPos. SampleLightSmooth (trilineal) evita
-        // los bloques del vecino-mas-cercano; el diseno lo recomienda justo para
-        // la funcion de vigor. Si la rejilla de luz no es valida, asume cielo
-        // despejado (Q=1): asi el heatmap funciona aunque aun no haya arboles.
-        const float Q = Light.IsValid() ? Light.SampleLightSmooth(WorldPos) : FLightFieldCoarse::FullSunlight;
-
-        const float fL = LightFactor(Q, Species.ShadeTolerance, KlMax);
-        const float fW = WaterFactor(W, Species.WaterDemand);
-        const float fN = NutrientFactor(N, Species.NutrientDemand);
-
-        float V;
-        if (OutLimiter)
-        {
-            V = CombineWithLimiter(fL, fW, fN, *OutLimiter);
-        }
-        else
-        {
-            V = Combine(fL, fW, fN);
-        }
-
-        // Fase 6 (doc. 6.3): CO2 como MULTIPLICADOR, no como cuarto termino del
-        // min(). El limitante de Liebig que se devuelve en OutLimiter sigue siendo
-        // el de los tres recursos de verdad -el CO2 aqui no se simula como recurso
-        // consumible, solo modula la eficiencia-, asi que el mapa cualitativo de
-        // limitantes no cambia de significado.
-        if (CO2)
-        {
-            // Altura de copa 0: la idoneidad se evalua a ras de suelo, que es donde
-            // cae una semilla.
-            V *= EcoCarbon::CO2Factor(Q, /*CanopyHeightCm*/ 0.f, *CO2);
-        }
-        return V;
-    }
-
     void BakeSuitabilityField(
         const FHeightField& Height,
         const FWaterField& Water,

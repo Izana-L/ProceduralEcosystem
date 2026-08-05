@@ -1,4 +1,5 @@
 #include "Debug/FieldVisualizer.h"
+#include "Terrain/Field2D.h" // FField2D::MinMax (helper compartido)
 #include "Engine/Texture2D.h"
 // Si tu versión no encuentra FUpdateTextureRegion2D con estos includes,
 // añade #include "RHI.h".
@@ -64,13 +65,8 @@ void UFieldVisualizer::UpdateFromField(const TArray<float>& Field)
 {
     if (Field.Num() != Width * Height) { return; }
 
-    float MinV = TNumericLimits<float>::Max();
-    float MaxV = TNumericLimits<float>::Lowest();
-    for (const float V : Field)
-    {
-        MinV = FMath::Min(MinV, V);
-        MaxV = FMath::Max(MaxV, V);
-    }
+    float MinV, MaxV;
+    FField2D::MinMax(Field, MinV, MaxV); // helper unico (mismo barrido que los campos)
 
     UpdateFromField(Field, MinV, MaxV);
 }

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Core/EcoCore.h"
+#include "Ecology/EcologyRules.h" // HeightRatioFromBiomass: alometria compartida con el tick
 
 /**
  * Clave de ARQUETIPO (doc. Fase 4, 4.2).
@@ -94,20 +95,18 @@ namespace TreeArchetype
     /** Valor estable en [0,1) derivado del id del arbol. */
     FORCEINLINE float StableUnit(uint32 StableId, uint32 Salt)
     {
-        return static_cast<float>(StableHash(StableId, Salt) >> 8) * (1.f / 16777216.f);
+        return EcoRand::UnitFromBits(StableHash(StableId, Salt));
     }
 
     /**
-     * Fraccion de altura adulta que tiene el arbol, en [0,1].
-     * Usa la MISMA alometria que EcologyRules::HeightFromBiomass (raiz cubica de
-     * la biomasa) para que el bucket sea coherente con la altura que la Fase 2
-     * usa en el grid de luz: si no, un arbol podria "verse" de un tamano y
-     * sombrear como otro.
+     * Fraccion de altura adulta que tiene el arbol, en [0,1]. DELEGA en la
+     * alometria unica de EcologyRules (raiz cubica de la biomasa) para que el
+     * bucket sea coherente con la altura que la Fase 2 usa en el grid de luz:
+     * si no, un arbol podria "verse" de un tamano y sombrear como otro.
      */
     FORCEINLINE float HeightRatio(float Biomass, float MaxBiomass)
     {
-        const float R = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
-        return FMath::Pow(R, 1.f / 3.f);
+        return EcologyRules::HeightRatioFromBiomass(Biomass, MaxBiomass);
     }
 
     /**

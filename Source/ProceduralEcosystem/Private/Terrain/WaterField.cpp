@@ -21,6 +21,12 @@
 // =====================================================================
 namespace
 {
+    // Offsets de los 8 vecinos (D8), en el MISMO orden para el priority-flood y
+    // para la direccion de flujo. Una sola copia: antes estaban declarados por
+    // duplicado dentro de cada funcion y podian divergir en silencio.
+    constexpr int32 GD8X[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
+    constexpr int32 GD8Y[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
+
     struct FPFNode { double Z; int32 Idx; };
 
     FORCEINLINE bool PFLess(const FPFNode& A, const FPFNode& B)
@@ -97,8 +103,6 @@ namespace
             }
         }
 
-        static const int32 NX[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
-        static const int32 NY[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
         const double Epsilon = 0.01; // cm: pendiente minima impuesta al rellenar
 
         while (Count > 0)
@@ -109,8 +113,8 @@ namespace
 
             for (int32 k = 0; k < 8; ++k)
             {
-                const int32 nx = cx + NX[k];
-                const int32 ny = cy + NY[k];
+                const int32 nx = cx + GD8X[k];
+                const int32 ny = cy + GD8Y[k];
                 if (nx < 0 || ny < 0 || nx >= W || ny >= Ht) continue;
 
                 const int32 n = ny * W + nx;
@@ -162,8 +166,6 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
     TArray<int32> FlowTo;
     FlowTo.Init(-1, N); // -1 = sin salida (borde / salida del mapa)
 
-    static const int32 NX[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
-    static const int32 NY[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
     static const double NDist[8] = { 1.0, 1.41421356, 1.0, 1.41421356,
                                      1.0, 1.41421356, 1.0, 1.41421356 };
 
@@ -179,8 +181,8 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
 
                 for (int32 k = 0; k < 8; ++k)
                 {
-                    const int32 nx = x + NX[k];
-                    const int32 ny = y + NY[k];
+                    const int32 nx = x + GD8X[k];
+                    const int32 ny = y + GD8Y[k];
                     if (nx < 0 || ny < 0 || nx >= W || ny >= Ht) continue;
 
                     const int32 nIdx = ny * W + nx;
@@ -263,26 +265,9 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
             }
         });
 
-    float MinTwi = TNumericLimits<float>::Max();
-    float MaxTwi = -TNumericLimits<float>::Max();
-    for (const float V : TwiRaw)
-    {
-        MinTwi = FMath::Min(MinTwi, V);
-        MaxTwi = FMath::Max(MaxTwi, V);
-    }
-
     // -----------------------------------------------------------------
     // 5) Normalizacion lineal a [0, OutputMax]: deja el campo listo para la
     //    formula de vigor (Monod, Fase 2) sin reescalados ahi.
     // -----------------------------------------------------------------
-    const float Range = FMath::Max(MaxTwi - MinTwi, KINDA_SMALL_NUMBER);
-    ParallelFor(Ht, [&](int32 y)
-        {
-            for (int32 x = 0; x < W; ++x)
-            {
-                const int32 i = y * W + x;
-                const float t = (TwiRaw[i] - MinTwi) / Range; // [0, 1]
-                Field.Data[i] = t * OutputMax;
-            }
-        });
+    Field.FillNormalizedFrom(TwiRaw, OutputMax);
 }

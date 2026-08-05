@@ -13,7 +13,7 @@
  *
  * Implementacion: compone un FField2D (Field) que aporta la rejilla, el
  * almacenamiento y el muestreo bilineal genericos. FHeightField solo anade
- * lo especifico de terreno: generacion de ruido fractal, pendiente y normal.
+ * lo especifico de terreno: generacion de ruido fractal y normal.
  *
  * Unidades: coordenadas de mundo en cm (unidades de Unreal). La altura
  * tambien en cm.
@@ -42,9 +42,6 @@ struct PROCEDURALECOSYSTEM_API FHeightField
     {
         return Field.SampleBilinear(Xcm, Ycm);
     }
-
-    /** Pendiente en radianes (0 = plano) por diferencias centrales. */
-    float SampleSlope(double Xcm, double Ycm) const;
 
     /** Normal del terreno (unitaria, Z hacia arriba). */
     FVector SampleNormal(double Xcm, double Ycm) const;

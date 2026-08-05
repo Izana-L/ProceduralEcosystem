@@ -20,6 +20,7 @@ class ADecalActor;
 class UMaterialInstanceDynamic;
 class USpeciesData;
 class AHeroTreeActor;
+class UEcosystemSettings;
 class FArchive;
 // Fase 5 (Paso 6): serializacion del bake
 /** Se emite cuando LoadState sustituye la poblacion entera. Las capas que
@@ -127,9 +128,6 @@ public:
         frame se lleva la simulacion. */
     const FEcoTickProfile& GetTickProfile() const { return Profile; }
 
-    /** Fase 6 (6.4): ticks ejecutados en el ultimo frame (0 si estaba pausada). */
-    int32 GetTicksLastFrame() const { return TicksLastFrame; }
-
     /** Fase 6 (6.3): parametros del multiplicador de CO2, ya resueltos contra la
         consola (Eco.CO2.Enable). Lo usan el tick, la germinacion y el heatmap de
         idoneidad, para que los tres evaluen EXACTAMENTE la misma funcion. */
@@ -184,6 +182,31 @@ public:
 
 private:
     void SimulateTick(float DtYears);
+
+    // --- Etapas de SimulateTick ---
+    // Extraidas a metodos con nombre para que el tick sea un orquestador legible
+    // y cada etapa se pueda razonar (y en el futuro testear) por separado. El
+    // ORDEN de llamada es fijo: es parte del contrato de determinismo del doc 2.5.
+
+    /** Prepara el scratch por-tarea (chunks deterministas + reservas). Devuelve
+        el nº de chunks, derivado SOLO de la poblacion y del grain de settings. */
+    int32 PrepareTickScratch(const UEcosystemSettings& Settings);
+
+    /** PASO 2 (paralelo): crecimiento/estres/mortalidad/semillas por chunk. Cada
+        chunk solo lee del snapshot y escribe en su porcion de Agents_Write y en
+        su propio FTickScratch. */
+    void RunGrowthParallel(float DtYears, const UEcosystemSettings& Settings,
+        const EcoCarbon::FCO2Params& CO2, int32 NumChunks);
+
+    /** Decae el campo de descomposicion y aplica los pulsos de muerte del tick
+        (nutrientes + evento para la capa de suelo + mancha visible). Serial. */
+    void ApplyDeathPulses(float DtYears, const UEcosystemSettings& Settings);
+
+    /** Germinacion serial de PendingSeeds: espaciado minimo (spatial hash +
+        recien nacidas), sitio seguro y probabilidad por vigor local. */
+    void RunGermination(float DtYears, const UEcosystemSettings& Settings,
+        const EcoCarbon::FCO2Params& CO2);
+
     /** Rehace el grid de luz grueso con la poblacion actual (ClearShadow + deposito
         de todas las copas). Lo llama SimulateTick al principio del tick, y LoadState
         despues de cargar: sin esto un bake cargado deja la luz del bosque ANTERIOR,

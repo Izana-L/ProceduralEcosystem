@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Math/Box2D.h"
+#include "Core/GridMath.h"
 
 /**
  * Rejilla escalar 2D generica: "un TArray<float> con forma de mundo".
@@ -49,21 +50,26 @@ struct PROCEDURALECOSYSTEM_API FField2D
         return Data[Iy * Width + Ix];
     }
 
-    FORCEINLINE void SetAt(int32 Ix, int32 Iy, float Value)
-    {
-        if (Ix >= 0 && Ix < Width && Iy >= 0 && Iy < Height)
-        {
-            Data[Iy * Width + Ix] = Value;
-        }
-    }
-
     /** Extension en mundo (cm) que cubre la rejilla. */
     FBox2D GetWorldBounds() const;
 
     /** Mundo -> coordenadas de rejilla (en muestras, fraccional). */
     FORCEINLINE void WorldToGrid(double Xcm, double Ycm, double& OutGx, double& OutGy) const
     {
-        OutGx = (Xcm - Origin.X) / CellSize;
-        OutGy = (Ycm - Origin.Y) / CellSize;
+        OutGx = EcoGrid::ToGridCoord(Xcm, Origin.X, CellSize);
+        OutGy = EcoGrid::ToGridCoord(Ycm, Origin.Y, CellSize);
     }
+
+    /** Min y max de un buffer de valores (barrido serial O(N)). UNICA copia del
+        patron que antes reimplementaban los tres generadores de campo, el
+        visualizador y el log de rangos. Con Values vacio deja min > max. */
+    static void MinMax(const TArray<float>& Values, float& OutMin, float& OutMax);
+
+    /**
+     * Escribe en Data la normalizacion lineal de Raw a [0, OutputMax]:
+     * t = (v - min) / (max - min), Data[i] = t * OutputMax. Paralelo por filas
+     * (cada fila escribe celdas disjuntas -> determinista). Raw debe tener el
+     * mismo numero de celdas que la rejilla.
+     */
+    void FillNormalizedFrom(const TArray<float>& Raw, float OutputMax);
 };

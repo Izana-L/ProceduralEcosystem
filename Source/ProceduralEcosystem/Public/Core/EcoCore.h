@@ -30,10 +30,20 @@ namespace EcoRand
         return x;
     }
 
+    /**
+     * uint32 -> float uniforme en [0, 1): usa los 24 bits altos (la mantisa de
+     * un float). UNICA copia de esta conversion: la usan NextUnit, los hashes
+     * estables de TreeArchetype y los desfases de viento de TreeWindData.
+     */
+    FORCEINLINE float UnitFromBits(uint32 Bits)
+    {
+        return static_cast<float>(Bits >> 8) * (1.0f / 16777216.0f);
+    }
+
     /** Devuelve un float en [0, 1). */
     FORCEINLINE float NextUnit(uint32& State)
     {
-        return static_cast<float>(NextU32(State) >> 8) * (1.0f / 16777216.0f);
+        return UnitFromBits(NextU32(State));
     }
 
     /** Float en [Min, Max). */

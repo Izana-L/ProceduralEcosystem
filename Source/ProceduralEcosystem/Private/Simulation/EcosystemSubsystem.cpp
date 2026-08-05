@@ -272,7 +272,11 @@ void UEcosystemSubsystem::LogTickProfile() const
 // ---------------------------------------------------------------------------
 static TAutoConsoleVariable<int32> CVarDebugAgents(TEXT("Eco.Debug.Agents"), 1, TEXT("Dibuja los agentes de debug (Fase 0) como esferas."));
 
-static TAutoConsoleVariable<int32> CVarDebugPopulation(TEXT("Eco.Debug.Population"), 1, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas."));
+// Por defecto APAGADO: dibujar una esfera por arbol vivo es trabajo O(poblacion)
+// por frame (a 20k arboles, decenas de miles de esferas) y ademas es redundante
+// con el render por instancias, que ya dibuja los mismos arboles. Activalo solo
+// para depurar: Eco.Debug.Population 1.
+static TAutoConsoleVariable<int32> CVarDebugPopulation(TEXT("Eco.Debug.Population"), 0, TEXT("Dibuja la poblacion de arboles simulada (Fase 2) como esferas. 0 = off (por defecto)."));
 
 static TAutoConsoleVariable<int32> CVarDebugTerrain(TEXT("Eco.Debug.Terrain"), 0, TEXT("Dibuja las normales del terreno en una rejilla de sondas."));
 
@@ -305,11 +309,13 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
-    // 1) Relieve: fuente de verdad de la simulacion.
+    // 1) Relieve: fuente de verdad de la simulacion. Octavas y frecuencia base
+    //    tambien salen de Project Settings (controlan directamente el aspecto
+    //    del terreno; antes eran literales que exigian recompilar para tunear).
     HeightField.GenerateFractalNoise(
         S->HeightfieldResolution, S->HeightfieldResolution,
         S->HeightfieldCellSizeCm, static_cast<uint32>(S->MasterSeed),
-        /*Octaves*/ 5, /*BaseFrequency*/ 0.0006, S->HeightScaleCm);
+        S->HeightfieldOctaves, S->HeightfieldBaseFrequency, S->HeightScaleCm);
 
     if (!HeightField.IsValid())
     {
@@ -330,8 +336,8 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
         HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed), S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);
 
     auto LogRange = [](const FField2D& F, const TCHAR* N) {
-        float Mn = TNumericLimits<float>::Max(), Mx = -Mn;
-        for (float V : F.Data) { Mn = FMath::Min(Mn, V); Mx = FMath::Max(Mx, V); }
+        float Mn, Mx;
+        FField2D::MinMax(F.Data, Mn, Mx);
         UE_LOG(LogEco, Log, TEXT("[Eco] Campo %s: min=%.3f max=%.3f (%d celdas)"), N, Mn, Mx, F.Data.Num()); };
     LogRange(WaterBase.Field, TEXT("Agua"));  LogRange(NutrientBase.Field, TEXT("Nutrientes"));
 
@@ -561,12 +567,11 @@ float UEcosystemSubsystem::GetInterpolationAlpha() const
 //  Bucle de tick (Fase 2)
 // ---------------------------------------------------------------------------
 
-// Factores de forma de la copa hasta que la Fase 3 aporte geometria real.
-// Aqui como constantes con nombre (antes eran literales sueltos en el bucle);
-// si en el futuro varian por especie, muevelos a USpeciesData.
-static constexpr float kCanopyRadiusFraction = 0.30f; // radio de copa = 30% de la altura
-static constexpr float kCanopyShadowDensity = 0.80f; // opacidad de la copa [0,1]
-static constexpr float kGerminationBiomassFraction = 0.01f; // plantula nueva = 1% de MaxBiomass
+// Los factores de forma de copa (CanopyRadiusFraction/CanopyShadowDensity) y la
+// biomasa de germinacion (GerminationBiomassFraction) ya NO son constantes de
+// este .cpp: entran en el bucle de luz y en la germinacion -alteran el resultado
+// ecologico-, asi que viven en UEcosystemSettings como parte de la configuracion
+// reproducible del proyecto.
 
 // Tope de tareas del ParallelFor del tick. Constante (no depende de la maquina)
 // para que la particion en chunks -y por tanto el orden de la reduccion de
@@ -628,6 +633,74 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     WaterPool.BeginTick();
     NutrientPool.BeginTick();
 
+    const int32 NumChunks = PrepareTickScratch(*Settings);
+
+    // ================================================================
+    // PASO 2 (paralelo): crecimiento/estres/mortalidad/semillas por chunk.
+    // ================================================================
+    RunGrowthParallel(DtYears, *Settings, CO2, NumChunks);
+
+    const double AfterParallel = FPlatformTime::Seconds();
+
+    // ================================================================
+    // PASO 3 (serial): reduccion -> regeneracion -> pulsos de muerte -> germinacion.
+    // ================================================================
+    // PendingSeeds/PendingDeaths son MIEMBROS (C5): ReduceScratchInto los hace
+    // Reset(), asi que conservan la capacidad de ticks anteriores y una oleada de
+    // germinacion no vuelve a pedir memoria al heap.
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoReduce);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Reduce);
+        EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+    }
+    const double AfterReduce = FPlatformTime::Seconds();
+
+    {
+        SCOPE_CYCLE_COUNTER(STAT_EcoRegen);
+        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Regen);
+        WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
+        NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
+    }
+    const double AfterRegen = FPlatformTime::Seconds();
+
+    // Fase 6 (6.4): pulsos de muerte + germinacion, la ultima etapa del tick.
+    SCOPE_CYCLE_COUNTER(STAT_EcoGermination);
+    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Germination);
+
+    ApplyDeathPulses(DtYears, *Settings);
+    RunGermination(DtYears, *Settings, CO2);
+
+    // ================================================================
+    // PASO 4: compactar muertos e intercambiar buffers (agentes y campos).
+    // ================================================================
+    Agents_Write.CompactDead();
+
+    Swap(Agents_Read, Agents_Write);
+    WaterPool.SwapBuffers();
+    NutrientPool.SwapBuffers();
+
+    // Instrumentacion (Eco.Profile): media exponencial del coste de cada etapa.
+    // Es lo que el doc. 6.4 exige tener ANTES de decidir que se optimiza.
+    const double TickT1 = FPlatformTime::Seconds();
+    FEcoTickProfile::Accumulate(Profile.HashMs, (AfterHash - TickT0) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.LightMs, (AfterLight - AfterHash) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.ParallelMs, (AfterParallel - AfterLight) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.ReduceMs, (AfterReduce - AfterParallel) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.RegenMs, (AfterRegen - AfterReduce) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.GerminationMs, (TickT1 - AfterRegen) * 1000.0);
+    FEcoTickProfile::Accumulate(Profile.TotalMs, (TickT1 - TickT0) * 1000.0);
+
+    if ((TickCount % 20) == 0)
+    {
+        LogPopulationStats();
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Etapas de SimulateTick (el tick queda como orquestador; ver el .h)
+// ---------------------------------------------------------------------------
+int32 UEcosystemSubsystem::PrepareTickScratch(const UEcosystemSettings& Settings)
+{
     // -----------------------------------------------------------------
     // DETERMINISMO: el nº de chunks se deriva SOLO de la poblacion y de un
     // grain fijo (settings), NUNCA del nº de hilos de la maquina. Si dependiera
@@ -641,7 +714,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     // asi que seguimos aprovechando todos los nucleos.
     // -----------------------------------------------------------------
     const int32 PopNum = Agents_Read.Num();
-    const int32 GrainSize = FMath::Max(1, Settings->TickChunkGrainSize);
+    const int32 GrainSize = FMath::Max(1, Settings.TickChunkGrainSize);
     const int32 NumChunks = FMath::Clamp(FMath::DivideAndRoundUp(PopNum, GrainSize), 1, kMaxTickChunks);
 
     // Scratch PERSISTENTE (miembro) y DISPERSO (optimizacion C1): cada tarea
@@ -664,12 +737,17 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         Ctx.ResetForNextTick();
         Ctx.ReserveForTrees(TreesPerChunk, CellsPerTree);
     }
+    return NumChunks;
+}
 
-    // ================================================================
-    // PASO 2 (paralelo): cada chunk SOLO lee del snapshot (Agents_Read,
-    // WaterPool.Current, NutrientPool.Current, LightCoarse) y SOLO escribe
-    // en su porcion de Agents_Write y en su propio FTickScratch.
-    // ================================================================
+void UEcosystemSubsystem::RunGrowthParallel(float DtYears, const UEcosystemSettings& Settings,
+    const EcoCarbon::FCO2Params& CO2, int32 NumChunks)
+{
+    // Cada chunk SOLO lee del snapshot (Agents_Read, WaterPool.Current,
+    // NutrientPool.Current, LightCoarse) y SOLO escribe en su porcion de
+    // Agents_Write y en su propio FTickScratch.
+    const int32 PopNum = Agents_Read.Num();
+
     const EParallelForFlags Flags = CVarForceST.GetValueOnGameThread()
         ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None;
 
@@ -701,7 +779,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     const float Q = LightCoarse.SampleLightSmooth(P);
 
                     // 2b) factores + vigor (Liebig)
-                    const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
+                    const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings.LightHalfSaturationMax);
                     const float fW = EcologyRules::DemandFactor(W, Sp->WaterDemand);
                     const float fN = EcologyRules::DemandFactor(N, Sp->NutrientDemand);
 
@@ -750,8 +828,8 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
 
                     // 2d) estres
                     Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
-                        Settings->StressVigorThreshold, Settings->StressAccumulationRate,
-                        Settings->StressRecoveryRate, DtYears);
+                        Settings.StressVigorThreshold, Settings.StressAccumulationRate,
+                        Settings.StressRecoveryRate, DtYears);
 
                     // 2e) consumo -> SOLO al scratch de este chunk, en forma DISPERSA
                     //     (lista de (celda, cantidad), ver C1 en FCellDelta).
@@ -764,7 +842,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                     // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
                     //     La senescencia multiplica la probabilidad de morir (Fase 5 Paso 1).
                     float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
-                        Agents_Write.Stress[i], Settings->StressMortalityWeight, DtYears);
+                        Agents_Write.Stress[i], Settings.StressMortalityWeight, DtYears);
                     pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
 
                     if (EcoRand::NextUnit(RngState) < pDeath)
@@ -774,7 +852,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                         FPendingDeathPulse Pulse;
                         Pulse.Position = P;
                         Pulse.RadiusCm = RootRadiusCm;
-                        Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings->NutrientDecompositionFactor);
+                        Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings.NutrientDecompositionFactor);
                         // Fase 5: datos para la caida/tocon/hojarasca del render.
                         Pulse.SpeciesId = Agents_Read.SpeciesId[i];
                         Pulse.StableId = Agents_Read.StableId[i];
@@ -797,7 +875,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                             ? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f)
                             : 1.f;
                         const int32 NumSeeds = EcologyRules::ComputeSeedCount(
-                            Settings->SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
+                            Settings.SeedRatePerBiomass * SeedScale, NewBiomass, DtYears, RngState);
                         const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
 
                         for (int32 s = 0; s < NumSeeds; ++s)
@@ -814,39 +892,15 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
                 }
             }, Flags);
     } // fin del ambito de STAT_EcoParallel
+}
 
-    const double AfterParallel = FPlatformTime::Seconds();
-
-    // ================================================================
-    // PASO 3 (serial): reduccion -> regeneracion -> pulsos de muerte -> germinacion.
-    // ================================================================
-    // PendingSeeds/PendingDeaths son MIEMBROS (C5): ReduceScratchInto los hace
-    // Reset(), asi que conservan la capacidad de ticks anteriores y una oleada de
-    // germinacion no vuelve a pedir memoria al heap.
-    {
-        SCOPE_CYCLE_COUNTER(STAT_EcoReduce);
-        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Reduce);
-        EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
-    }
-    const double AfterReduce = FPlatformTime::Seconds();
-
-    {
-        SCOPE_CYCLE_COUNTER(STAT_EcoRegen);
-        TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Regen);
-        WaterPool.RegenerateTowardBase(WaterBase.Field, Settings->WaterRechargeRate, Settings->WaterDiffusionRate, DtYears);
-        NutrientPool.RegenerateTowardBase(NutrientBase.Field, Settings->NutrientRechargeRate, Settings->NutrientDiffusionRate, DtYears);
-    }
-    const double AfterRegen = FPlatformTime::Seconds();
-
-    // Fase 6 (6.4): pulsos de muerte + germinacion, la ultima etapa del tick.
-    SCOPE_CYCLE_COUNTER(STAT_EcoGermination);
-    TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Germination);
-
+void UEcosystemSubsystem::ApplyDeathPulses(float DtYears, const UEcosystemSettings& Settings)
+{
     // Fase 5 (Paso 5): envejece las manchas de descomposicion existentes
     // (decaimiento exponencial) antes de sumar las de este tick.
     if (DecompositionField.IsValid())
     {
-        const float Decay = FMath::Exp(-Settings->DecompositionDecayPerYear * DtYears);
+        const float Decay = FMath::Exp(-Settings.DecompositionDecayPerYear * DtYears);
         for (float& V : DecompositionField.Data) { V *= Decay; }
     }
 
@@ -858,16 +912,21 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         if (DecompositionField.IsValid())
         {
             EcologyRules::DepositKernel(DecompositionField, DecompositionField.Data,
-                Pulse.Position, Pulse.RadiusCm, Pulse.Amount * Settings->DecompositionPulseScale);
+                Pulse.Position, Pulse.RadiusCm, Pulse.Amount * Settings.DecompositionPulseScale);
         }
     }
 
+}
+
+void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings& Settings,
+    const EcoCarbon::FCO2Params& CO2)
+{
     // Reserva una sola vez: PendingSeeds.Num() es la cota superior de germinaciones.
     // Evita realojos de los 8 arrays SoA durante los Add() de abajo.
     Agents_Write.Reserve(Agents_Write.Num() + PendingSeeds.Num());
 
     const FBox2D WorldBounds = HeightField.GetWorldBounds();
-    const double MinSpacingSq = FMath::Square((double)Settings->MinGerminationSpacingCm);
+    const double MinSpacingSq = FMath::Square((double)Settings.MinGerminationSpacingCm);
     NewbornPositions.Reset();
 
     for (const FPendingSeed& Seed : PendingSeeds)
@@ -893,7 +952,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         // hueco que acaba de liberar. El booleano no depende del orden de visita ->
         // sigue siendo determinista.
         bool bTooClose = false;
-        Hash.ForEachNeighbor(GerminationPos, Settings->MinGerminationSpacingCm,
+        Hash.ForEachNeighbor(GerminationPos, Settings.MinGerminationSpacingCm,
             [&](int32 NeighborIdx)
             {
                 if (bTooClose) { return; }
@@ -925,14 +984,14 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
         if (bTooClose) { continue; }
 
         const float LightHere = LightCoarse.SampleLightSmooth(GerminationPos);
-        if (!EcologyRules::IsSafeGerminationSite(LightHere, Settings->MinLightForGermination))
+        if (!EcologyRules::IsSafeGerminationSite(LightHere, Settings.MinLightForGermination))
         {
             continue; // sitio no seguro: la semilla no prospera, se descarta
         }
 
         const float WHere = WaterPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
         const float NHere = NutrientPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
-        const float fL = EcologyRules::LightFactor(LightHere, Sp->ShadeTolerance, Settings->LightHalfSaturationMax);
+        const float fL = EcologyRules::LightFactor(LightHere, Sp->ShadeTolerance, Settings.LightHalfSaturationMax);
         const float fW = EcologyRules::DemandFactor(WHere, Sp->WaterDemand);
         const float fN = EcologyRules::DemandFactor(NHere, Sp->NutrientDemand);
         // Fase 6: la semilla cae al SUELO, o sea altura de copa 0: es donde el
@@ -944,41 +1003,20 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
             * EcoCarbon::CO2Factor(LightHere, /*CanopyHeightCm*/ 0.f, CO2);
 
         uint32 SeedRng = Seed.RngSeed;
-        const float pGerm = EcologyRules::GerminationProbability(VigorHere, Settings->GerminationRate);
+        const float pGerm = EcologyRules::GerminationProbability(VigorHere, Settings.GerminationRate);
         if (EcoRand::NextUnit(SeedRng) < pGerm)
         {
-            Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * kGerminationBiomassFraction);
+            Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * Settings.GerminationBiomassFraction);
             NewbornPositions.Add(GerminationPos);
         }
     }
 
-    // ================================================================
-    // PASO 4: compactar muertos e intercambiar buffers (agentes y campos).
-    // ================================================================
-    Agents_Write.CompactDead();
-
-    Swap(Agents_Read, Agents_Write);
-    WaterPool.SwapBuffers();
-    NutrientPool.SwapBuffers();
-
-    // Instrumentacion (Eco.Profile): media exponencial del coste de cada etapa.
-    // Es lo que el doc. 6.4 exige tener ANTES de decidir que se optimiza.
-    const double TickT1 = FPlatformTime::Seconds();
-    FEcoTickProfile::Accumulate(Profile.HashMs, (AfterHash - TickT0) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.LightMs, (AfterLight - AfterHash) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.ParallelMs, (AfterParallel - AfterLight) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.ReduceMs, (AfterReduce - AfterParallel) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.RegenMs, (AfterRegen - AfterReduce) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.GerminationMs, (TickT1 - AfterRegen) * 1000.0);
-    FEcoTickProfile::Accumulate(Profile.TotalMs, (TickT1 - TickT0) * 1000.0);
-
-    if ((TickCount % 20) == 0)
-    {
-        LogPopulationStats();
-    }
 }
+
 void UEcosystemSubsystem::RebuildCoarseLight()
 {
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+
     LightCoarse.ClearShadow();
     for (int32 i = 0; i < Agents_Read.Num(); ++i)
     {
@@ -989,8 +1027,8 @@ void UEcosystemSubsystem::RebuildCoarseLight()
         const float H = Agents_Read.Height[i];
         const FVector Apex = Agents_Read.Position[i] + FVector(0.f, 0.f, H);
         // Radio/profundidad de copa: aproximacion hasta que la Fase 3 aporte
-        // geometria real (ver constantes kCanopy* arriba).
-        LightCoarse.DepositCanopyShadow(Apex, H * kCanopyRadiusFraction, H, kCanopyShadowDensity);
+        // geometria real. Config (no literales): altera el resultado ecologico.
+        LightCoarse.DepositCanopyShadow(Apex, H * S->CanopyRadiusFraction, H, S->CanopyShadowDensity);
     }
 }
 const USpeciesData* UEcosystemSubsystem::ResolveSpecies(uint16 SpeciesId) const
@@ -1422,12 +1460,13 @@ void UEcosystemSubsystem::AddRandomDebugAgent()
     const double y = FMath::Lerp(B.Min.Y, B.Max.Y, (double)v);
     const float  z = HeightField.SampleHeight(x, y);
 
-    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    // ResolvedSpecies ya esta cargada y cacheada en OnWorldBeginPlay: no hay que
+    // volver a resolver el soft pointer aqui (era el unico sitio que lo hacia).
     const USpeciesData* Sp = nullptr;
-    if (S->Species.Num() > 0)
+    if (ResolvedSpecies.Num() > 0)
     {
-        const int32 Idx = Rng.RangeI(EEcoRngStream::Debug, 0, S->Species.Num() - 1);
-        Sp = S->Species[Idx].LoadSynchronous();
+        const int32 Idx = Rng.RangeI(EEcoRngStream::Debug, 0, ResolvedSpecies.Num() - 1);
+        Sp = ResolvedSpecies[Idx];
     }
 
     FColor Color;

@@ -56,7 +56,6 @@ struct PROCEDURALECOSYSTEM_API FTreeSkeleton
     TArray<FBranchNode> Nodes;
 
     int32 Num() const { return Nodes.Num(); }
-    bool IsValidIndex(int32 Index) const { return Nodes.IsValidIndex(Index); }
 
     /** Vacia el esqueleto sin liberar la capacidad reservada. */
     void Reset();
@@ -79,9 +78,18 @@ struct PROCEDURALECOSYSTEM_API FTreeSkeleton
     int32 AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir);
 
     /**
-     * Caja envolvente de todos los nodos (cm). Util para encuadrar el debug
-     * draw y para dimensionar la rejilla fina de luz. Devuelve una caja
-     * "vacia" (invalida) si el esqueleto no tiene nodos.
+     * Nº de hijos de cada nodo. UNICA copia de la pasada que necesitan tanto el
+     * mallador (nodos terminales = puntas con hoja) como los datos de viento
+     * (un nodo abre rama nueva si su padre bifurco). Deja OutChildCount con
+     * Num() elementos.
      */
-    FBox ComputeBounds() const;
+    void ComputeChildCounts(TArray<int32>& OutChildCount) const;
+
+    /**
+     * Longitud acumulada desde la raiz hasta cada nodo (cm), siguiendo la
+     * cadena de padres. Explota la invariante Parent < indice (una pasada, sin
+     * recursion). La comparten el mallador (UV.v de la corteza) y los datos de
+     * viento (posicion a lo largo del arbol para el peso de balanceo).
+     */
+    void ComputeAlongLengths(TArray<float>& OutAlongLen) const;
 };

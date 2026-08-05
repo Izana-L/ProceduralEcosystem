@@ -10,10 +10,13 @@ namespace
      *
      * Dos pasadas:
      *   1. Suma los pesos crudos de las celdas dentro del radio (kernel lineal:
-     *      1 en el centro, 0 en el borde).
+     *      1 en el centro, 0 en el borde) y los CACHEA en un buffer local.
      *   2. Reparte TotalAmount proporcional al peso NORMALIZADO por esa suma, de
      *      modo que lo depositado sume exactamente TotalAmount pase lo que pase
-     *      con el redondeo a celdas.
+     *      con el redondeo a celdas. Reutiliza los pesos de la pasada 1: el peso
+     *      lineal necesita la distancia real (un Sqrt por celda) y esto corre por
+     *      cada arbol, cada campo y cada tick dentro del ParallelFor caliente;
+     *      recomputarlo duplicaba todos esos Sqrt.
      *
      * Sink se invoca como Sink(int32 CellIndex, float Amount).
      */
@@ -32,7 +35,12 @@ namespace
         const int32 Cy = FMath::FloorToInt(Gy);
         const int32 CellRadius = FMath::CeilToInt(RadiusCm / Geometry.CellSize);
 
-        // --- Pasada 1: peso crudo de cada celda dentro del radio ---
+        // Pesos de las celdas visitadas, en orden de visita. Inline: el radio
+        // efectivo por defecto es ~1 celda (bloque 3x3); 64 cubre hasta 7x7 sin
+        // tocar el heap, y con radios mayores simplemente reserva.
+        TArray<float, TInlineAllocator<64>> Weights;
+
+        // --- Pasada 1: peso crudo de cada celda dentro del radio (cacheado) ---
         float WeightSum = 0.f;
         for (int32 dy = -CellRadius; dy <= CellRadius; ++dy)
         {
@@ -45,7 +53,9 @@ namespace
                 if (Ix < 0 || Ix >= Geometry.Width) continue;
 
                 const double CellDistCm = FVector2D(dx, dy).Size() * Geometry.CellSize;
-                WeightSum += FMath::Max(0.f, 1.f - static_cast<float>(CellDistCm / RadiusCm));
+                const float W = FMath::Max(0.f, 1.f - static_cast<float>(CellDistCm / RadiusCm));
+                Weights.Add(W);
+                WeightSum += W;
             }
         }
 
@@ -60,8 +70,11 @@ namespace
             return;
         }
 
-        // --- Pasada 2: repartir TotalAmount proporcional al peso normalizado ---
+        // --- Pasada 2: repartir TotalAmount con los pesos ya calculados ---
+        // Mismo recorrido (y por tanto mismo orden de emision, que sostiene el
+        // determinismo de la reduccion), sin recomputar ninguna distancia.
         const float InvWeightSum = 1.f / WeightSum;
+        int32 WeightIdx = 0;
         for (int32 dy = -CellRadius; dy <= CellRadius; ++dy)
         {
             const int32 Iy = Cy + dy;
@@ -72,8 +85,7 @@ namespace
                 const int32 Ix = Cx + dx;
                 if (Ix < 0 || Ix >= Geometry.Width) continue;
 
-                const double CellDistCm = FVector2D(dx, dy).Size() * Geometry.CellSize;
-                const float W = FMath::Max(0.f, 1.f - static_cast<float>(CellDistCm / RadiusCm));
+                const float W = Weights[WeightIdx++];
                 if (W <= 0.f) continue;
 
                 Sink(Iy * Geometry.Width + Ix, TotalAmount * (W * InvWeightSum));

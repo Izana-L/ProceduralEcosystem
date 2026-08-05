@@ -64,13 +64,6 @@ struct FTreeMeshBuffers
     }
 
     bool IsEmpty() const { return Vertices.Num() == 0 || Triangles.Num() == 0; }
-
-    /** true si los canales de la Fase 6 estan rellenos y alineados con Vertices. */
-    bool HasWindData() const
-    {
-        const int32 N = Vertices.Num();
-        return N > 0 && UV1.Num() == N && UV2.Num() == N && UV3.Num() == N;
-    }
 };
 
 /**

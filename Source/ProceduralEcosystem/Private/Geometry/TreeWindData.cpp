@@ -7,10 +7,11 @@
 
 namespace
 {
-    /** Valor estable en [0,1) a partir de un entero (mismo patron que TreeArchetype). */
+    /** Valor estable en [0,1) a partir de un entero (misma conversion compartida
+        que TreeArchetype: EcoRand::UnitFromBits). */
     FORCEINLINE float StableUnit(uint32 Value)
     {
-        return static_cast<float>(EcoRand::Hash32(Value) >> 8) * (1.f / 16777216.f);
+        return EcoRand::UnitFromBits(EcoRand::Hash32(Value));
     }
 
     /** Suelo del AO: por debajo de esto no se oscurece mas (evita negros planos). */
@@ -28,7 +29,6 @@ void FTreeWindData::Reset()
 {
     Nodes.Reset();
     BranchRoot.Reset();
-    TreeHeightCm = 0.f;
 }
 
 bool FTreeWindData::IsValidFor(const FTreeSkeleton& Skeleton) const
@@ -50,44 +50,36 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
     const FVector Base = Skeleton.Nodes[0].Pos;
 
     // -----------------------------------------------------------------------
-    // 1) Hijos por nodo. Hace falta ANTES de decidir donde empieza cada rama:
-    //    un nodo abre rama nueva si su padre bifurco (mas de un hijo).
+    // 1) Hijos por nodo y longitud acumulada: pasadas compartidas del esqueleto
+    //    (las mismas que usa el mallador; una sola implementacion). Los hijos
+    //    hacen falta ANTES de decidir donde empieza cada rama: un nodo abre
+    //    rama nueva si su padre bifurco (mas de un hijo).
     // -----------------------------------------------------------------------
     TArray<int32> ChildCount;
-    ChildCount.SetNumZeroed(N);
-    for (int32 i = 0; i < N; ++i)
-    {
-        const int32 P = Skeleton.Nodes[i].Parent;
-        if (P >= 0 && P < N)
-        {
-            ++ChildCount[P];
-        }
-    }
+    Skeleton.ComputeChildCounts(ChildCount);
+    TArray<float> AlongLen;
+    Skeleton.ComputeAlongLengths(AlongLen);
 
     // -----------------------------------------------------------------------
-    // 2) Ramas, niveles y longitud acumulada, en UNA pasada de indice creciente.
-    //    Funciona sin recursion ni ordenacion gracias a la invariante de
-    //    FTreeSkeleton: Parent < indice del hijo, siempre.
+    // 2) Ramas y niveles, en UNA pasada de indice creciente. Funciona sin
+    //    recursion ni ordenacion gracias a la invariante de FTreeSkeleton:
+    //    Parent < indice del hijo, siempre.
     // -----------------------------------------------------------------------
     BranchRoot.SetNumUninitialized(N);
     TArray<int32> Level;      Level.SetNumZeroed(N);
-    TArray<float> AlongLen;   AlongLen.SetNumZeroed(N);   // distancia recorrida desde la raiz
 
     BranchRoot[0] = 0;
     Level[0] = 0;
 
     int32 MaxLevel = 0;
     float MaxAlong = 0.f;
-    float MaxZ = 0.f;
 
     for (int32 i = 1; i < N; ++i)
     {
         const FBranchNode& Node = Skeleton.Nodes[i];
         const int32 P = FMath::Clamp(Node.Parent, 0, N - 1);
 
-        AlongLen[i] = AlongLen[P] + static_cast<float>(FVector::Dist(Node.Pos, Skeleton.Nodes[P].Pos));
         MaxAlong = FMath::Max(MaxAlong, AlongLen[i]);
-        MaxZ = FMath::Max(MaxZ, static_cast<float>(Node.Pos.Z - Base.Z));
 
         if (ChildCount[P] > 1)
         {
@@ -104,8 +96,6 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
         }
         MaxLevel = FMath::Max(MaxLevel, Level[i]);
     }
-
-    TreeHeightCm = MaxZ;
 
     // -----------------------------------------------------------------------
     // 3) Referencias para normalizar.

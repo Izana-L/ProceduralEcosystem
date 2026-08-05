@@ -100,8 +100,6 @@ public:
         const FTreeLibraryConfig& InConfig);
     void Shutdown();
 
-    bool IsInitialized() const { return Host != nullptr; }
-
     /**
      * Especie DERIVADA del arquetipo: duplicado transitorio de la especie base
      * con la morfologia escalada al bucket y con el jitter estable de la
@@ -128,9 +126,7 @@ public:
     /** Vacia todas las instancias de todos los componentes (las mallas se conservan). */
     void ClearAllInstances();
 
-    int32 GetNumBakedArchetypes() const { return Entries.Num(); }
-    int32 GetNumPendingBakes() const { return BakeQueue.Num(); }
-    int32 GetNumAgeBuckets() const { return Config.NumAgeBuckets; }
+    int32 GetNumPendingBakes() const { return BakeQueue.Num() - BakeQueueHead; }
 
     /** Recuento agregado para Eco.LOD.Stats. */
     void GetStats(int32& OutMeshes, int32& OutComponents, int32& OutInstances, int32& OutTriangles) const;
@@ -143,11 +139,12 @@ public:
      */
     void ApplyWindSettings(const FTreeLibraryConfig& InConfig);
 
-    const TMap<uint32, FTreeArchetypeEntry>& GetEntries() const { return Entries; }
-
 private:
     bool BakeArchetype(const FArchetypeKey& Key);
-    const USpeciesData* GetBaseSpecies(uint16 SpeciesId) const;
+    /** Devuelve no-const a proposito: GetArchetypeSpecies necesita duplicar el
+        asset (DuplicateObject) y asi se evita el const_cast en el punto de uso.
+        Los TObjectPtr del array ya son no-const. */
+    USpeciesData* GetBaseSpecies(uint16 SpeciesId) const;
 
     /** Aplica a un componente los ajustes de viento/bounds de la Fase 6. */
     void ConfigureWind(UHierarchicalInstancedStaticMeshComponent* Comp, bool bImpostor) const;
@@ -167,6 +164,10 @@ private:
 
     FTreeLibraryConfig Config;
 
+    /** Cola FIFO de horneados con CURSOR de lectura: extraer con RemoveAt(0)
+        desplazaba todos los elementos restantes en cada extraccion (drenar N
+        era O(N^2)). El cursor avanza y la cola se compacta solo al vaciarse. */
     TArray<uint32> BakeQueue;
+    int32          BakeQueueHead = 0;
     TSet<uint32>   BakeQueued;
 };

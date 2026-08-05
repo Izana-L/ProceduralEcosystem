@@ -55,6 +55,14 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0"))
     float HeightScaleCm = 30000.f; // amplitud vertical
 
+    /** Octavas del fBm del relieve: mas octavas = mas detalle fino. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "1", ClampMax = "12"))
+    int32 HeightfieldOctaves = 5;
+
+    /** Frecuencia base del ruido del relieve: mas baja = formas mas grandes. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0.0"))
+    double HeightfieldBaseFrequency = 0.0006;
+
     // --- Recursos: agua (Fase 1) ---
     /** Rango de salida del TWI. Debe casar con NutrientOutputMax para que el vigor
         (Monod) reciba agua y nutrientes en escalas comparables. */
@@ -166,6 +174,23 @@ public:
 
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float MinGerminationSpacingCm = 100.f;
+
+    // --- Forma de copa y germinacion (antes constantes en el .cpp del tick) ---
+    // Entran en el bucle de luz y en la germinacion, o sea alteran el resultado
+    // ecologico: deben ser parte de la configuracion reproducible del proyecto.
+    // Si algun dia varian por especie, muevelas a USpeciesData.
+
+    /** Radio de copa como fraccion de la altura del arbol (proxy hasta la geometria real). */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float CanopyRadiusFraction = 0.30f;
+
+    /** Opacidad de la copa al depositar sombra en el grid de luz [0,1]. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float CanopyShadowDensity = 0.80f;
+
+    /** Biomasa inicial de una plantula, como fraccion de MaxBiomass de su especie. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float GerminationBiomassFraction = 0.01f;
 
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "50"))
     float SpatialHashCellSizeCm = 500.f;
@@ -484,6 +509,13 @@ public:
         cizallamiento raro. */
     UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento")
     bool bWindOnImpostors = false;
+
+    /** Margen de la caja envolvente de los componentes con viento. El WPO mueve
+        vertices que el culling no ve; sin margen, un arbol al borde del encuadre
+        desaparece de golpe con las ramas todavia dentro. UNICA fuente de este
+        valor: lo leen los componentes de instancing Y los hero trees. */
+    UPROPERTY(EditAnywhere, config, Category = "Fase6|Viento", meta = (ClampMin = "1", ClampMax = "3"))
+    float WindBoundsScale = 1.15f;
 
     // ----------------------------------------------------------------
     // 6.2 MATERIALES

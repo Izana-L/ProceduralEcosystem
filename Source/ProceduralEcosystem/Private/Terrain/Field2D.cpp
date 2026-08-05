@@ -1,11 +1,16 @@
 #include "Terrain/Field2D.h"
+#include "Async/ParallelFor.h"
 
 void FField2D::Init(int32 InWidth, int32 InHeight, double InCellSize,
     const FVector2D& InOrigin, float InitialValue)
 {
     Width = FMath::Max(2, InWidth);
     Height = FMath::Max(2, InHeight);
-    CellSize = InCellSize;
+    // CellSize es divisor en WorldToGrid (y por tanto en todos los Sample*): un
+    // 0 llegado de config (el ClampMin del UPROPERTY es solo restriccion de UI)
+    // produciria NaN en todas las posiciones. Misma guarda que FSpatialHash,
+    // FAttractorCloud y FTreeLightGridFine.
+    CellSize = FMath::Max(InCellSize, static_cast<double>(KINDA_SMALL_NUMBER));
     Origin = InOrigin;
 
     // Fast path: si el valor inicial es 0, SetNumZeroed hace un memset en
@@ -56,4 +61,38 @@ FBox2D FField2D::GetWorldBounds() const
     const FVector2D Min = Origin;
     const FVector2D Max = Origin + FVector2D((Width - 1) * CellSize, (Height - 1) * CellSize);
     return FBox2D(Min, Max);
+}
+
+void FField2D::MinMax(const TArray<float>& Values, float& OutMin, float& OutMax)
+{
+    OutMin = TNumericLimits<float>::Max();
+    OutMax = -TNumericLimits<float>::Max();
+    for (const float V : Values)
+    {
+        OutMin = FMath::Min(OutMin, V);
+        OutMax = FMath::Max(OutMax, V);
+    }
+}
+
+void FField2D::FillNormalizedFrom(const TArray<float>& Raw, float OutputMax)
+{
+    if (!IsValid() || Raw.Num() != Data.Num())
+    {
+        return;
+    }
+
+    float RawMin, RawMax;
+    MinMax(Raw, RawMin, RawMax);
+    const float Range = FMath::Max(RawMax - RawMin, KINDA_SMALL_NUMBER);
+
+    const int32 W = Width;
+    ParallelFor(Height, [&](int32 y)
+        {
+            for (int32 x = 0; x < W; ++x)
+            {
+                const int32 i = y * W + x;
+                const float t = (Raw[i] - RawMin) / Range; // [0, 1]
+                Data[i] = t * OutputMax;
+            }
+        });
 }

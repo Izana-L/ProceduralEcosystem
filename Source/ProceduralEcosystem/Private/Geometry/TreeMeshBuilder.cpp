@@ -89,13 +89,18 @@ namespace TreeMeshBuilder
         FTreeWindData Wind;
         Wind.Build(Skeleton, Species, FineLight, /*Seed*/ RngState);
 
-        // --- Marcos de rotacion minima + longitud acumulada + n de hijos ---
+        // --- Longitud acumulada y n de hijos: pasadas compartidas del esqueleto
+        //     (las mismas que usa FTreeWindData; una sola implementacion) ---
+        TArray<float> AlongLen;
+        Skeleton.ComputeAlongLengths(AlongLen);   // longitud de rama para UV.v
+        TArray<int32> ChildCount;
+        Skeleton.ComputeChildCounts(ChildCount);  // terminales = puntas con hoja
+
+        // --- Marcos de rotacion minima ---
         // Se calculan en orden de indice (padre antes que hijo, por la invariante
         // de FTreeSkeleton), asi el marco del hijo deriva del del padre.
         TArray<FVector> FrameN; FrameN.SetNumUninitialized(N); // normal del anillo
         TArray<FVector> FrameB; FrameB.SetNumUninitialized(N); // binormal del anillo
-        TArray<float>   AlongLen; AlongLen.SetNumZeroed(N);    // longitud de rama para UV.v
-        TArray<int32>   ChildCount; ChildCount.SetNumZeroed(N);
 
         for (int32 i = 0; i < N; ++i)
         {
@@ -119,9 +124,6 @@ namespace TreeMeshBuilder
                 // Reortogonaliza contra T (elimina deriva numerica).
                 Np = (Np - FVector::DotProduct(Np, T) * T).GetSafeNormal(SMALL_NUMBER, AnyPerpendicular(T));
                 Nrm = Np;
-
-                AlongLen[i] = AlongLen[P] + FVector::Dist(Node.Pos, Skeleton.Nodes[P].Pos);
-                ChildCount[P] += 1;
             }
 
             FrameN[i] = Nrm;

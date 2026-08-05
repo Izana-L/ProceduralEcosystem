@@ -110,7 +110,11 @@ private:
 
     // Estado para Regenerate.
     TWeakObjectPtr<const USpeciesData> SpeciesPtr;
-    const FLightFieldCoarse* CoarseLightPtr = nullptr; // struct del subsistema (no reflejado)
+    /** true = el arbol se genero con contexto de luz gruesa del ecosistema.
+        NO se cachea el puntero al grid (struct propiedad del subsistema, no
+        reflejada): un actor cacheado que sobreviviera al subsistema lo
+        deferenciaria colgante. BuildNow() lo pide FRESCO al subsistema vivo. */
+    bool bUseCoarseLight = false;
     uint32 GenSeed = 0;
     FVector TrunkBaseWorld = FVector::ZeroVector;
 

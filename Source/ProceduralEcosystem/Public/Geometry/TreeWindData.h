@@ -116,9 +116,6 @@ struct PROCEDURALECOSYSTEM_API FTreeWindData
     /** Un elemento por nodo del esqueleto, en el mismo orden. */
     TArray<FTreeWindNode> Nodes;
 
-    /** Altura total del esqueleto sobre la base del tronco (cm). Informativo. */
-    float TreeHeightCm = 0.f;
-
     /** Indice de la rama a la que pertenece cada nodo (= indice del nodo que la
         inicia). Se expone porque el mallador lo usa para dar a cada leaf card el
         desfase de SU rama. */

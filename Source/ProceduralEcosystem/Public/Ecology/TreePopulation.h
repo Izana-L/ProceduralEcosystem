@@ -56,11 +56,6 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     /** Numero de arboles actualmente en el array (vivos + muertos sin compactar). */
     int32 Num() const { return Position.Num(); }
 
-    bool IsValidIndex(int32 Index) const { return Position.IsValidIndex(Index); }
-
-    /** Vacia todos los arrays sin liberar la capacidad reservada. */
-    void Reset();
-
     /** Reserva espacio en todos los arrays a la vez (evita realojos durante germinacion masiva). */
     void Reserve(int32 ExpectedNum);
 

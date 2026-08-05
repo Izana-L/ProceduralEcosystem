@@ -23,14 +23,10 @@ void FTreeLightGridFine::InitForBounds(const FBox& WorldBounds, float InVoxelSiz
     }
 
     const FVector Pad(FMath::Max(PaddingCm, 0.f));
-    const FVector Min = WorldBounds.Min - Pad;
-    const FVector Max = WorldBounds.Max + Pad;
-    const FVector Size = (Max - Min).ComponentMax(FVector(VoxelSizeCm)); // al menos 1 voxel por eje
+    const FBox Padded(WorldBounds.Min - Pad, WorldBounds.Max + Pad);
 
-    OriginWorld = Min;
-    Width = FMath::Clamp(FMath::CeilToInt32(Size.X / VoxelSizeCm), 1, MaxVoxelsPerAxis);
-    Height = FMath::Clamp(FMath::CeilToInt32(Size.Y / VoxelSizeCm), 1, MaxVoxelsPerAxis);
-    Layers = FMath::Clamp(FMath::CeilToInt32(Size.Z / VoxelSizeCm), 1, MaxVoxelsPerAxis);
+    OriginWorld = Padded.Min;
+    EcoGrid::DimensionsFromBounds(Padded, VoxelSizeCm, MaxVoxelsPerAxis, Width, Height, Layers);
 
     Shadow.Reset();
     Shadow.SetNumZeroed(Width * Height * Layers);
@@ -121,9 +117,9 @@ void FTreeLightGridFine::DepositLeafShadow(const FTreeSkeleton& Skeleton, float 
 
 void FTreeLightGridFine::WorldToVoxelClamped(const FVector& WorldPos, int32& OutIx, int32& OutIy, int32& OutIz) const
 {
-    OutIx = FMath::Clamp(FMath::FloorToInt32((WorldPos.X - OriginWorld.X) / VoxelSizeCm), 0, Width - 1);
-    OutIy = FMath::Clamp(FMath::FloorToInt32((WorldPos.Y - OriginWorld.Y) / VoxelSizeCm), 0, Height - 1);
-    OutIz = FMath::Clamp(FMath::FloorToInt32((WorldPos.Z - OriginWorld.Z) / VoxelSizeCm), 0, Layers - 1);
+    OutIx = EcoGrid::WorldToCellClamped(WorldPos.X, OriginWorld.X, VoxelSizeCm, Width);
+    OutIy = EcoGrid::WorldToCellClamped(WorldPos.Y, OriginWorld.Y, VoxelSizeCm, Height);
+    OutIz = EcoGrid::WorldToCellClamped(WorldPos.Z, OriginWorld.Z, VoxelSizeCm, Layers);
 }
 
 float FTreeLightGridFine::SampleShadowNearest(const FVector& WorldPos) const
@@ -166,13 +162,13 @@ float FTreeLightGridFine::SampleShadowTrilinear(const FVector& WorldPos) const
 float FTreeLightGridFine::SampleLight(const FVector& WorldPos) const
 {
     if (!IsValid()) { return FullSunlight; }
-    return FMath::Max(0.f, FullSunlight - SampleShadowNearest(WorldPos));
+    return EcoGrid::LightFromShadow(SampleShadowNearest(WorldPos), FullSunlight);
 }
 
 float FTreeLightGridFine::SampleLightSmooth(const FVector& WorldPos) const
 {
     if (!IsValid()) { return FullSunlight; }
-    return FMath::Max(0.f, FullSunlight - SampleShadowTrilinear(WorldPos));
+    return EcoGrid::LightFromShadow(SampleShadowTrilinear(WorldPos), FullSunlight);
 }
 
 bool FTreeLightGridFine::IsShaded(const FVector& WorldPos, float LightThreshold) const

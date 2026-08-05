@@ -283,16 +283,49 @@ void UTreeSoilSubsystem::QueueSnag(const FTreeDeathEvent& Death, const UEcosyste
         // Anillo lleno y nadie retirado todavia: reutiliza la instancia del tocon mas
         // viejo (no se borra ninguna instancia -> sin baile de indices de
         // RemoveInstances). Es un backstop de memoria, NO el mecanismo de retirada.
-        FSoilSnag& Old = Snags[SnagCursor];
-        Snag.InstanceIndex = Old.InstanceIndex;
-        Old = Snag;
-        if (Snag.InstanceIndex >= 0)
+        //
+        // OJO: solo puede reciclarse una ranura YA VOLCADA (InstanceIndex >= 0).
+        // Las anadidas ESTE MISMO tick siguen con InstanceIndex == -1 hasta
+        // FlushSpawns: si se sobrescribiera una de ellas, el indice que devuelva
+        // AddInstances se asignaria a datos ya pisados y la instancia horneada
+        // quedaria con el transform de un arbol y los datos logicos de otro
+        // (tocon descuadrado en mortandades masivas del tick de primer llenado).
+        int32 Slot = INDEX_NONE;
+        for (int32 Step = 0; Step < Cap; ++Step)
         {
+            const int32 Candidate = (SnagCursor + Step) % Cap;
+            if (Snags[Candidate].InstanceIndex >= 0)
+            {
+                Slot = Candidate;
+                SnagCursor = (Candidate + 1) % Cap;
+                break;
+            }
+        }
+
+        if (Slot != INDEX_NONE)
+        {
+            FSoilSnag& Old = Snags[Slot];
+            Snag.InstanceIndex = Old.InstanceIndex;
+            Old = Snag;
             WoodISM->UpdateInstanceTransform(Snag.InstanceIndex, SnagTransform(Snag),
                 /*bWorldSpace*/ false, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
-            bWoodDirty = true;
+            bWoodDirty = true; // una sola invalidacion, en FlushSpawns
         }
-        SnagCursor = (SnagCursor + 1) % Cap;
+        else
+        {
+            // Todas las ranuras son altas de este mismo tick sin volcar: se
+            // sustituye la mas vieja pendiente EN SITIO, incluida su transform
+            // encolada, para que FlushSpawns cree la instancia ya con los datos
+            // del tocon nuevo (InstanceIndex sigue en -1 y lo rellena el flush).
+            const int32 Reuse = SnagCursor;
+            Snags[Reuse] = Snag;
+            const int32 PendingIdx = PendingSnagSlots.Find(Reuse);
+            if (PendingIdx != INDEX_NONE && PendingSnagAdds.IsValidIndex(PendingIdx))
+            {
+                PendingSnagAdds[PendingIdx] = SnagTransform(Snag);
+            }
+            SnagCursor = (SnagCursor + 1) % Cap;
+        }
     }
 }
 

@@ -1,22 +1,11 @@
 #include "Geometry/HeroTreeActor.h"
 #include "Geometry/SpaceColonization.h"
+#include "Simulation/EcosystemSubsystem.h" // luz gruesa FRESCA en cada BuildNow
+#include "Config/EcosystemSettings.h"      // WindBoundsScale (fuente unica)
 #include "Species/SpeciesData.h"
 #include "ProceduralMeshComponent.h"
+#include "Engine/World.h"
 #include "DrawDebugHelpers.h"
-
-namespace
-{
-    /**
-     * Fase 6 (6.1): margen de la caja envolvente para el viento.
-     *
-     * El balanceo es un desplazamiento de vertices en el material (WPO): la malla
-     * "real" que el culling conoce no se entera de que las ramas se han movido.
-     * Sin margen, un arbol al borde del encuadre desaparece de golpe mientras sus
-     * ramas todavia deberian verse. Un 15% cubre de sobra el recorrido de un
-     * balanceo creible y cuesta cero (solo agranda un test de visibilidad).
-     */
-    constexpr float WindBoundsScale = 1.15f;
-}
 
 AHeroTreeActor::AHeroTreeActor()
 {
@@ -30,10 +19,6 @@ AHeroTreeActor::AHeroTreeActor()
 
     Mesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("TreeMesh"));
     SetRootComponent(Mesh);
-
-    // Fase 6: margen de bounds para que el viento (WPO) no provoque culling
-    // prematuro. Ver la nota de arriba.
-    Mesh->SetBoundsScale(WindBoundsScale);
 }
 
 void AHeroTreeActor::SetDrawDebug(bool bInDrawDebug)
@@ -58,7 +43,9 @@ void AHeroTreeActor::Generate(const USpeciesData* InSpecies, uint32 Seed,
 
     SpeciesPtr = InSpecies;
     GenSeed = Seed;
-    CoarseLightPtr = CoarseLight;
+    // Solo se recuerda SI hay contexto de luz; el puntero al grid se pide fresco
+    // al subsistema en cada BuildNow (ver nota en el .h).
+    bUseCoarseLight = (CoarseLight != nullptr);
     TrunkBaseWorld = WorldTrunkBase;
     SetActorLocation(WorldTrunkBase);
 
@@ -81,7 +68,7 @@ void AHeroTreeActor::Regenerate()
         // cambiar la semilla en el editor surte efecto).
         SpeciesPtr = DebugSpecies;
         GenSeed = (uint32)DebugSeed;
-        CoarseLightPtr = nullptr;
+        bUseCoarseLight = false;
         TrunkBaseWorld = GetActorLocation();
 
         BuildNow();
@@ -98,13 +85,33 @@ void AHeroTreeActor::BuildNow()
         return;
     }
 
+    // Fase 6 (6.1): margen de bounds para que el viento (WPO) no provoque
+    // culling prematuro. MISMA fuente (settings) que los componentes de
+    // instancing, para que hero e instancia lleven identico margen.
+    Mesh->SetBoundsScale(FMath::Max(1.f, UEcosystemSettings::Get()->WindBoundsScale));
+
     uint32 Rng = GenSeed; // stream local: la misma semilla da el mismo arbol
 
     FSpaceColonizationConfig Config;
     Config.bEnableSelfPruning = bEnableSelfPruning;
     Config.bEnablePhototropism = bEnablePhototropism;
 
-    SpaceColonization::GrowTree(*Sp, Rng, TrunkBaseWorld, CoarseLightPtr, Config,
+    // Luz gruesa FRESCA del subsistema vivo (nunca un puntero cacheado de otro
+    // frame: el dueño del grid es el subsistema y este actor puede sobrevivirle
+    // en la cache LRU del gestor de LOD).
+    const FLightFieldCoarse* CoarseLight = nullptr;
+    if (bUseCoarseLight)
+    {
+        if (UWorld* World = GetWorld())
+        {
+            if (const UEcosystemSubsystem* Eco = World->GetSubsystem<UEcosystemSubsystem>())
+            {
+                CoarseLight = &Eco->GetLightCoarse();
+            }
+        }
+    }
+
+    SpaceColonization::GrowTree(*Sp, Rng, TrunkBaseWorld, CoarseLight, Config,
         Skeleton, FineLight, Attractors);
 
     // Fase 6 (6.2): se le pasa al mallador la rejilla de luz FINA que acaba de

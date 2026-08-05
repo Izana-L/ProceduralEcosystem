@@ -44,12 +44,29 @@ int32 FTreeSkeleton::AddChild(int32 ParentIndex, const FVector& Pos, const FVect
     return Nodes.Add(Child);
 }
 
-FBox FTreeSkeleton::ComputeBounds() const
+void FTreeSkeleton::ComputeChildCounts(TArray<int32>& OutChildCount) const
 {
-    FBox Bounds(ForceInit); // caja invalida hasta el primer punto
-    for (const FBranchNode& N : Nodes)
+    const int32 N = Nodes.Num();
+    OutChildCount.Reset();
+    OutChildCount.SetNumZeroed(N);
+    for (int32 i = 0; i < N; ++i)
     {
-        Bounds += N.Pos;
+        const int32 P = Nodes[i].Parent;
+        if (P >= 0 && P < N)
+        {
+            ++OutChildCount[P];
+        }
     }
-    return Bounds;
+}
+
+void FTreeSkeleton::ComputeAlongLengths(TArray<float>& OutAlongLen) const
+{
+    const int32 N = Nodes.Num();
+    OutAlongLen.Reset();
+    OutAlongLen.SetNumZeroed(N);
+    for (int32 i = 1; i < N; ++i)
+    {
+        const int32 P = FMath::Clamp(Nodes[i].Parent, 0, N - 1);
+        OutAlongLen[i] = OutAlongLen[P] + static_cast<float>(FVector::Dist(Nodes[i].Pos, Nodes[P].Pos));
+    }
 }

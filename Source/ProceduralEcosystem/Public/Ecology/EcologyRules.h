@@ -27,18 +27,20 @@ namespace EcologyRules
      * fW y fN comparten la misma forma matematica (Michaelis-Menten /
      * Monod): Available/Demand normaliza el recurso a "veces la necesidad
      * de la especie", y la curva x/(x+1) satura suavemente hacia 1 sin
-     * necesitar un tope duro.
+     * necesitar un tope duro. Delega en EcoVigor (igual que LightFactor):
+     * una sola copia de la formula garantiza que el heatmap de idoneidad y
+     * el tick usen EXACTAMENTE el mismo numero.
      */
     FORCEINLINE float DemandFactor(float Available, float Demand)
     {
-        const float Ratio = Available / FMath::Max(Demand, KINDA_SMALL_NUMBER);
-        return Ratio / (Ratio + 1.f);
+        return EcoVigor::MonodFactor(Available, Demand);
     }
 
-    /** Ley del minimo de Liebig: el recurso mas escaso limita el crecimiento. */
+    /** Ley del minimo de Liebig: el recurso mas escaso limita el crecimiento.
+        Delega en EcoVigor::Combine (unica copia, mismo motivo que arriba). */
     FORCEINLINE float Vigor(float LightFactorValue, float WaterFactorValue, float NutrientFactorValue)
     {
-        return FMath::Min3(LightFactorValue, WaterFactorValue, NutrientFactorValue);
+        return EcoVigor::Combine(LightFactorValue, WaterFactorValue, NutrientFactorValue);
     }
 
     /**
@@ -55,17 +57,27 @@ namespace EcologyRules
     }
 
     /**
-     * Altura visual a partir de la biomasa. Escalado alometrico simple:
-     * H = MaxHeight * (B/MaxBiomass)^(1/3). La raiz cubica viene de asumir
-     * que la biomasa escala aprox. con el volumen del arbol (~ largo^3): es
-     * una aproximacion deliberadamente burda para la Fase 2 (solo alimenta
-     * el grid de luz y el tamano de las esferas de debug); el Pipe Model de
-     * la Fase 3 la sustituira por geometria real.
+     * Fraccion de altura adulta en [0,1]: raiz cubica de la biomasa normalizada
+     * (la biomasa escala aprox. con el volumen, ~largo^3). UNICA copia de la
+     * alometria: la usan HeightFromBiomass (tick / grid de luz) y
+     * TreeArchetype::HeightRatio (buckets de LOD). Si divergieran, un arbol se
+     * "veria" de un tamano y sombrearia como otro.
+     */
+    FORCEINLINE float HeightRatioFromBiomass(float Biomass, float MaxBiomass)
+    {
+        const float Ratio = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
+        return FMath::Pow(Ratio, 1.f / 3.f);
+    }
+
+    /**
+     * Altura visual a partir de la biomasa: H = MaxHeight * ratio^(1/3). Es una
+     * aproximacion deliberadamente burda para la Fase 2 (solo alimenta el grid
+     * de luz y el tamano de las esferas de debug); el Pipe Model de la Fase 3
+     * la sustituye por geometria real.
      */
     FORCEINLINE float HeightFromBiomass(float Biomass, float MaxBiomass, float MaxHeightCm)
     {
-        const float Ratio = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
-        return MaxHeightCm * FMath::Pow(Ratio, 1.f / 3.f);
+        return MaxHeightCm * HeightRatioFromBiomass(Biomass, MaxBiomass);
     }
 
     /**
@@ -96,7 +108,10 @@ namespace EcologyRules
         float StressMortalityWeight, float DtYears)
     {
         const float AgeRatio = Age / FMath::Max(Longevity, KINDA_SMALL_NUMBER);
-        const float pAge = DtYears * FMath::Pow(AgeRatio, 4.f);
+        // Potencia entera con multiplicaciones: FMath::Pow(x, 4.f) usa exp/log
+        // y esto se ejecuta por CADA arbol vivo en CADA tick.
+        const float AgeRatio2 = AgeRatio * AgeRatio;
+        const float pAge = DtYears * AgeRatio2 * AgeRatio2;
         const float pStress = DtYears * Stress * StressMortalityWeight;
         return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
     }

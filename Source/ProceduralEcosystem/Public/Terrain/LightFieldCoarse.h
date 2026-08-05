@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Core/GridMath.h"
 
 /**
  * Grid de luz GRUESO a escala de paisaje (varios metros/voxel): sombreado
@@ -61,8 +62,8 @@ struct PROCEDURALECOSYSTEM_API FLightFieldCoarse
     /** Cota de terreno (cm) del centro de cada columna. Vacio = rejilla absoluta. */
     TArray<float> GroundZ;
 
-    /** C: luz plena normalizada (cielo despejado). */
-    static constexpr float FullSunlight = 1.f;
+    /** C: luz plena normalizada (cielo despejado). Compartida con el grid fino. */
+    static constexpr float FullSunlight = EcoGrid::FullSunlight;
 
     bool IsValid() const
     {
@@ -126,14 +127,14 @@ struct PROCEDURALECOSYSTEM_API FLightFieldCoarse
 private:
     FORCEINLINE int32 IndexOf(int32 Ix, int32 Iy, int32 Iz) const
     {
-        return (Iz * Height + Iy) * Width + Ix;
+        return EcoGrid::VoxelIndex(Ix, Iy, Iz, Width, Height);
     }
 
     /** Columna de mundo -> indice (Ix,Iy) con clamp a los bordes. */
     FORCEINLINE void WorldToColumnClamped(double Xcm, double Ycm, int32& OutIx, int32& OutIy) const
     {
-        OutIx = FMath::Clamp(FMath::FloorToInt32((Xcm - Origin.X) / CellSizeXY), 0, Width - 1);
-        OutIy = FMath::Clamp(FMath::FloorToInt32((Ycm - Origin.Y) / CellSizeXY), 0, Height - 1);
+        OutIx = EcoGrid::WorldToCellClamped(Xcm, Origin.X, CellSizeXY, Width);
+        OutIy = EcoGrid::WorldToCellClamped(Ycm, Origin.Y, CellSizeXY, Height);
     }
 
     /** Mundo -> indice de voxel, con clamp a los bordes de la rejilla. */

@@ -37,11 +37,12 @@ void UTreeLibrary::Shutdown()
     Entries.Reset();
     ArchetypeSpecies.Reset();
     BakeQueue.Reset();
+    BakeQueueHead = 0;
     BakeQueued.Reset();
     Host = nullptr;
 }
 
-const USpeciesData* UTreeLibrary::GetBaseSpecies(uint16 SpeciesId) const
+USpeciesData* UTreeLibrary::GetBaseSpecies(uint16 SpeciesId) const
 {
     return BaseSpecies.IsValidIndex(SpeciesId) ? BaseSpecies[SpeciesId].Get() : nullptr;
 }
@@ -56,13 +57,13 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
         return Found->Get();
     }
 
-    const USpeciesData* Base = GetBaseSpecies(Key.Species);
+    USpeciesData* Base = GetBaseSpecies(Key.Species);
     if (!Base)
     {
         return nullptr;
     }
 
-    USpeciesData* Sp = DuplicateObject<USpeciesData>(const_cast<USpeciesData*>(Base), this);
+    USpeciesData* Sp = DuplicateObject<USpeciesData>(Base, this);
     if (!Sp)
     {
         return nullptr;
@@ -158,17 +159,25 @@ FTreeArchetypeEntry* UTreeLibrary::FindOrRequestBake(const FArchetypeKey& Key)
 
 int32 UTreeLibrary::ProcessBakeQueue(int32 MaxThisFrame)
 {
+    // FIFO con cursor de lectura: avanzar BakeQueueHead evita el RemoveAt(0)
+    // que desplazaba todos los elementos restantes en cada extraccion.
     int32 Done = 0;
-    while (BakeQueue.Num() > 0 && Done < FMath::Max(1, MaxThisFrame))
+    while (BakeQueueHead < BakeQueue.Num() && Done < FMath::Max(1, MaxThisFrame))
     {
-        const uint32 Packed = BakeQueue[0];
-        BakeQueue.RemoveAt(0, 1, EAllowShrinking::No);
+        const uint32 Packed = BakeQueue[BakeQueueHead++];
         BakeQueued.Remove(Packed);
 
         if (BakeArchetype(FArchetypeKey::Unpack(Packed)))
         {
             ++Done;
         }
+    }
+
+    // Cola drenada: compactar de una vez (conserva la capacidad).
+    if (BakeQueueHead >= BakeQueue.Num())
+    {
+        BakeQueue.Reset();
+        BakeQueueHead = 0;
     }
     return Done;
 }
@@ -199,6 +208,7 @@ int32 UTreeLibrary::BakeAll()
     }
 
     BakeQueue.Reset();
+    BakeQueueHead = 0;
     BakeQueued.Reset();
 
     UE_LOG(LogEcoLOD, Log, TEXT("[Eco/LOD] Libreria horneada: %d arquetipos en %.0f ms."),

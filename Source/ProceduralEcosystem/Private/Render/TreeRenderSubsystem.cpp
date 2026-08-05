@@ -147,7 +147,7 @@ static void FillWindConfig(const UEcosystemSettings& S, FTreeLibraryConfig& Cfg)
     Cfg.bWindOnInstances = bWind;
     Cfg.bWindOnImpostors = bWind && S.bWindOnImpostors;
     Cfg.WindWpoCutoffCm = S.WindWpoCutoffCm;
-    Cfg.WindBoundsScale = 1.15f;
+    Cfg.WindBoundsScale = S.WindBoundsScale; // misma fuente que los hero trees
 }
 
 /**
@@ -512,21 +512,22 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
 
     for (int32 i = 0; i < PopNum; ++i)
     {
-        const double D2d = FVector::DistSquared(Pop.Position[i], ViewLocation);
-        const float  D2 = static_cast<float>(D2d);
+        // En double de principio a fin: las posiciones de mundo de UE5 son
+        // double y a estas distancias (^2 ~ 1e10) el float pierde precision.
+        const double D2 = FVector::DistSquared(Pop.Position[i], ViewLocation);
         DistSqCache[i] = D2;
 
-        if (HeroBudget == 0 || Pop.State[i] == ETreeState::Dead || D2d >= HeroR2) { continue; }
+        if (HeroBudget == 0 || Pop.State[i] == ETreeState::Dead || D2 >= HeroR2) { continue; }
         if (HeroBest.Num() == HeroBudget && D2 >= HeroBest.Last().Key) { continue; } // no entra
 
         int32 Insert = HeroBest.Num();
         while (Insert > 0 && HeroBest[Insert - 1].Key > D2) { --Insert; }
-        HeroBest.Insert(TPair<float, int32>(D2, i), Insert);
+        HeroBest.Insert(TPair<double, int32>(D2, i), Insert);
         if (HeroBest.Num() > HeroBudget) { HeroBest.Pop(EAllowShrinking::No); }
     }
 
     HeroSet.Reset();
-    for (const TPair<float, int32>& Cand : HeroBest)
+    for (const TPair<double, int32>& Cand : HeroBest)
     {
         HeroSet.Add(Pop.StableId[Cand.Value]);
     }
@@ -992,11 +993,16 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
     SCOPE_CYCLE_COUNTER(STAT_EcoHeroGen);
     TRACE_CPUPROFILER_EVENT_SCOPE(Eco_ProcessHeroQueue);
 
+    // Se consume por la cabeza con un contador y se compacta con UN solo
+    // RemoveAt al final: el RemoveAt(0) por elemento desplazaba todo el resto
+    // de la cola en cada extraccion. (Nada dentro del bucle re-encola ni borra
+    // de HeroQueue: las altas las hace UpdateLOD y ReleaseHero solo se alcanza
+    // desde LeaveTier de un arbol cuyo nivel actual no es Hero.)
     int32 Done = 0;
-    while (HeroQueue.Num() > 0 && Done < FMath::Max(1, MaxThisFrame))
+    int32 Consumed = 0;
+    while (Consumed < HeroQueue.Num() && Done < FMath::Max(1, MaxThisFrame))
     {
-        const uint32 StableId = HeroQueue[0];
-        HeroQueue.RemoveAt(0, 1, EAllowShrinking::No);
+        const uint32 StableId = HeroQueue[Consumed++];
 
         FPendingHero Info;
         if (!HeroInfo.RemoveAndCopyValue(StableId, Info))
@@ -1070,6 +1076,11 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         CommitHeroTier(StableId, *State, Info);  // la malla ya esta: suelta la anterior
 
         ++Done;
+    }
+
+    if (Consumed > 0)
+    {
+        HeroQueue.RemoveAt(0, Consumed, EAllowShrinking::No); // un solo desplazamiento
     }
 
     // Las bajas que acaba de encolar CommitHeroTier se aplican YA. Si esperasen al

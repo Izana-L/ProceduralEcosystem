@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Core/GridMath.h"
 
 struct FLightFieldCoarse; // Terrain/LightFieldCoarse.h (se incluye en el .cpp)
 struct FTreeSkeleton;      // Geometry/TreeSkeleton.h    (se incluye en el .cpp)
@@ -43,8 +44,9 @@ struct PROCEDURALECOSYSTEM_API FTreeLightGridFine
     /** Sombra por voxel, tamano Width*Height*Layers. 0 = sin sombra. */
     TArray<float> Shadow;
 
-    /** C: luz plena normalizada (cielo despejado), igual que FLightFieldCoarse. */
-    static constexpr float FullSunlight = 1.f;
+    /** C: luz plena normalizada (cielo despejado), igual que FLightFieldCoarse
+        (ambos leen la misma constante compartida de EcoGrid). */
+    static constexpr float FullSunlight = EcoGrid::FullSunlight;
 
     bool IsValid() const
     {
@@ -55,8 +57,8 @@ struct PROCEDURALECOSYSTEM_API FTreeLightGridFine
 
     /**
      * Dimensiona la rejilla para cubrir WorldBounds (p.ej. la envolvente de la
-     * copa o FTreeSkeleton::ComputeBounds) con voxels de InVoxelSizeCm, mas un
-     * margen PaddingCm por cada lado. Deja la sombra a 0.
+     * copa que construye SpaceColonization::GrowTree) con voxels de
+     * InVoxelSizeCm, mas un margen PaddingCm por cada lado. Deja la sombra a 0.
      */
     void InitForBounds(const FBox& WorldBounds, float InVoxelSizeCm, float PaddingCm = 0.f);
 
@@ -107,7 +109,7 @@ struct PROCEDURALECOSYSTEM_API FTreeLightGridFine
 private:
     FORCEINLINE int32 IndexOf(int32 Ix, int32 Iy, int32 Iz) const
     {
-        return (Iz * Height + Iy) * Width + Ix;
+        return EcoGrid::VoxelIndex(Ix, Iy, Iz, Width, Height);
     }
 
     /** Centro de mundo (cm) del voxel (ix,iy,iz). */

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Math/Box2D.h"
+#include "Core/GridMath.h"
 
 /**
  * Spatial hash grid 2D sobre las posiciones de los agentes-arbol (doc. Fase 2, 2.3).
@@ -65,8 +66,8 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
     /** Celda (cx,cy) -> indice lineal, con clamp a los bordes del grid. */
     FORCEINLINE int32 CellOf(const FVector& P) const
     {
-        const int32 Cx = FMath::Clamp(FMath::FloorToInt32((P.X - Origin.X) / CellSize), 0, GridW - 1);
-        const int32 Cy = FMath::Clamp(FMath::FloorToInt32((P.Y - Origin.Y) / CellSize), 0, GridH - 1);
+        const int32 Cx = EcoGrid::WorldToCellClamped(P.X, Origin.X, CellSize, GridW);
+        const int32 Cy = EcoGrid::WorldToCellClamped(P.Y, Origin.Y, CellSize, GridH);
         return Cy * GridW + Cx;
     }
 
@@ -93,8 +94,8 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
             return;
         }
 
-        const int32 Cx = FMath::Clamp(FMath::FloorToInt32((P.X - Origin.X) / CellSize), 0, GridW - 1);
-        const int32 Cy = FMath::Clamp(FMath::FloorToInt32((P.Y - Origin.Y) / CellSize), 0, GridH - 1);
+        const int32 Cx = EcoGrid::WorldToCellClamped(P.X, Origin.X, CellSize, GridW);
+        const int32 Cy = EcoGrid::WorldToCellClamped(P.Y, Origin.Y, CellSize, GridH);
         const int32 R = FMath::CeilToInt32(Radius / CellSize);
 
         for (int32 Dy = -R; Dy <= R; ++Dy)

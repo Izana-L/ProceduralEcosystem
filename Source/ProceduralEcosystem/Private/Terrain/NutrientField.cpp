@@ -1,4 +1,5 @@
 #include "Terrain/NutrientField.h"
+#include "Terrain/EcoNoise.h"
 #include "Core/EcoCore.h"
 #include "Async/ParallelFor.h"
 
@@ -26,44 +27,12 @@ void FNutrientField::GeneratePatchyBase(int32 Width, int32 Height, double CellSi
         {
             for (int32 x = 0; x < W; ++x)
             {
-                double freq = PatchFrequency;
-                double amp = 1.0;
-                double sum = 0.0;
-                double norm = 0.0;
-
-                for (int32 o = 0; o < Octaves; ++o)
-                {
-                    const FVector2D P(OffX + x * CellSize * freq, OffY + y * CellSize * freq);
-                    sum += amp * FMath::PerlinNoise2D(P); // [-0.707, 0.707]
-                    norm += amp;
-                    amp *= 0.5;
-                    freq *= 2.0;
-                }
-
-                Raw[y * W + x] = static_cast<float>(sum / FMath::Max(norm, KINDA_SMALL_NUMBER));
+                Raw[y * W + x] = EcoNoise::FractalPerlin(x, y, CellSize, OffX, OffY, PatchFrequency, Octaves);
             }
         });
 
-    // 2) min/max real (barrido serial O(N)).
-    float RawMin = TNumericLimits<float>::Max();
-    float RawMax = -TNumericLimits<float>::Max();
-    for (const float V : Raw)
-    {
-        RawMin = FMath::Min(RawMin, V);
-        RawMax = FMath::Max(RawMax, V);
-    }
-
-    // 3) Normalizacion a [0, OutputMax]: mismo criterio que el agua, para que
+    // 2) Normalizacion a [0, OutputMax]: mismo criterio que el agua, para que
     //    ambos campos entren en la formula de vigor (Monod, Fase 2) con rangos
     //    comparables sin reescalar ahi.
-    const float Range = FMath::Max(RawMax - RawMin, KINDA_SMALL_NUMBER);
-    ParallelFor(Ht, [&](int32 y)
-        {
-            for (int32 x = 0; x < W; ++x)
-            {
-                const int32 i = y * W + x;
-                const float t = (Raw[i] - RawMin) / Range; // [0, 1]
-                Field.Data[i] = t * OutputMax;
-            }
-        });
+    Field.FillNormalizedFrom(Raw, OutputMax);
 }
