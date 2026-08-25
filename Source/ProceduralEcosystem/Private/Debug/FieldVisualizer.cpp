@@ -1,8 +1,7 @@
 #include "Debug/FieldVisualizer.h"
-#include "Terrain/Field2D.h" // FField2D::MinMax (helper compartido)
+#include "Terrain/Field2D.h" 
 #include "Engine/Texture2D.h"
-// Si tu versión no encuentra FUpdateTextureRegion2D con estos includes,
-// añade #include "RHI.h".
+
 
 void UFieldVisualizer::Initialize(int32 InWidth, int32 InHeight)
 {
@@ -17,7 +16,7 @@ void UFieldVisualizer::Initialize(int32 InWidth, int32 InHeight)
         DynamicTexture->Filter = TF_Bilinear;
         DynamicTexture->AddressX = TA_Clamp;
         DynamicTexture->AddressY = TA_Clamp;
-        DynamicTexture->NeverStream = true; // textura dinámica: no queremos streaming
+        DynamicTexture->NeverStream = true; 
 #if WITH_EDITORONLY_DATA
         DynamicTexture->MipGenSettings = TMGS_NoMipmaps;
 #endif
@@ -42,8 +41,7 @@ FColor UFieldVisualizer::Ramp(float T)
         const float k = (T - 0.5f) / 0.5f;
         C = FMath::Lerp(FLinearColor(0.10f, 0.70f, 0.20f), FLinearColor(0.85f, 0.15f, 0.10f), k);
     }
-    // ToFColor(true): codifica a sRGB en 8 bits; con la textura marcada SRGB=true
-    // el sampler la vuelve a linealizar al leerla -> el color se conserva.
+  
     return C.ToFColor(true);
 }
 
@@ -66,7 +64,7 @@ void UFieldVisualizer::UpdateFromField(const TArray<float>& Field)
     if (Field.Num() != Width * Height) { return; }
 
     float MinV, MaxV;
-    FField2D::MinMax(Field, MinV, MaxV); // helper unico (mismo barrido que los campos)
+    FField2D::MinMax(Field, MinV, MaxV); 
 
     UpdateFromField(Field, MinV, MaxV);
 }
@@ -77,23 +75,20 @@ void UFieldVisualizer::UploadPixels()
 
     const int32 NumBytes = Width * Height * static_cast<int32>(sizeof(FColor));
 
-    // Copia efímera: UpdateTextureRegions lee la fuente de forma ASÍNCRONA en el
-    // render thread, así que no podemos pasarle 'Pixels' directamente (se
-    // sobrescribiría en la siguiente actualización). Ambos punteros (búfer y
-    // región) se liberan en el callback, ya en el render thread.
+    
     FColor* Buffer = static_cast<FColor*>(FMemory::Malloc(NumBytes));
     FMemory::Memcpy(Buffer, Pixels.GetData(), NumBytes);
 
-    FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(
-        /*DestX*/ 0, /*DestY*/ 0, /*SrcX*/ 0, /*SrcY*/ 0,
-        /*Width*/ Width, /*Height*/ Height);
+    FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(0,0,0,0,Width, Height);
+         
+         
 
     DynamicTexture->UpdateTextureRegions(
-        /*MipIndex*/ 0,
-        /*NumRegions*/ 1,
+         0,
+        1,
         Region,
-        /*SrcPitch*/ static_cast<uint32>(Width * sizeof(FColor)),
-        /*SrcBpp*/   static_cast<uint32>(sizeof(FColor)),
+         static_cast<uint32>(Width * sizeof(FColor)),
+         static_cast<uint32>(sizeof(FColor)),
         reinterpret_cast<uint8*>(Buffer),
         [](uint8* SrcData, const FUpdateTextureRegion2D* Regions)
         {

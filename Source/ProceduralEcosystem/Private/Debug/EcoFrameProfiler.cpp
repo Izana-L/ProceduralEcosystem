@@ -31,16 +31,15 @@ static UEcoFrameProfiler* GetProfiler(UWorld* World)
 // ---------------------------------------------------------------------------
 //  Comandos de consola
 // ---------------------------------------------------------------------------
-static FAutoConsoleCommandWithWorld GEcoFrame(TEXT("Eco.Frame"),
-    TEXT("Reparto del frame frente al presupuesto (doc. 6.4): ms medio/p95/max, fps y coste del ecosistema."),
+static FAutoConsoleCommandWithWorld GEcoFrame(TEXT("Eco.Frame"),TEXT("Reparto del frame frente al presupuesto (doc. 6.4): ms medio/p95/max, fps y coste del ecosistema."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcoFrameProfiler* P = GetProfiler(W)) P->LogFrameBudget(); }));
+    
 
-static FAutoConsoleCommandWithWorld GEcoFrameReset(TEXT("Eco.Frame.Reset"),
-    TEXT("Reinicia la ventana de estadisticas de frame (tras cambiar ajustes)."),
+static FAutoConsoleCommandWithWorld GEcoFrameReset(TEXT("Eco.Frame.Reset"),TEXT("Reinicia la ventana de estadisticas de frame (tras cambiar ajustes)."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcoFrameProfiler* P = GetProfiler(W)) P->ResetWindow(); }));
+    
 
-static FAutoConsoleCommandWithWorldAndArgs GEcoFrameHUD(TEXT("Eco.Frame.HUD"),
-    TEXT("Muestra (1) u oculta (0) el reparto del frame en pantalla. Uso: Eco.Frame.HUD [0|1]"),
+static FAutoConsoleCommandWithWorldAndArgs GEcoFrameHUD(TEXT("Eco.Frame.HUD"),TEXT("Muestra (1) u oculta (0) el reparto del frame en pantalla. Uso: Eco.Frame.HUD [0|1]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* W)
         {
@@ -51,8 +50,7 @@ static FAutoConsoleCommandWithWorldAndArgs GEcoFrameHUD(TEXT("Eco.Frame.HUD"),
         }));
 
 static FAutoConsoleCommandWithWorldAndArgs GEcoFrameCapture(TEXT("Eco.Frame.Capture"),
-    TEXT("Graba una fila por frame durante N segundos y escribe Saved/EcoProfile/<nombre>.csv. "
-        "Uso: Eco.Frame.Capture [segundos=10] [nombre=captura]"),
+    TEXT("Graba una fila por frame durante N segundos y escribe Saved/EcoProfile/<nombre>.csv. " "Uso: Eco.Frame.Capture [segundos=10] [nombre=captura]"),
     FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
         [](const TArray<FString>& Args, UWorld* W)
         {
@@ -93,23 +91,16 @@ TStatId UEcoFrameProfiler::GetStatId() const
 
 bool UEcoFrameProfiler::EnsureInitialized()
 {
-    if (bInitialized)
-    {
-        return true;
-    }
-
+    if (bInitialized){ return true; }
+  
     UWorld* World = GetWorld();
-    if (!World)
-    {
-        return false;
-    }
+
+    if (!World){ return false; }  
 
     Eco = World->GetSubsystem<UEcosystemSubsystem>();
     Render = World->GetSubsystem<UTreeRenderSubsystem>();
-    if (!Eco)
-    {
-        return false;
-    }
+
+    if (!Eco){ return false; }
 
     Window.SetNumZeroed(kFrameWindow);
     WindowCursor = 0;
@@ -132,10 +123,7 @@ void UEcoFrameProfiler::ResetWindow()
 // ---------------------------------------------------------------------------
 void UEcoFrameProfiler::Tick(float DeltaTime)
 {
-    if (!EnsureInitialized() || DeltaTime <= 0.f)
-    {
-        return;
-    }
+    if (!EnsureInitialized() || DeltaTime <= 0.f){ return; }
 
     const float FrameMs = DeltaTime * 1000.f;
 
@@ -151,7 +139,7 @@ void UEcoFrameProfiler::Tick(float DeltaTime)
     CSV_CUSTOM_STAT(Eco, Population, PopNow, ECsvCustomStatOp::Set);
     CSV_CUSTOM_STAT(Eco, FrameMs, FrameMs, ECsvCustomStatOp::Set);
 
-    // --- Captura propia a CSV (curvas de la Fase 7) ---
+    // --- Captura propia a CSV  ---
     if (bCapturing)
     {
         CaptureElapsed += DeltaTime;
@@ -229,12 +217,9 @@ void UEcoFrameProfiler::LogFrameBudget() const
     const float RelevelMs = Render ? static_cast<float>(Render->GetLastRelevelMs()) : 0.f;
     const float OursMs = TickMs + RelevelMs;
 
-    UE_LOG(LogEcoProfile, Log, TEXT("=== [Eco/F6] Presupuesto de frame (objetivo %.1f ms = %.0f fps) ==="),
-        Budget, 1000.f / Budget);
-    UE_LOG(LogEcoProfile, Log, TEXT("  Frame: medio %.2f ms (%.0f fps) | p95 %.2f ms | max %.2f ms | ventana %d frames"),
-        Avg, 1000.f / FMath::Max(Avg, 0.001f), P95, Max, WindowFilled);
-    UE_LOG(LogEcoProfile, Log, TEXT("  Ecosistema: tick %.2f ms + re-nivelado LOD %.2f ms = %.2f ms (%.1f%% del frame medio)"),
-        TickMs, RelevelMs, OursMs, 100.f * OursMs / FMath::Max(Avg, 0.001f));
+    UE_LOG(LogEcoProfile, Log, TEXT("=== [Eco/F6] Presupuesto de frame (objetivo %.1f ms = %.0f fps) ==="), Budget, 1000.f / Budget);
+    UE_LOG(LogEcoProfile, Log, TEXT("  Frame: medio %.2f ms (%.0f fps) | p95 %.2f ms | max %.2f ms | ventana %d frames"), Avg, 1000.f / FMath::Max(Avg, 0.001f), P95, Max, WindowFilled);  
+    UE_LOG(LogEcoProfile, Log, TEXT("  Ecosistema: tick %.2f ms + re-nivelado LOD %.2f ms = %.2f ms (%.1f%% del frame medio)"),TickMs, RelevelMs, OursMs, 100.f * OursMs / FMath::Max(Avg, 0.001f));   
     UE_LOG(LogEcoProfile, Log, TEXT("  Poblacion: %d arboles vivos"), Eco->GetLivePopulationCount());
 
     if (Render)
@@ -253,16 +238,16 @@ void UEcoFrameProfiler::LogFrameBudget() const
     else if (OursMs > 0.35f * Avg)
     {
         UE_LOG(LogEcoProfile, Warning, TEXT("  -> Fuera de presupuesto y el ecosistema se lleva una parte grande del frame: "
-            "mira Eco.Profile para ver que etapa del tick domina, y sube TickBudgetMsPerFrame / "
-            "RelevelEveryNFrames / LightRebuildEveryNTicks."));
+                                            "mira Eco.Profile para ver que etapa del tick domina, y sube TickBudgetMsPerFrame / "
+                                            "RelevelEveryNFrames / LightRebuildEveryNTicks."));
     }
     else
     {
         UE_LOG(LogEcoProfile, Warning, TEXT("  -> Fuera de presupuesto PERO el ecosistema apenas cuenta (%.1f%%): "
-            "el cuello NO es la simulacion. Sigue por `stat Unit` (game vs render vs GPU), "
-            "`stat GPU` / ProfileGPU y `stat RHI`; lo mas probable es overdraw de follaje, "
-            "coste de VSM o material masked en Nanite (doc. 4.6 / 6.4)."),
-            100.f * OursMs / FMath::Max(Avg, 0.001f));
+                                            "el cuello NO es la simulacion. Sigue por `stat Unit` (game vs render vs GPU), "
+                                            "`stat GPU` / ProfileGPU y `stat RHI`; lo mas probable es overdraw de follaje, "
+                                            "coste de VSM o material masked en Nanite (doc. 4.6 / 6.4)."),
+                                            100.f * OursMs / FMath::Max(Avg, 0.001f));
     }
 }
 
@@ -289,13 +274,12 @@ void UEcoFrameProfiler::DrawHUD() const
     if (Render) { Render->GetTierCounts(H, I, Imp, C); }
 
     // Claves fijas (0..3): sobrescriben el mensaje anterior en vez de acumular.
-    GEngine->AddOnScreenDebugMessage(0, 0.f, Color,
-        FString::Printf(TEXT("Frame %.2f ms (%.0f fps)  | objetivo %.1f ms"), Avg, 1000.f / FMath::Max(Avg, 0.001f), Budget));
-    GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::White,
-        FString::Printf(TEXT("Eco: tick %.2f ms + LOD %.2f ms"), TickMs, RelevelMs));
-    GEngine->AddOnScreenDebugMessage(2, 0.f, FColor::White,
-        FString::Printf(TEXT("Arboles %d | hero %d  inst %d  imp %d  off %d"),
-            Eco->GetLivePopulationCount(), H, I, Imp, C));
+    GEngine->AddOnScreenDebugMessage(0, 0.f, Color,FString::Printf(TEXT("Frame %.2f ms (%.0f fps)  | objetivo %.1f ms"), Avg, 1000.f / FMath::Max(Avg, 0.001f), Budget));
+        
+    GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::White, FString::Printf(TEXT("Eco: tick %.2f ms + LOD %.2f ms"), TickMs, RelevelMs));
+       
+    GEngine->AddOnScreenDebugMessage(2, 0.f, FColor::White,FString::Printf(TEXT("Arboles %d | hero %d  inst %d  imp %d  off %d"), Eco->GetLivePopulationCount(), H, I, Imp, C));
+
     if (bCapturing)
     {
         GEngine->AddOnScreenDebugMessage(3, 0.f, FColor::Cyan,
@@ -304,14 +288,11 @@ void UEcoFrameProfiler::DrawHUD() const
 }
 
 // ---------------------------------------------------------------------------
-//  Captura a CSV (material directo para las graficas de la Fase 7)
+//  Captura a CSV 
 // ---------------------------------------------------------------------------
 void UEcoFrameProfiler::StartCapture(float Seconds, const FString& Name)
 {
-    if (!EnsureInitialized())
-    {
-        return;
-    }
+    if (!EnsureInitialized()){ return; }
 
     if (Seconds <= 0.f)
     {

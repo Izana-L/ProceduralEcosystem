@@ -51,7 +51,8 @@ bool FEcoSoA::RunTest(const FString&) {
     TestEqual(TEXT("2 eliminados"), P.CompactDead(), 2);
     TestEqual(TEXT("Num=8"), P.Num(), 8);
     TestEqual(TEXT("arrays alineados"), P.Biomass.Num(), P.Position.Num());
-    TestEqual(TEXT("orden preservado (2 pos1)"), (double)P.Position[1].X, 2.0);
+    TestEqual(TEXT("orden preservado (4 pos3)"), (double)P.Position[3].X, 4.0);
+    TestEqual(TEXT("orden preservado (9 pos7)"), (double)P.Position[7].X, 9.0);
     return true;
 }
 
@@ -270,7 +271,7 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
         Light.SampleLight(FVector(600.0, 600.0, 300.0)), FLightFieldCoarse::FullSunlight);
 
     // Dos copas identicas, una en cada altiplano, a la MISMA altura sobre el suelo.
-    const float CanopyR = 500.f, CanopyDepth = 1200.f;
+    const float CanopyR = 500.f, CanopyDepth = 1800.f;
     Light.DepositCanopyShadow(FVector(600.0, 600.0, 0.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
     Light.DepositCanopyShadow(FVector(2200.0, 600.0, 10000.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
 
