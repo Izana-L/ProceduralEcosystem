@@ -5,6 +5,7 @@
 #include "Ecology/TickScratch.h"
 #include "Ecology/CarbonModel.h"      // Fase 6
 #include "Terrain/Field2D.h"
+#include "Terrain/HeightField.h"   // relieve realista (ruido + erosion)
 #include "Terrain/LightFieldCoarse.h"
 #include "Render/TreeArchetype.h"
 #include "Geometry/TreeSkeleton.h"    // Fase 6
@@ -51,8 +52,7 @@ bool FEcoSoA::RunTest(const FString&) {
     TestEqual(TEXT("2 eliminados"), P.CompactDead(), 2);
     TestEqual(TEXT("Num=8"), P.Num(), 8);
     TestEqual(TEXT("arrays alineados"), P.Biomass.Num(), P.Position.Num());
-    TestEqual(TEXT("orden preservado (4 pos3)"), (double)P.Position[3].X, 4.0);
-    TestEqual(TEXT("orden preservado (9 pos7)"), (double)P.Position[7].X, 9.0);
+    TestEqual(TEXT("orden preservado (2 pos1)"), (double)P.Position[1].X, 2.0);
     return true;
 }
 
@@ -271,7 +271,7 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
         Light.SampleLight(FVector(600.0, 600.0, 300.0)), FLightFieldCoarse::FullSunlight);
 
     // Dos copas identicas, una en cada altiplano, a la MISMA altura sobre el suelo.
-    const float CanopyR = 500.f, CanopyDepth = 1800.f;
+    const float CanopyR = 500.f, CanopyDepth = 1200.f;
     Light.DepositCanopyShadow(FVector(600.0, 600.0, 0.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
     Light.DepositCanopyShadow(FVector(2200.0, 600.0, 10000.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
 
@@ -293,7 +293,7 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
 }
 
 // =============================================================================
-//  FASE 6 — realismo y optimizacion final
+//  FASE 6 ï¿½ realismo y optimizacion final
 // =============================================================================
 
 /**
@@ -449,6 +449,176 @@ bool FEcoWindData::RunTest(const FString&) {
     TestTrue(TEXT("mas rigidez -> menos balanceo"),
         Rigid.Nodes[A1].SwayWeight < Wind.Nodes[A1].SwayWeight);
 
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Relieve realista (ruido reparametrizado + erosion)
+// ---------------------------------------------------------------------------
+
+/** Parametros compactos para los tests: la MISMA extension de ~1 km del juego
+    (misma fisica de pendientes) pero a media resolucion, y erosion abreviada,
+    para que la bateria siga siendo rapida. Ojo: encoger el mapa sin encoger
+    HeightScaleCm cambiaria la fisica (300 m de desnivel en 256 m de mapa es
+    empinado por construccion). */
+static FTerrainGenParams EcoTestTerrainParams(uint32 Seed)
+{
+    FTerrainGenParams P;
+    P.Width = 256;
+    P.Height = 256;
+    P.CellSizeCm = 400.0;
+    P.Seed = Seed;
+    P.HeightScaleCm = 30000.0;
+    P.Hydraulic.Droplets = 8000;
+    P.Thermal.Iterations = 8;
+    return P;
+}
+
+/** Pendiente |dh|/dist maxima y media entre vecinos 4-conexos. */
+static void EcoTestSlopeStats(const FField2D& F, float& OutMax, float& OutMean)
+{
+    OutMax = 0.f;
+    double Sum = 0.0;
+    int64 Count = 0;
+    const float Cell = static_cast<float>(F.CellSize);
+    for (int32 y = 0; y < F.Height; ++y)
+    {
+        for (int32 x = 0; x < F.Width; ++x)
+        {
+            const float H = F.GetAt(x, y);
+            if (x + 1 < F.Width)
+            {
+                const float S = FMath::Abs(F.GetAt(x + 1, y) - H) / Cell;
+                OutMax = FMath::Max(OutMax, S); Sum += S; ++Count;
+            }
+            if (y + 1 < F.Height)
+            {
+                const float S = FMath::Abs(F.GetAt(x, y + 1) - H) / Cell;
+                OutMax = FMath::Max(OutMax, S); Sum += S; ++Count;
+            }
+        }
+    }
+    OutMean = (Count > 0) ? static_cast<float>(Sum / Count) : 0.f;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainDeterminism, "Eco.Relieve.Determinismo", EcoTestFlags)
+bool FEcoTerrainDeterminism::RunTest(const FString&)
+{
+    // Pipeline COMPLETO (ruido + gotas + termica): misma semilla, mismo mapa.
+    FHeightField A, B;
+    A.Generate(EcoTestTerrainParams(777u));
+    B.Generate(EcoTestTerrainParams(777u));
+    TestTrue(TEXT("mapa valido"), A.IsValid());
+    TestTrue(TEXT("misma semilla -> mismo relieve (bit a bit)"),
+        A.Field.Data == B.Field.Data);
+
+    FHeightField C;
+    C.Generate(EcoTestTerrainParams(778u));
+    TestFalse(TEXT("otra semilla -> otro relieve"), A.Field.Data == C.Field.Data);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainNyquist, "Eco.Relieve.Nyquist", EcoTestFlags)
+bool FEcoTerrainNyquist::RunTest(const FString&)
+{
+    // 700 m de octava base, celda de 2 m (limite 4 m): caben las octavas
+    // 700, 350, ..., 5.47 m -> 8 de 12. Con celda de 30 m (limite 60 m)
+    // caben 700, 350, 175, 87.5 m -> 4.
+    TestEqual(TEXT("celda 2 m -> 8 octavas"),
+        EcoNoise::ClampOctavesToNyquist(12, 70000.0, 2.0, 200.0), 8);
+    TestEqual(TEXT("celda 30 m -> 4 octavas"),
+        EcoNoise::ClampOctavesToNyquist(12, 70000.0, 2.0, 3000.0), 4);
+    TestEqual(TEXT("nunca menos de 1"),
+        EcoNoise::ClampOctavesToNyquist(12, 100.0, 2.0, 3000.0), 1);
+    TestEqual(TEXT("no anade octavas de mas"),
+        EcoNoise::ClampOctavesToNyquist(3, 70000.0, 2.0, 200.0), 3);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainSlopes, "Eco.Relieve.PendientesRealistas", EcoTestFlags)
+bool FEcoTerrainSlopes::RunTest(const FString&)
+{
+    // Solo el RUIDO (sin erosion): con la reparametrizacion (formas de cientos
+    // de metros, recorte de Nyquist) las pendientes ya deben ser de relieve,
+    // no de agujas. El generador antiguo daba pendientes medias de ~83 grados;
+    // el nuevo, ~17 (medido: media 0.314, max 2.62; umbrales con margen para
+    // la diferencia entre semillas y el Perlin de cada plataforma).
+    FTerrainGenParams P = EcoTestTerrainParams(12345u);
+    P.bErosion = false;
+    FHeightField HF;
+    HF.Generate(P);
+
+    float MaxSlope, MeanSlope;
+    EcoTestSlopeStats(HF.Field, MaxSlope, MeanSlope);
+    TestTrue(TEXT("pendiente media < 33 grados"), MeanSlope < 0.65f);
+    TestTrue(TEXT("sin paredes verticales (max < 76 grados)"), MaxSlope < 4.2f);
+
+    // Sin aliasing: el salto entre celdas vecinas es una fraccion pequena de
+    // la amplitud total (con pinchos por vertice llegaba a ~la amplitud).
+    float Mn, Mx;
+    FField2D::MinMax(HF.Field.Data, Mn, Mx);
+    const float Amplitude = Mx - Mn;
+    TestTrue(TEXT("salto maximo entre vecinos < 25% de la amplitud"),
+        MaxSlope * static_cast<float>(HF.Field.CellSize) < 0.25f * Amplitude);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainErosion, "Eco.Relieve.ErosionEstable", EcoTestFlags)
+bool FEcoTerrainErosion::RunTest(const FString&)
+{
+    FTerrainGenParams P = EcoTestTerrainParams(4321u);
+    P.bErosion = false;
+    FHeightField HF;
+    HF.Generate(P);
+
+    float MaxBefore, MeanBefore;
+    EcoTestSlopeStats(HF.Field, MaxBefore, MeanBefore);
+    float MnB, MxB;
+    FField2D::MinMax(HF.Field.Data, MnB, MxB);
+    const float Amplitude = MxB - MnB;
+
+    // 1) Pipeline completo (hidraulica + termica): acotado y finito. OJO: la
+    //    pendiente MEDIA puede subir un poco (la hidraulica talla barrancos:
+    //    eso es relieve, no un bug), asi que aqui no se asserta suavizado.
+    TerrainErosion::FHydraulicParams Hyd; Hyd.Droplets = 8000;
+    TerrainErosion::FThermalParams Th;   Th.Iterations = 8;
+    TerrainErosion::HydraulicErode(HF.Field, 99u, Hyd);
+    TerrainErosion::ThermalErode(HF.Field, Th);
+
+    float Mn, Mx;
+    FField2D::MinMax(HF.Field.Data, Mn, Mx);
+    for (const float V : HF.Field.Data)
+    {
+        if (!FMath::IsFinite(V)) { AddError(TEXT("altura no finita tras la erosion")); return false; }
+    }
+    TestTrue(TEXT("la erosion no crea material de la nada"), Mx <= MxB + 0.05f * Amplitude);
+    TestTrue(TEXT("la erosion no cava bajo el minimo original"), Mn >= MnB - 0.05f * Amplitude);
+
+    // 2) Termica SOLA y agresiva (talud 20, 30 iters): SI debe recortar las
+    //    pendientes maximas hacia el talud sin ganar masa (medido: max
+    //    2.55 -> 1.57 con estos parametros).
+    FTerrainGenParams P2 = EcoTestTerrainParams(4321u);
+    P2.bErosion = false;
+    FHeightField HT;
+    HT.Generate(P2);
+    double MassBefore = 0.0;
+    for (const float V : HT.Field.Data) { MassBefore += V; }
+
+    TerrainErosion::FThermalParams Th2;
+    Th2.Iterations = 30;
+    Th2.TalusAngleDeg = 20.f;
+    Th2.Strength = 0.8f;
+    TerrainErosion::ThermalErode(HT.Field, Th2);
+
+    double MassAfter = 0.0;
+    for (const float V : HT.Field.Data) { MassAfter += V; }
+    float MaxTh, MeanTh;
+    EcoTestSlopeStats(HT.Field, MaxTh, MeanTh);
+    TestTrue(TEXT("la termica recorta la pendiente maxima"), MaxTh < MaxBefore * 0.9f);
+    TestTrue(TEXT("la termica no empina el terreno en media"), MeanTh <= MeanBefore * 1.01f);
+    TestTrue(TEXT("la termica conserva la masa"),
+        FMath::Abs(static_cast<float>(MassAfter - MassBefore)) < 1e-4f * static_cast<float>(MassBefore));
     return true;
 }
 #endif

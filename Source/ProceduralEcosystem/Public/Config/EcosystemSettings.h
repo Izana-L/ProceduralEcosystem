@@ -44,7 +44,13 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Tiempo")
     bool bStartPaused = true;
 
-    // --- Relieve (Fase 0/1) ---
+    // --- Relieve (Fase 0/1; sintesis realista: ver FHeightField::Generate) ---
+    // NOTA (relieve realista): aqui vivia HeightfieldBaseFrequency (cm^-1), que
+    // producia formas de ~17 m con 300 m de desnivel (agujas) y octavas por
+    // debajo del limite de Nyquist de la rejilla (pinchos por vertice). La
+    // sustituye TerrainBaseWavelengthM, en metros. Si actualizas desde una
+    // version anterior y tu DefaultGame.ini guarda HeightfieldBaseFrequency,
+    // borra esa clave: es un literal huerfano.
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "2"))
     int32 HeightfieldResolution = 512; // muestras por lado
 
@@ -53,15 +59,66 @@ public:
     float HeightfieldCellSizeCm = 200.f;
 
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0"))
-    float HeightScaleCm = 30000.f; // amplitud vertical
+    float HeightScaleCm = 30000.f; // amplitud vertical (pico-valle)
 
-    /** Octavas del fBm del relieve: mas octavas = mas detalle fino. */
+    /** Octavas del fractal: mas octavas = mas detalle fino. El generador ademas
+        recorta las que caen bajo el limite de Nyquist de la rejilla (longitud
+        de onda < 2 * HeightfieldCellSizeCm), que solo meterian aliasing. */
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "1", ClampMax = "12"))
-    int32 HeightfieldOctaves = 5;
+    int32 HeightfieldOctaves = 8;
 
-    /** Frecuencia base del ruido del relieve: mas baja = formas mas grandes. */
+    /** Longitud de onda (m) de la octava base: el ancho de las formas GRANDES
+        del relieve. Para un mapa de ~1 km, 600-1000 m da 1-2 macizos. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "10.0"))
+    float TerrainBaseWavelengthM = 700.f;
+
+    /** Amplitud conservada por octava (0..1). 0.5 reproduce el espectro ~1/f^2
+        de los DEM reales; mas alto = mas rugoso, mas bajo = mas liso. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0.1", ClampMax = "0.9"))
+    float TerrainPersistence = 0.5f;
+
+    /** Multiplicador de frecuencia entre octavas (2 = estandar). */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "1.5", ClampMax = "4.0"))
+    float TerrainLacunarity = 2.f;
+
+    /** Amplitud (m) del domain warp (Quilez): distorsiona el dominio con otro
+        fBm para curvar valles y laderas de forma organica. 0 = desactivado. */
     UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0.0"))
-    double HeightfieldBaseFrequency = 0.0006;
+    float TerrainWarpStrengthM = 150.f;
+
+    /** Longitud de onda (m) de las formas del warp. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "10.0"))
+    float TerrainWarpWavelengthM = 400.f;
+
+    /** Peso de las crestas (ridged multifractal de Musgrave) en las zonas
+        altas: 0 = solo colinas suaves, 1 = cordillera afilada. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float TerrainRidgeWeight = 0.45f;
+
+    // --- Relieve: erosion (bake unico al generar; ver TerrainErosion) ---
+    /** Interruptor general de la erosion (hidraulica + termica). */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve|Erosion")
+    bool bTerrainErosion = true;
+
+    /** Nº de gotas de la erosion hidraulica (0 = off). Mas gotas = red de
+        drenaje mas marcada. ~120k para 512x512 tarda <1 s al generar. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve|Erosion", meta = (ClampMin = "0"))
+    int32 TerrainHydraulicDroplets = 120000;
+
+    /** Intensidad de la erosion hidraulica: escala la tasa de arranque de
+        material de cada gota (0..1). */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve|Erosion", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float TerrainErosionStrength = 0.5f;
+
+    /** Iteraciones de erosion termica (0 = off): relaja las pendientes que
+        superan el angulo de talud (laderas de derrubios). */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve|Erosion", meta = (ClampMin = "0"))
+    int32 TerrainThermalIterations = 25;
+
+    /** Angulo de talud (grados): pendiente maxima estable del material suelto.
+        En la naturaleza, ~30-37. */
+    UPROPERTY(EditAnywhere, config, Category = "Relieve|Erosion", meta = (ClampMin = "10.0", ClampMax = "80.0"))
+    float TerrainTalusAngleDeg = 34.f;
 
     // --- Recursos: agua (Fase 1) ---
     /** Rango de salida del TWI. Debe casar con NutrientOutputMax para que el vigor

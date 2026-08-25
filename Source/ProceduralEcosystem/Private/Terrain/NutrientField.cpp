@@ -9,8 +9,8 @@ void FNutrientField::GeneratePatchyBase(int32 Width, int32 Height, double CellSi
 {
     Field.Init(Width, Height, CellSize, Origin, 0.f);
 
-    // Hash DISTINTO al que usa FHeightField::GenerateFractalNoise: aunque
-    // compartan la misma MasterSeed del proyecto, el desplazamiento debe
+    // Sales DISTINTAS a las que usa FHeightField::Generate (EcoNoise::SeedOffset):
+    // aunque compartan la misma MasterSeed del proyecto, el desplazamiento debe
     // salir distinto para que el patron de nutrientes no quede pegado al
     // relieve (no son la misma causa fisica).
     const double OffX = (EcoRand::Hash32(Seed ^ 0xA24BAED4u) & 0xFFFF) * 0.1;

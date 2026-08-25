@@ -309,13 +309,29 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
-    // 1) Relieve: fuente de verdad de la simulacion. Octavas y frecuencia base
-    //    tambien salen de Project Settings (controlan directamente el aspecto
-    //    del terreno; antes eran literales que exigian recompilar para tunear).
-    HeightField.GenerateFractalNoise(
-        S->HeightfieldResolution, S->HeightfieldResolution,
-        S->HeightfieldCellSizeCm, static_cast<uint32>(S->MasterSeed),
-        S->HeightfieldOctaves, S->HeightfieldBaseFrequency, S->HeightScaleCm);
+    // 1) Relieve: fuente de verdad de la simulacion. Toda la forma (longitud
+    //    de onda, persistencia, warp, crestas) y la erosion salen de Project
+    //    Settings; aqui solo se convierten metros -> cm y se lanza el bake
+    //    (ver FHeightField::Generate para el pipeline completo).
+    FTerrainGenParams TerrainParams;
+    TerrainParams.Width = S->HeightfieldResolution;
+    TerrainParams.Height = S->HeightfieldResolution;
+    TerrainParams.CellSizeCm = S->HeightfieldCellSizeCm;
+    TerrainParams.Seed = static_cast<uint32>(S->MasterSeed);
+    TerrainParams.HeightScaleCm = S->HeightScaleCm;
+    TerrainParams.Noise.Octaves = S->HeightfieldOctaves;
+    TerrainParams.Noise.BaseWavelengthCm = S->TerrainBaseWavelengthM * 100.0;
+    TerrainParams.Noise.Persistence = S->TerrainPersistence;
+    TerrainParams.Noise.Lacunarity = S->TerrainLacunarity;
+    TerrainParams.Noise.WarpStrengthCm = S->TerrainWarpStrengthM * 100.0;
+    TerrainParams.Noise.WarpWavelengthCm = S->TerrainWarpWavelengthM * 100.0;
+    TerrainParams.Noise.RidgeWeight = S->TerrainRidgeWeight;
+    TerrainParams.bErosion = S->bTerrainErosion;
+    TerrainParams.Hydraulic.Droplets = S->TerrainHydraulicDroplets;
+    TerrainParams.Hydraulic.Strength = S->TerrainErosionStrength;
+    TerrainParams.Thermal.Iterations = S->TerrainThermalIterations;
+    TerrainParams.Thermal.TalusAngleDeg = S->TerrainTalusAngleDeg;
+    HeightField.Generate(TerrainParams);
 
     if (!HeightField.IsValid())
     {

@@ -1,26 +1,37 @@
 #include "Terrain/HeightField.h"
-#include "Terrain/EcoNoise.h"
 #include "Core/EcoCore.h"
 #include "Async/ParallelFor.h"
 
-void FHeightField::GenerateFractalNoise(int32 InWidth, int32 InHeight, double InCellSize,
-    uint32 Seed, int32 Octaves,
-    double BaseFrequency, double HeightScaleCm)
+void FHeightField::Generate(const FTerrainGenParams& Params)
 {
     // Prepara la rejilla base (geometria + almacenamiento); el valor inicial
     // da igual, se sobrescribe entero a continuacion.
-    Field.Init(InWidth, InHeight, InCellSize, FVector2D::ZeroVector, 0.f);
+    Field.Init(Params.Width, Params.Height, Params.CellSizeCm, FVector2D::ZeroVector, 0.f);
 
-    // Desplazamiento por semilla: cada Seed produce un relieve distinto.
-    const double OffX = (EcoRand::Hash32(Seed) & 0xFFFF) * 0.1;
-    const double OffY = (EcoRand::Hash32(Seed ^ 0x9E3779B9u) & 0xFFFF) * 0.1;
+    // -----------------------------------------------------------------
+    // 1) Parametros de ruido derivados: offsets por semilla (streams
+    //    independientes para base, crestas y las dos coordenadas del warp) y
+    //    recorte de Nyquist (una octava con longitud de onda < 2*CellSize no
+    //    se puede representar en la rejilla y solo mete aliasing: los
+    //    "pinchos" por vertice del relieve antiguo).
+    // -----------------------------------------------------------------
+    EcoNoise::FTerrainNoiseParams N = Params.Noise;
+    N.BaseOffset = EcoNoise::SeedOffset(Params.Seed, 0x0000000Du);
+    N.RidgeOffset = EcoNoise::SeedOffset(Params.Seed, 0x51ED270Bu);
+    N.WarpOffsetA = EcoNoise::SeedOffset(Params.Seed, 0x85EBCA6Bu);
+    N.WarpOffsetB = EcoNoise::SeedOffset(Params.Seed, 0xC2B2AE35u);
+    N.Octaves = EcoNoise::ClampOctavesToNyquist(N.Octaves,
+        N.BaseWavelengthCm, N.Lacunarity, Params.CellSizeCm);
+    N.WarpOctaves = EcoNoise::ClampOctavesToNyquist(N.WarpOctaves,
+        N.WarpWavelengthCm, /*Lacunarity del warp*/ 2.0, Params.CellSizeCm);
 
     const int32 W = Field.Width;
     const int32 Ht = Field.Height;
+    const double Cell = Field.CellSize;
 
     // -----------------------------------------------------------------
-    // 1) fBm crudo, en paralelo por filas. Cada fila escribe celdas
-    //    distintas y PerlinNoise2D es puro -> el resultado NO depende del
+    // 2) Ruido compuesto, en paralelo por filas. Cada fila escribe celdas
+    //    distintas y TerrainSample es puro -> el resultado NO depende del
     //    orden de los hilos (determinista).
     // -----------------------------------------------------------------
     TArray<float> Raw;
@@ -30,18 +41,27 @@ void FHeightField::GenerateFractalNoise(int32 InWidth, int32 InHeight, double In
         {
             for (int32 x = 0; x < W; ++x)
             {
-                Raw[y * W + x] = EcoNoise::FractalPerlin(x, y, InCellSize, OffX, OffY, BaseFrequency, Octaves);
+                Raw[y * W + x] = EcoNoise::TerrainSample(x * Cell, y * Cell, N);
             }
         });
 
     // -----------------------------------------------------------------
-    // 2) Normaliza al rango REAL del ruido. Antes se usaba 0.5*perlin+0.5
-    //    asumiendo rango [-1,1], pero el Perlin 2D de UE llega solo a ~+-0.707,
-    //    asi que el relieve se quedaba comprimido en ~[0.15, 0.85]. Con el
-    //    min/max real el terreno aprovecha toda la amplitud y HeightScaleCm
-    //    pasa a ser la amplitud pico-valle.
+    // 3) Normaliza al rango REAL del ruido: el relieve ocupa todo
+    //    [0, HeightScaleCm] y HeightScaleCm es la amplitud pico-valle.
     // -----------------------------------------------------------------
-    Field.FillNormalizedFrom(Raw, static_cast<float>(HeightScaleCm));
+    Field.FillNormalizedFrom(Raw, static_cast<float>(Params.HeightScaleCm));
+
+    // -----------------------------------------------------------------
+    // 4) Erosion (bake unico): la hidraulica talla la red de drenaje y
+    //    despues la termica relaja cualquier pendiente que quede por encima
+    //    del talud. El stream de las gotas se deriva de Seed con su propia
+    //    sal: no perturba ningun otro stream del proyecto.
+    // -----------------------------------------------------------------
+    if (Params.bErosion)
+    {
+        TerrainErosion::HydraulicErode(Field, EcoRand::Hash32(Params.Seed ^ 0x5EEDDA7Au), Params.Hydraulic);
+        TerrainErosion::ThermalErode(Field, Params.Thermal);
+    }
 }
 
 FVector FHeightField::SampleNormal(double Xcm, double Ycm) const
