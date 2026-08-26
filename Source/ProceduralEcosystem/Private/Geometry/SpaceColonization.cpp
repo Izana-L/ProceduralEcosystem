@@ -52,6 +52,7 @@ namespace SpaceColonization
 
         const double PipeExp = FMath::Max(1.0, (double)Species.PipeExp);
         const double TipR = FMath::Max((double)KINDA_SMALL_NUMBER, (double)Species.TipRadiusCm);
+        const double TipTaper = FMath::Clamp((double)Species.TipTaper, 0.05, 1.0);
 
         // Acc[i] = suma de r^n de los hijos de i. Recorremos en indice
         // decreciente: por la invariante Parent < indice, eso procesa cada
@@ -61,14 +62,18 @@ namespace SpaceColonization
 
         for (int32 i = N - 1; i >= 0; --i)
         {
-            const double R = (Acc[i] > 0.0) ? FMath::Pow(Acc[i], 1.0 / PipeExp) : TipR;
-            Skeleton.Nodes[i].Radius = (float)R;
+            const bool bTip = (Acc[i] <= 0.0);
+            const double R = bTip ? TipR : FMath::Pow(Acc[i], 1.0 / PipeExp);
 
+            // El padre hereda el radio SIN afilar: el afilado es un remate de la
+            // punta, no debe adelgazar toda la cadena hasta el tronco.
             const int32 P = Skeleton.Nodes[i].Parent;
             if (P >= 0)
             {
                 Acc[P] += FMath::Pow(R, PipeExp);
             }
+
+            Skeleton.Nodes[i].Radius = (float)(bTip ? R * TipTaper : R);
         }
     }
 
@@ -87,6 +92,7 @@ namespace SpaceColonization
         const float d_k = FMath::Max(Species.KillRadiusDk, 0.1f);
         const float D = FMath::Max(Species.StepLengthD, 1.f);
         const int32 MaxIter = FMath::Max(Species.MaxIter, 1);
+        const int32 MaxChildren = FMath::Max(Config.MaxChildrenPerNode, 1);
         const float LeafShadowR = D * FMath::Max(Config.LeafShadowRadiusScale, 0.f);
         const float LeafShadowDepth = D * FMath::Max(Config.LeafShadowDepthScale, 0.f);
         const bool  bHasCoarse = (CoarseLight != nullptr) && CoarseLight->IsValid();
@@ -130,6 +136,11 @@ namespace SpaceColonization
             if (Ci == INDEX_NONE) { break; }
             TrunkTip = Ci;
         }
+        // Grado alcanzado por cada nodo. Arranca del tronco desnudo recien
+        // encadenado y se mantiene incrementalmente al anadir hijos.
+        TArray<int32> Degree;
+        OutSkeleton.ComputeChildCounts(Degree);
+
         // Scratch reutilizado entre iteraciones.
         TArray<FVector> SumDir;
         TArray<int32>   Count;
@@ -138,6 +149,7 @@ namespace SpaceColonization
         for (int32 Iter = 0; Iter < MaxIter; ++Iter)
         {
             const int32 NumNodes = OutSkeleton.Num();
+            Degree.SetNumZeroed(NumNodes); // los nodos nacidos en la iteracion previa entran a 0
 
             // ---- ASOCIAR: cada atractor vivo -> su nodo mas cercano dentro de d_i ----
             for (FAttractor& A : OutAttractors.Attractors)
@@ -151,6 +163,11 @@ namespace SpaceColonization
 
             for (int32 v = 0; v < NumNodes; ++v)
             {
+                // Un nodo saturado no compite por atractores: si lo hiciera, los
+                // suyos quedarian asignados a un nodo que ya no puede crecer y
+                // nunca se consumirian.
+                if (Degree[v] >= MaxChildren) { continue; }
+
                 const FVector NodePos = OutSkeleton.Nodes[v].Pos;
                 OutAttractors.ForEachInRange(NodePos, d_i, [&](int32 Ai)
                     {
@@ -204,6 +221,7 @@ namespace SpaceColonization
                 const int32 Ci = OutSkeleton.AddChild(v, ChildPos, Dir);
                 if (Ci != INDEX_NONE)
                 {
+                    ++Degree[v];
                     NewChildren.Add(Ci);
                 }
             }

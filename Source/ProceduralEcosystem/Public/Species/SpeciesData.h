@@ -170,17 +170,63 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|PipeModel", meta = (ClampMin = "0.05"))
     float TipRadiusCm = 1.5f;
 
+    /** Radio del último nodo de una ramilla como fracción de TipRadiusCm. < 1
+        afila la punta en vez de dejarla como un cilindro cortado a plano. No
+        propaga hacia la base: el pipe model se calcula con el radio sin afilar. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|PipeModel", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+    float TipTaper = 0.35f;
+
     // --- Mallado: de esqueleto a malla (doc. §3.7) ---
     /** K: nº de vértices del anillo de sección de cada rama (tubos). */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "3", ClampMax = "16"))
     int32 RingSegments = 6;
 
-    /** Lado de una leaf card (cm). */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "1"))
+    // --- Follaje: filotaxis (ver Geometry/TreeFoliage.h) ---
+    // Las hojas se reparten a lo largo de las ramillas, una por ranura cada
+    // LeafSpacingCm de longitud de rama, girando PhyllotaxisAngleDeg entre
+    // ranuras consecutivas. LeafSpacingCm es, por tanto, la palanca de DENSIDAD
+    // (y de coste): la mitad de separación es el doble de hojas.
+
+    /** Largo de la hoja, del pecíolo a la punta (cm). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1"))
     float LeafSizeCm = 20.f;
 
-    /** Densidad de hojas: fracción de nodos terminales que reciben leaf card [0..1]. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "0", ClampMax = "1"))
+    /** Ancho de la hoja como fracción de su largo. 1 = cuadrada, <1 = lanceolada. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0.05", ClampMax = "2"))
+    float LeafWidthRatio = 0.45f;
+
+    /** Distancia entre hojas consecutivas a lo largo de la ramilla (cm). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0.5"))
+    float LeafSpacingCm = 8.f;
+
+    /** Ángulo de divergencia entre hojas consecutivas. 137.5 = espiral áurea
+        (el caso general), 180 = dística (haya), 90 = decusada. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0", ClampMax = "180"))
+    float PhyllotaxisAngleDeg = 137.5f;
+
+    /** Una rama lleva hoja mientras su radio no supere TipRadiusCm × esto: el
+        follaje sale de la madera joven, no del tronco. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1"))
+    float LeafBearingRadiusScale = 2.f;
+
+    /** Ángulo de inserción sobre la perpendicular a la ramilla. 0 = la hoja sale
+        en ángulo recto; positivo = inclinada hacia la punta. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "-80", ClampMax = "80"))
+    float LeafInsertionAngleDeg = 35.f;
+
+    /** Separación de la hoja respecto a la corteza (cm): sin ella la card queda
+        clavada dentro del tubo de la rama. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0"))
+    float PetioleLengthCm = 1.5f;
+
+    /** Cuánto orienta la hoja su cara al gradiente de luz de la rejilla fina.
+        0 = siempre al cielo, 1 = totalmente heliotrópica. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0", ClampMax = "1"))
+    float LeafHeliotropism = 0.6f;
+
+    /** Fracción de ranuras que llegan a producir hoja [0..1]. Aclara el follaje
+        sin cambiar su reparto; para MÁS follaje, baja LeafSpacingCm. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0", ClampMax = "1"))
     float LeafDensity = 0.8f;
 
     // ================================================================

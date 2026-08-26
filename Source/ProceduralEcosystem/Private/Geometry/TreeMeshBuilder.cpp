@@ -1,25 +1,16 @@
 #include "Geometry/TreeMeshBuilder.h"
 #include "Geometry/TreeSkeleton.h"
 #include "Geometry/TreeWindData.h"     // Fase 6: pivotes de rama, balanceo y AO
+#include "Geometry/TreeFoliage.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h" // EcoRand
 
 namespace
 {
     constexpr float MinBranchRadiusCm = 0.05f;
     constexpr float UvAlongScale = 1.f / 100.f; // 1 unidad de UV.v por metro de rama
-    constexpr float CmToM = 0.01f;              // Fase 6: los pivotes viajan en METROS
-
-    /** Vector unitario aleatorio, reproducible desde RngState. */
-    FVector RandUnitVector(uint32& Rng)
-    {
-        const FVector V(
-            EcoRand::NextRange(Rng, -1.f, 1.f),
-            EcoRand::NextRange(Rng, -1.f, 1.f),
-            EcoRand::NextRange(Rng, -1.f, 1.f));
-        return V.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
-    }
+    constexpr float TipConeLengthFrac = 0.55f;  // largo del apice como fraccion del internodo
+    constexpr float MinTipConeRadii = 2.f;      // ... con un minimo en radios de la ramilla
 
     /** Una perpendicular cualquiera y estable a T (T debe venir normalizado). */
     FVector AnyPerpendicular(const FVector& T)
@@ -31,36 +22,11 @@ namespace
         }
         return P.GetSafeNormal(SMALL_NUMBER, FVector::ForwardVector);
     }
-
-    /**
-     * Fase 6: escribe los canales de viento/AO de UN vertice.
-     *
-     * PivotLocalCm viene relativo a la base del tronco y sale en METROS (ver la
-     * nota de precision de TreeWindData.h). El resto son escalares [0,1].
-     */
-    void WriteWindVertex(FTreeMeshBuffers& B, int32 Vi, const FVector& PivotLocalCm,
-        float BranchLevel01, float SwayWeight, float Phase01, float CanopyAO, float Tint)
-    {
-        B.UV1[Vi] = FVector2D(PivotLocalCm.X * CmToM, PivotLocalCm.Y * CmToM);
-        B.UV2[Vi] = FVector2D(PivotLocalCm.Z * CmToM, BranchLevel01);
-        B.UV3[Vi] = FVector2D(SwayWeight, Phase01);
-        B.Colors[Vi] = FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f);
-    }
-
-    /** Igual, pero anadiendo al final de los arrays (las hojas se van anadiendo). */
-    void AppendWindVertex(FTreeMeshBuffers& B, const FVector& PivotLocalCm,
-        float BranchLevel01, float SwayWeight, float Phase01, float CanopyAO, float Tint)
-    {
-        B.UV1.Add(FVector2D(PivotLocalCm.X * CmToM, PivotLocalCm.Y * CmToM));
-        B.UV2.Add(FVector2D(PivotLocalCm.Z * CmToM, BranchLevel01));
-        B.UV3.Add(FVector2D(SwayWeight, Phase01));
-        B.Colors.Add(FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f));
-    }
 }
 
 namespace TreeMeshBuilder
 {
-    void BuildMesh(const FTreeSkeleton& Skeleton, const USpeciesData& Species, uint32& RngState,
+    void BuildMesh(const FTreeSkeleton& Skeleton, const USpeciesData& Species, uint32 Seed,
         FTreeMeshData& OutMesh, const FTreeLightGridFine* FineLight)
     {
         OutMesh.Reset();
@@ -80,21 +46,15 @@ namespace TreeMeshBuilder
         // de la rejilla de luz fina que dejo el SCA: no hay que reconstruir
         // ninguna jerarquia ni hornear texturas de pivotes (doc. 6.1).
         //
-        // NOTA DE DETERMINISMO: FTreeWindData NO consume RngState. Los desfases
-        // salen de hashes del indice de rama y de la semilla del arbol. Asi la
-        // geometria que produce este mallador es BIT A BIT la misma que antes de
-        // la Fase 6 -las mallas de la libreria no cambian, solo se les anaden
-        // canales- y los bakes de la Fase 5 siguen cuadrando.
+        // FTreeWindData deja ademas publicadas las dos pasadas O(N) que comparte
+        // con el mallador (ChildCount y AlongLen): aqui se reutilizan, no se
+        // recalculan.
         // ===================================================================
         FTreeWindData Wind;
-        Wind.Build(Skeleton, Species, FineLight, /*Seed*/ RngState);
+        Wind.Build(Skeleton, Species, FineLight, Seed);
 
-        // --- Longitud acumulada y n de hijos: pasadas compartidas del esqueleto
-        //     (las mismas que usa FTreeWindData; una sola implementacion) ---
-        TArray<float> AlongLen;
-        Skeleton.ComputeAlongLengths(AlongLen);   // longitud de rama para UV.v
-        TArray<int32> ChildCount;
-        Skeleton.ComputeChildCounts(ChildCount);  // terminales = puntas con hoja
+        const TArray<int32>& ChildCount = Wind.ChildCount;
+        const TArray<float>& AlongLen = Wind.AlongLen;
 
         // --- Marcos de rotacion minima ---
         // Se calculan en orden de indice (padre antes que hijo, por la invariante
@@ -130,19 +90,31 @@ namespace TreeMeshBuilder
             FrameB[i] = FVector::CrossProduct(T, Nrm).GetSafeNormal(SMALL_NUMBER, FVector::CrossProduct(T, AnyPerpendicular(T)));
         }
 
-        // --- MADERA: un anillo de K vertices por nodo ---
+        // --- MADERA: reparto del buffer de vertices ---
+        //   [0, N*RingVerts)          anillos, uno por nodo
+        //   BaseCapVert               centro de la tapa de la base del tronco
+        //   ApexVert[i]               apice de cada nodo terminal
         FTreeMeshBuffers& W = OutMesh.Wood;
         const int32 RingVerts = K + 1;          // <-- +1: vertice de costura (duplicado en u=1)
-        const int32 VertCount = N * RingVerts;
-        W.Vertices.SetNumUninitialized(VertCount);
-        W.Normals.SetNumUninitialized(VertCount);
-        W.UVs.SetNumUninitialized(VertCount);
-        W.Tangents.SetNumUninitialized(VertCount);
-        // Fase 6: canales de viento/AO, en lockstep con los demas.
-        W.UV1.SetNumUninitialized(VertCount);
-        W.UV2.SetNumUninitialized(VertCount);
-        W.UV3.SetNumUninitialized(VertCount);
-        W.Colors.SetNumUninitialized(VertCount);
+        const int32 RingBlock = N * RingVerts;
+        const int32 BaseCapVert = RingBlock;
+
+        TArray<int32> ApexVert;
+        ApexVert.Init(INDEX_NONE, N);
+
+        int32 VertCount = RingBlock + 1;
+        int32 NumApex = 0;
+        for (int32 i = 0; i < N; ++i)
+        {
+            if (ChildCount[i] == 0 && Skeleton.Nodes[i].Parent >= 0)
+            {
+                ApexVert[i] = VertCount++;
+                ++NumApex;
+            }
+        }
+
+        W.SetNumVertices(VertCount);
+        W.Triangles.Reserve(((N - 1) * K * 2 + NumApex * K + K) * 3);
 
         for (int32 i = 0; i < N; ++i)
         {
@@ -170,9 +142,49 @@ namespace TreeMeshBuilder
                 W.UVs[Vi] = FVector2D((float)k / (float)K, V);
                 W.Tangents[Vi] = (-S * Nrm + C * Bin);
 
-                WriteWindVertex(W, Vi, Wn.PivotLocalCm, Wn.BranchLevel01,
+                W.SetWindVertex(Vi, Wn.PivotLocalCm, Wn.BranchLevel01,
                     Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
             }
+        }
+
+        // --- MADERA: vertice apice de cada punta ---
+        // El eje sale del SEGMENTO padre->nodo, no de Node.Dir: el SCA puede
+        // dejar nodos cuya Dir apunta hacia atras, y ahi el cono se meteria
+        // dentro del tubo del padre.
+        for (int32 i = 0; i < N; ++i)
+        {
+            const int32 Av = ApexVert[i];
+            if (Av == INDEX_NONE)
+            {
+                continue;
+            }
+
+            const FBranchNode& Node = Skeleton.Nodes[i];
+            const FVector Seg = Node.Pos - Skeleton.Nodes[Node.Parent].Pos;
+            const float SegLen = (float)Seg.Size();
+            const FVector Axis = Seg.GetSafeNormal(SMALL_NUMBER, Node.Dir);
+            const float Radius = FMath::Max(Node.Radius, MinBranchRadiusCm);
+            const float TipLen = FMath::Max(SegLen * TipConeLengthFrac, Radius * MinTipConeRadii);
+
+            const FTreeWindNode& Wn = Wind.Nodes[i];
+            W.Vertices[Av] = Node.Pos + Axis * TipLen;
+            W.Normals[Av] = Axis;
+            W.UVs[Av] = FVector2D(0.5f, (AlongLen[i] + TipLen) * UvAlongScale);
+            W.Tangents[Av] = FrameN[i];
+            W.SetWindVertex(Av, Wn.PivotLocalCm, Wn.BranchLevel01,
+                Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
+        }
+
+        // --- MADERA: centro de la tapa de la base ---
+        {
+            const FBranchNode& Root = Skeleton.Nodes[0];
+            const FTreeWindNode& Wn = Wind.Nodes[0];
+            W.Vertices[BaseCapVert] = Root.Pos;
+            W.Normals[BaseCapVert] = -Root.Dir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
+            W.UVs[BaseCapVert] = FVector2D(0.5f, 0.f);
+            W.Tangents[BaseCapVert] = FrameN[0];
+            W.SetWindVertex(BaseCapVert, Wn.PivotLocalCm, Wn.BranchLevel01,
+                Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
         }
 
         // --- MADERA: conectar cada anillo con el de su padre ---
@@ -193,67 +205,28 @@ namespace TreeMeshBuilder
             }
         }
 
-        // --- HOJAS: leaf cards en los nodos terminales ---
-        FTreeMeshBuffers& L = OutMesh.Leaves;
-        const float Half = FMath::Max(Species.LeafSizeCm * 0.5f, 0.5f);
-        const float Density = FMath::Clamp(Species.LeafDensity, 0.f, 1.f);
-        // Fase 6: la hoja SIEMPRE se mueve algo, aunque cuelgue de una rama
-        // gruesa: una hoja pesa nada. Se mezcla el balanceo de su rama con un
-        // suelo propio y se escala con el aleteo de la especie.
-        const float Flutter = FMath::Clamp(Species.LeafFlutterScale, 0.f, 2.f);
-
+        // --- MADERA: cierres ---
+        // El abanico del apice es el quad de pared con el anillo del hijo
+        // colapsado en un punto; la tapa de la base, con el del padre. De ahi
+        // sale el winding sin tener que razonarlo de nuevo.
         for (int32 i = 0; i < N; ++i)
         {
-            if (ChildCount[i] != 0) { continue; }                 // solo puntas
-            if (EcoRand::NextUnit(RngState) > Density) { continue; }
+            const int32 Av = ApexVert[i];
+            if (Av == INDEX_NONE) { continue; }
 
-            // Normal de la hoja: mayormente hacia la luz (arriba) con jitter.
-            const FVector LeafN = (FVector::UpVector + 0.6f * RandUnitVector(RngState))
-                .GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
-            FVector U = FVector::CrossProduct(LeafN, FVector::ForwardVector);
-            if (U.IsNearlyZero()) { U = FVector::CrossProduct(LeafN, FVector::RightVector); }
-            U = U.GetSafeNormal(SMALL_NUMBER, FVector::RightVector);
-            const FVector Vv = FVector::CrossProduct(LeafN, U).GetSafeNormal(SMALL_NUMBER, FVector::ForwardVector);
-
-            const FVector Cn = Skeleton.Nodes[i].Pos;
-            const int32 B = L.Vertices.Num();
-
-            L.Vertices.Add(Cn - U * Half - Vv * Half);
-            L.Vertices.Add(Cn + U * Half - Vv * Half);
-            L.Vertices.Add(Cn + U * Half + Vv * Half);
-            L.Vertices.Add(Cn - U * Half + Vv * Half);
-
-            for (int32 j = 0; j < 4; ++j)
+            const int32 BaseI = i * RingVerts;
+            for (int32 k = 0; k < K; ++k)
             {
-                L.Normals.Add(LeafN);
-                L.Tangents.Add(U);
+                W.Triangles.Add(BaseI + k); W.Triangles.Add(Av); W.Triangles.Add(BaseI + k + 1);
             }
-            L.UVs.Add(FVector2D(0.f, 0.f));
-            L.UVs.Add(FVector2D(1.f, 0.f));
-            L.UVs.Add(FVector2D(1.f, 1.f));
-            L.UVs.Add(FVector2D(0.f, 1.f));
-
-            // --- Fase 6: viento/AO de la card ---
-            // Pivote: el de la RAMA de la que cuelga (no el de la hoja). Asi la
-            // hoja acompana el balanceo de su rama; el aleteo de alta frecuencia
-            // lo anade el material como un offset pequeno, que no necesita pivote.
-            const FTreeWindNode& Wn = Wind.Nodes[i];
-            const float LeafSway = FMath::Clamp((0.35f + 0.65f * Wn.SwayWeight) * Flutter, 0.f, 1.f);
-
-            // Desfase POR HOJA, derivado por hash del indice de nodo (NO del
-            // RngState: asi no se altera la secuencia que coloca las hojas y la
-            // geometria sigue siendo identica a la de la Fase 5).
-            const float LeafPhase = FMath::Frac(Wn.Phase01 + 0.6180339887f * static_cast<float>(i));
-
-            for (int32 j = 0; j < 4; ++j)
-            {
-                AppendWindVertex(L, Wn.PivotLocalCm, Wn.BranchLevel01,
-                    LeafSway, LeafPhase, Wn.CanopyAO, Wn.TintVariation);
-            }
-
-            // Dos triangulos (material de hoja two-sided: el winding da igual).
-            L.Triangles.Add(B + 0); L.Triangles.Add(B + 1); L.Triangles.Add(B + 2);
-            L.Triangles.Add(B + 0); L.Triangles.Add(B + 2); L.Triangles.Add(B + 3);
         }
+
+        for (int32 k = 0; k < K; ++k)
+        {
+            W.Triangles.Add(BaseCapVert); W.Triangles.Add(k); W.Triangles.Add(k + 1);
+        }
+
+        // --- HOJAS ---
+        TreeFoliage::Build(Skeleton, Wind, Species, FrameN, FrameB, FineLight, Seed, OutMesh.Leaves);
     }
 }

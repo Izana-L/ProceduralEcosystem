@@ -29,6 +29,8 @@ void FTreeWindData::Reset()
 {
     Nodes.Reset();
     BranchRoot.Reset();
+    ChildCount.Reset();
+    AlongLen.Reset();
 }
 
 bool FTreeWindData::IsValidFor(const FTreeSkeleton& Skeleton) const
@@ -55,9 +57,7 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
     //    hacen falta ANTES de decidir donde empieza cada rama: un nodo abre
     //    rama nueva si su padre bifurco (mas de un hijo).
     // -----------------------------------------------------------------------
-    TArray<int32> ChildCount;
     Skeleton.ComputeChildCounts(ChildCount);
-    TArray<float> AlongLen;
     Skeleton.ComputeAlongLengths(AlongLen);
 
     // -----------------------------------------------------------------------

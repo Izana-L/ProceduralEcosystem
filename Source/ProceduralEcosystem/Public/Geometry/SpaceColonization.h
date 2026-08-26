@@ -35,6 +35,19 @@ struct FSpaceColonizationConfig
 
     /** Activar la autopoda interna (refresco de luz cada LightEvery iters). */
     bool bEnableSelfPruning = true;
+
+    /**
+     * Maximo de hijos que puede acumular UN nodo en toda su vida.
+     *
+     * El paso CRECER recorre TODOS los nodos en cada iteracion, no solo las
+     * puntas, y nada impedia que un nodo que sigue viendo atractores sacara un
+     * hijo nuevo en cada una de las MaxIter pasadas: aparecian nodos con
+     * decenas de hijos, todos partiendo del MISMO anillo de seccion al mallar.
+     * Ese abanico de munones es el artefacto de "apice abierto". Un nodo
+     * saturado deja de reclamar atractores, que pasan al siguiente nodo en
+     * rango, en vez de quedarse bloqueados.
+     */
+    int32 MaxChildrenPerNode = 3;
 };
 
 /**

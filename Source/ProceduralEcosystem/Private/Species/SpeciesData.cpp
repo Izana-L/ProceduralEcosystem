@@ -67,6 +67,31 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             TEXT("StepLengthD > CrownHeightCm: cada paso de crecimiento supera la copa entera; sube MaxIter o baja D.")));
     }
 
+    if (LeafSpacingCm <= 0.f)
+    {
+        Context.AddError(FText::FromString(
+            TEXT("LeafSpacingCm debe ser > 0: es el paso de la espiral filotáctica (divisor en TreeFoliage).")));
+        Fail();
+    }
+    else if (LeafSpacingCm < LeafSizeCm * 0.25f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("LeafSpacingCm (%.1f) muy por debajo de LeafSizeCm (%.1f): las hojas se solaparán mucho y el coste de overdraw se dispara."),
+            LeafSpacingCm, LeafSizeCm)));
+    }
+
+    if (LeafBearingRadiusScale < 1.f)
+    {
+        Context.AddWarning(FText::FromString(
+            TEXT("LeafBearingRadiusScale < 1: ni las ramillas terminales llegarían a llevar hoja.")));
+    }
+
+    if (FMath::IsNearlyZero(FMath::Fmod(PhyllotaxisAngleDeg, 360.f)))
+    {
+        Context.AddWarning(FText::FromString(
+            TEXT("PhyllotaxisAngleDeg = 0: todas las hojas de una ramilla saldrían en el mismo azimut.")));
+    }
+
     return Result;
 }
 #endif // WITH_EDITOR

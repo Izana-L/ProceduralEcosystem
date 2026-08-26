@@ -40,6 +40,9 @@ struct FTreeLightGridFine;
  */
 struct FTreeMeshBuffers
 {
+    /** Fase 6: los pivotes viajan en METROS (ver la nota de precision de TreeWindData.h). */
+    static constexpr float CmToM = 0.01f;
+
     TArray<FVector>   Vertices;
     TArray<int32>     Triangles;
     TArray<FVector>   Normals;
@@ -61,6 +64,52 @@ struct FTreeMeshBuffers
         UV3.Reset();
         Tangents.Reset();
         Colors.Reset();
+    }
+
+    /** Reserva de golpe los OCHO arrays por-vertice (van en lockstep). */
+    void ReserveVertices(int32 Count)
+    {
+        Vertices.Reserve(Count);
+        Normals.Reserve(Count);
+        UVs.Reserve(Count);
+        UV1.Reserve(Count);
+        UV2.Reserve(Count);
+        UV3.Reserve(Count);
+        Tangents.Reserve(Count);
+        Colors.Reserve(Count);
+    }
+
+    /** Dimensiona de golpe los OCHO arrays por-vertice, para escritura indexada. */
+    void SetNumVertices(int32 Count)
+    {
+        Vertices.SetNumUninitialized(Count);
+        Normals.SetNumUninitialized(Count);
+        UVs.SetNumUninitialized(Count);
+        UV1.SetNumUninitialized(Count);
+        UV2.SetNumUninitialized(Count);
+        UV3.SetNumUninitialized(Count);
+        Tangents.SetNumUninitialized(Count);
+        Colors.SetNumUninitialized(Count);
+    }
+
+    /** Fase 6: canales de viento/AO de UN vertice ya existente. */
+    void SetWindVertex(int32 Vi, const FVector& PivotLocalCm, float BranchLevel01,
+        float SwayWeight, float Phase01, float CanopyAO, float Tint)
+    {
+        UV1[Vi] = FVector2D(PivotLocalCm.X * CmToM, PivotLocalCm.Y * CmToM);
+        UV2[Vi] = FVector2D(PivotLocalCm.Z * CmToM, BranchLevel01);
+        UV3[Vi] = FVector2D(SwayWeight, Phase01);
+        Colors[Vi] = FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f);
+    }
+
+    /** Igual, anadiendo al final (los buffers que crecen vertice a vertice). */
+    void AppendWindVertex(const FVector& PivotLocalCm, float BranchLevel01,
+        float SwayWeight, float Phase01, float CanopyAO, float Tint)
+    {
+        UV1.Add(FVector2D(PivotLocalCm.X * CmToM, PivotLocalCm.Y * CmToM));
+        UV2.Add(FVector2D(PivotLocalCm.Z * CmToM, BranchLevel01));
+        UV3.Add(FVector2D(SwayWeight, Phase01));
+        Colors.Add(FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f));
     }
 
     bool IsEmpty() const { return Vertices.Num() == 0 || Triangles.Num() == 0; }
@@ -93,19 +142,27 @@ struct FTreeMeshData
  * en vez de recalcular una base por anillo. UVs cilindricas (u alrededor, v a
  * lo largo) para la corteza. Las uniones se dejan solapar (pragmatico, doc.).
  *
- * HOJAS: leaf cards (quads) en los nodos terminales, con densidad y orientacion
- * (mayormente hacia la luz = arriba) con jitter por-arbol.
+ * CIERRES: el tubo se cierra por los dos extremos. Cada nodo terminal remata en
+ * un vertice APICE unido a su anillo por un abanico de K triangulos (la punta
+ * converge en un punto en vez de dejar una boca abierta), y el anillo de la
+ * raiz se tapa con un abanico plano.
+ *
+ * HOJAS: las coloca TreeFoliage a lo largo de las ramillas por filotaxis; ver
+ * Geometry/TreeFoliage.h.
  *
  * VIENTO Y AO (Fase 6): ademas de la geometria, cada vertice se etiqueta con el
  * pivote de su rama, su nivel jerarquico, cuanto debe balancearse y su oclusion
  * de copa. Sale gratis porque el esqueleto ya conoce padres y radios; es la
  * "sinergia con la Fase 3" del doc. 6.1.
  *
- * Determinista: la seleccion y orientacion de hojas sale del RngState.
+ * Determinista y SIN CONSUMIR RNG: toda la variacion (desfases, jitter de hoja)
+ * sale de hashes de Seed. Asi el mallado nunca desplaza la secuencia aleatoria
+ * que el SCA consumio antes sobre el mismo stream.
  */
 namespace TreeMeshBuilder
 {
     /**
+     * @param Seed       Semilla del arbol. Solo se hashea, nunca se avanza.
      * @param FineLight  Rejilla de luz fina del SCA, para el AO de copa por
      *                   vertice (doc. 6.2). nullptr = AO neutro (todo a 1),
      *                   que es lo correcto para mallas sin contexto.
@@ -113,7 +170,7 @@ namespace TreeMeshBuilder
     PROCEDURALECOSYSTEM_API void BuildMesh(
         const FTreeSkeleton& Skeleton,
         const USpeciesData& Species,
-        uint32& RngState,
+        uint32 Seed,
         FTreeMeshData& OutMesh,
         const FTreeLightGridFine* FineLight = nullptr);
 }

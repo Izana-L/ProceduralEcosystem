@@ -72,11 +72,18 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     // S = tamano del bucket como fraccion del adulto (borde superior del bucket).
     const float S = TreeArchetype::BucketUpperRatio(Key.AgeBucket, Config.NumAgeBuckets);
 
+    // Compresion adicional de la COPA en los buckets jovenes. Con la copa
+    // encogida y la fraccion de tronco subida, el bucket bajo es casi todo
+    // fuste con un penacho arriba: la silueta de un planton, no la de un adulto
+    // en miniatura. Las dos palancas se compensan en altura total, porque
+    // TotalH = CrownHeight / (1 - TrunkFraction).
+    const float CrownSquash = FMath::Lerp(0.30f, 1.f, S);
+
     // --- Longitudes: escalan TODAS con S ---
     // Escalarlas juntas preserva las dos invariantes que valida
     // USpeciesData::IsDataValid: d_k < D < d_i y d_i > hueco de tronco.
-    Sp->CrownRadiusCm = Base->CrownRadiusCm * S;
-    Sp->CrownHeightCm = Base->CrownHeightCm * S;
+    Sp->CrownRadiusCm = Base->CrownRadiusCm * S * CrownSquash;
+    Sp->CrownHeightCm = Base->CrownHeightCm * S * CrownSquash;
     Sp->StepLengthD = Base->StepLengthD * S;
     Sp->InfluenceRadiusDi = Base->InfluenceRadiusDi * S;
     Sp->KillRadiusDk = Base->KillRadiusDk * S;
@@ -91,11 +98,18 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     // tienen menos orden de ramificacion (que es lo que de verdad distingue a un
     // plantón de un adulto) y ademas mallas mas baratas: la libreria hace
     // tambien de LOD por edad.
-    Sp->MaxIter = FMath::Max(6, FMath::RoundToInt(Base->MaxIter * FMath::Lerp(0.35f, 1.f, S)));
-    Sp->NumAttractors = FMath::Max(24, FMath::RoundToInt(Base->NumAttractors * FMath::Lerp(0.15f, 1.f, S)));
+    //
+    // La curva es de POTENCIA, no lineal: un Lerp con S = 0.2 seguia dejando la
+    // mitad de los atractores en el bucket mas pequeno, y con esa densidad la
+    // copa sale ramificada igual. El suelo del Max() esta por debajo de lo que
+    // aporta la cadena de tronco desnudo, asi que ningun arquetipo puede quedar
+    // por debajo de los 2 nodos que exige el mallador.
+    Sp->MaxIter = FMath::Max(4, FMath::RoundToInt(Base->MaxIter * FMath::Pow(S, 0.9f)));
+    Sp->NumAttractors = FMath::Max(12, FMath::RoundToInt(Base->NumAttractors * FMath::Pow(S, 2.2f)));
     Sp->RingSegments = FMath::Clamp(FMath::RoundToInt(Base->RingSegments * FMath::Lerp(0.6f, 1.f, S)), 3, 16);
-    Sp->TrunkFraction = Base->TrunkFraction * FMath::Lerp(0.35f, 1.f, S); // copa mas baja de joven
+    Sp->TrunkFraction = FMath::Clamp(FMath::Lerp(0.62f, Base->TrunkFraction, S), 0.f, 0.95f);
     Sp->LeafSizeCm = Base->LeafSizeCm * FMath::Lerp(0.55f, 1.f, S);       // hoja relativamente MAYOR de joven
+    Sp->LeafSpacingCm = Base->LeafSpacingCm * FMath::Lerp(0.55f, 1.f, S); // ... y por tanto mas junta
 
     // --- Fase 6: un arbol joven es MAS flexible que uno adulto ---
     // Un tronco de 2 m se dobla con el viento; uno de 20 m con 60 cm de diametro
@@ -106,7 +120,13 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
 
     // --- Variante: perturbacion pequena y ESTABLE de la morfologia ---
     // (doc. 4.2: "variacion parametrizada ... para que no haya dos identicos").
-    uint32 VRng = EcoRand::Hash32(Key.Pack() * 0x9E3779B9u + 0x51ED270Bu);
+    //
+    // La semilla IGNORA el bucket a proposito. Si entrase, un arbol cambiaria de
+    // radio de copa, de altura y de tropismos cada vez que cruza de bucket: no
+    // ganaria estructura con la edad, se convertiria en otro arbol. Con la
+    // semilla atada solo a (especie, variante), los 5 buckets son cinco etapas
+    // de la MISMA morfologia.
+    uint32 VRng = EcoRand::Hash32(FArchetypeKey(Key.Species, 0, Key.Variant).Pack() * 0x9E3779B9u + 0x51ED270Bu);
     auto Jitter = [&VRng](float Value, float Amount)
         {
             return Value * (1.f + Amount * (2.f * EcoRand::NextUnit(VRng) - 1.f));

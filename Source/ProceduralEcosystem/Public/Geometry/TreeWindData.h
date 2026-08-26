@@ -116,10 +116,18 @@ struct PROCEDURALECOSYSTEM_API FTreeWindData
     /** Un elemento por nodo del esqueleto, en el mismo orden. */
     TArray<FTreeWindNode> Nodes;
 
-    /** Indice de la rama a la que pertenece cada nodo (= indice del nodo que la
-        inicia). Se expone porque el mallador lo usa para dar a cada leaf card el
-        desfase de SU rama. */
+    /** Indice del nodo que INICIA la rama a la que pertenece cada nodo. Se
+        expone porque TreeFoliage lo usa como sal estable por rama al derivar el
+        desfase y el jitter de cada hoja. */
     TArray<int32> BranchRoot;
+
+    /** Nº de hijos de cada nodo. Se publica porque Build() ya paga la pasada y
+        el mallador la necesita (puntas = nodos sin hijos): una sola copia. */
+    TArray<int32> ChildCount;
+
+    /** Longitud acumulada desde la raiz hasta cada nodo (cm). Igual que
+        ChildCount: se calcula una vez aqui y la comparten mallador y follaje. */
+    TArray<float> AlongLen;
 
     void Reset();
 
