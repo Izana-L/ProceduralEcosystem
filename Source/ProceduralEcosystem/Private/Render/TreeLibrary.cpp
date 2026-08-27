@@ -90,6 +90,23 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     Sp->TipRadiusCm = Base->TipRadiusCm * S;
     Sp->FineVoxelSizeCm = FMath::Max(5.f, Base->FineVoxelSizeCm * S);
     Sp->MaxHeightCm = Base->MaxHeightCm * S;
+    Sp->TrunkFlareHeightCm = FMath::Max(1.f, Base->TrunkFlareHeightCm * S);
+
+    // --- Perfil y relieve de tronco: NO son invariantes de escala ---
+    // Un planton no tiene contrafuertes ni corteza acostillada: eso lo construye
+    // el arbol con las decadas. Escalar el ensanche por S a secas dejaria a los
+    // buckets bajos con un pie desproporcionado, que es peor que no tenerlo.
+    Sp->TrunkFlareStrength = Base->TrunkFlareStrength * FMath::Lerp(0.25f, 1.f, S);
+
+    // El relieve cae con S^2 a proposito: por debajo del umbral del mallador se
+    // apaga solo, y con el se apagan tambien los segmentos de anillo extra. Los
+    // buckets pequenos -que son los que se instancian a millares- se quedan asi
+    // en la malla barata de siempre.
+    Sp->SectionLobeAmount = Base->SectionLobeAmount * S * S;
+    Sp->BarkReliefAmount = Base->BarkReliefAmount * S * S;
+
+    // Un planton es casi todo eje con un penacho: el lider llega arriba del todo.
+    Sp->LeaderFraction = FMath::Clamp(FMath::Lerp(0.9f, Base->LeaderFraction, S), 0.f, 1.f);
 
     // --- Complejidad: un plantón NO es un adulto a escala ---
     // Si escalasemos TODO por S, el SCA es invariante de escala y las 5 mallas
@@ -142,7 +159,13 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     // SCA no arranca (ningun atractor en rango del nodo base): arquetipo vacio.
     Sp->KillRadiusDk = FMath::Clamp(Sp->KillRadiusDk, 0.1f, Sp->StepLengthD * 0.9f);
     Sp->InfluenceRadiusDi = FMath::Max(Sp->InfluenceRadiusDi, Sp->StepLengthD * 1.2f);
+    if (Sp->SubCrownFraction <= 0.f)
     {
+        // Sin falda de sub-copa, el atractor mas bajo esta en la base de la copa
+        // y el nodo raiz tiene que alcanzarlo o el SCA no arranca. Con falda hay
+        // atractores repartidos por el fuste, asi que esta red de seguridad
+        // sobra -y estirar d_i de mas empeora el cono de percepcion, porque cada
+        // nodo pasa a competir por atractores mucho mas lejanos.
         const float TF = FMath::Clamp(Sp->TrunkFraction, 0.f, 0.95f);
         const float TrunkGapCm = Sp->CrownHeightCm * TF / (1.f - TF);
         Sp->InfluenceRadiusDi = FMath::Max(Sp->InfluenceRadiusDi, TrunkGapCm * 1.1f + Sp->StepLengthD);

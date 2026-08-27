@@ -3,6 +3,21 @@
 #include "CoreMinimal.h"
 
 /**
+ * Bits de FBranchNode::Flags. Caben en el padding que el struct ya tenia, asi
+ * que marcar el eje principal no cuesta memoria (ver la nota de tamano abajo).
+ */
+enum EBranchNodeFlag : uint8
+{
+    BNF_None = 0,
+
+    /** El nodo forma parte del EJE PRINCIPAL (tronco + lider que atraviesa la
+        copa). Lo marca el SCA al pre-construir el eje y lo consumen el perfil
+        de tronco (que solo afila y ensancha el eje) y los datos de viento (el
+        eje continua SIEMPRE la misma rama al bifurcar, ver TreeWindData). */
+    BNF_Axis = 1 << 0
+};
+
+/**
  * Un nodo del esqueleto de ramas de un arbol (doc. Fase 3, 3.2).
  *
  * El esqueleto es una lista de nodos con puntero al PADRE (indice), no un
@@ -30,8 +45,36 @@ struct FBranchNode
     FVector Dir = FVector::UpVector;
 
     /** Radio de la rama en este nodo (cm). Se rellena al final con el pipe
-        model (doc. 3.6); vale 0 hasta entonces. */
+        model (doc. 3.6); vale 0 hasta entonces. Es el radio que MALLA el
+        tubo, o sea el que ya lleva encima el perfil de tronco. */
     float Radius = 0.f;
+
+    /**
+     * Radio ESTRUCTURAL del pipe model, sin el perfil de tronco (ensanche de
+     * base y taper) que ApplyTrunkProfile aplica despues sobre Radius.
+     *
+     * Existe porque hay consumidores que preguntan "que tan gruesa es esta
+     * rama" para deducir RIGIDEZ, no para dibujarla: FTreeWindData normaliza
+     * el balanceo contra el radio de la base, y si esa referencia llevase el
+     * ensanche de raiz -que puede duplicar el radio del pie- todo el arbol
+     * pasaria a considerarse "fino" y se balancearia de mas. La geometria usa
+     * Radius; la fisica del viento, PipeRadius.
+     */
+    float PipeRadius = 0.f;
+
+    /** Bits de EBranchNodeFlag (BNF_Axis). */
+    uint8 Flags = 0;
+
+    /** El nodo pertenece al eje principal (tronco + lider). */
+    FORCEINLINE bool IsAxis() const { return (Flags & BNF_Axis) != 0; }
+
+    /**
+     * Radio estructural con FALLBACK a Radius. Los esqueletos construidos a
+     * mano (tests, utilidades) rellenan Radius y no PipeRadius; sin el
+     * fallback verian grosor 0 y las formulas que dividen por el radio de la
+     * base darian resultados absurdos.
+     */
+    FORCEINLINE float GetPipeRadius() const { return (PipeRadius > 0.f) ? PipeRadius : Radius; }
 };
 
 /**
@@ -74,8 +117,12 @@ struct PROCEDURALECOSYSTEM_API FTreeSkeleton
      * Anade un hijo de ParentIndex en Pos con direccion Dir (debe venir
      * normalizada). Deriva Depth = Padre.Depth + 1 y preserva la invariante
      * Parent < indice. Devuelve el indice del nuevo nodo.
+     *
+     * InFlags son bits de EBranchNodeFlag; pasa BNF_Axis al encadenar el eje
+     * principal. Por defecto 0 (rama normal), asi que las llamadas existentes
+     * no cambian de significado.
      */
-    int32 AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir);
+    int32 AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir, uint8 InFlags = BNF_None);
 
     /**
      * Nº de hijos de cada nodo. UNICA copia de la pasada que necesitan tanto el

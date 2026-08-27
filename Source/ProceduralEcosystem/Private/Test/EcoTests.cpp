@@ -10,6 +10,10 @@
 #include "Render/TreeArchetype.h"
 #include "Geometry/TreeSkeleton.h"    // Fase 6
 #include "Geometry/TreeWindData.h"    // Fase 6
+#include "Geometry/SpaceColonization.h"
+#include "Geometry/AttractorCloud.h"
+#include "Geometry/TreeLightGridFine.h"
+#include "Geometry/TreeMeshBuilder.h"
 #include "Species/SpeciesData.h"      // Fase 6
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -382,9 +386,13 @@ bool FEcoWindData::RunTest(const FString&) {
     const int32 B0 = Sk.AddChild(Fork, FVector(-80, 0, 380.0), FVector(-1, 0, 0.5).GetSafeNormal());
 
     // Radios como los dejaria el pipe model: gruesos abajo, finos arriba.
+    // A0 (indice 4) queda mas GRUESO que B0 (indice 6): eso hace de A la rama
+    // que continua el tronco y de B la lateral, que es justo lo que se testea.
     for (int32 i = 0; i < Sk.Num(); ++i)
     {
-        Sk.Nodes[i].Radius = FMath::Lerp(10.f, 1.f, (float)i / FMath::Max(1, Sk.Num() - 1));
+        const float R = FMath::Lerp(10.f, 1.f, (float)i / FMath::Max(1, Sk.Num() - 1));
+        Sk.Nodes[i].Radius = R;
+        Sk.Nodes[i].PipeRadius = R;
     }
 
     FTreeWindData Wind;
@@ -417,16 +425,23 @@ bool FEcoWindData::RunTest(const FString&) {
         Wind.Nodes[2].PivotLocalCm.Equals(FVector::ZeroVector, 0.01));
     TestTrue(TEXT("el tronco es el nivel 0"), FMath::IsNearlyEqual(Wind.Nodes[2].BranchLevel01, 0.f, 1e-4f));
 
-    // 4) Ramas hermanas: nacen de la MISMA horquilla, asi que comparten pivote
-    //    (es el punto de insercion, no el primer nodo), pero se mueven con
-    //    desfases distintos y su nivel es mayor que el del tronco.
-    TestTrue(TEXT("las hijas son de nivel mayor que el tronco"),
-        Wind.Nodes[A0].BranchLevel01 > Wind.Nodes[2].BranchLevel01);
-    TestTrue(TEXT("ramas hermanas -> mismo pivote (la horquilla)"),
-        Wind.Nodes[A0].PivotLocalCm.Equals(Wind.Nodes[B0].PivotLocalCm, 0.01));
-    TestTrue(TEXT("el pivote es la horquilla, no el primer nodo de la rama"),
-        Wind.Nodes[A0].PivotLocalCm.Equals(Sk.Nodes[Fork].Pos, 0.01));
-    TestTrue(TEXT("ramas hermanas -> desfases distintos"),
+    // 4) En una bifurcacion, el hijo MAS GRUESO continua la rama del padre y
+    //    solo los mas finos abren rama nueva.
+    //
+    //    No es un detalle cosmetico: con un eje principal que atraviesa la copa,
+    //    el eje bifurca en CADA insercion lateral. Con la regla ingenua ("el
+    //    padre bifurco -> los dos hijos abren rama") el propio tronco se
+    //    contaria como rama nueva a media altura, su pivote se reiniciaria ahi y
+    //    el fuste se balancearia como una ramita colgada del punto equivocado.
+    TestTrue(TEXT("el hijo mas grueso continua la rama del tronco"),
+        Wind.Nodes[A0].PivotLocalCm.Equals(FVector::ZeroVector, 0.01));
+    TestTrue(TEXT("el hijo mas grueso conserva el nivel del tronco"),
+        FMath::IsNearlyEqual(Wind.Nodes[A0].BranchLevel01, Wind.Nodes[2].BranchLevel01, 1e-4f));
+    TestTrue(TEXT("el hijo mas fino abre rama nueva (nivel mayor)"),
+        Wind.Nodes[B0].BranchLevel01 > Wind.Nodes[A0].BranchLevel01);
+    TestTrue(TEXT("el pivote de la rama nueva es la horquilla, no su primer nodo"),
+        Wind.Nodes[B0].PivotLocalCm.Equals(Sk.Nodes[Fork].Pos, 0.01));
+    TestTrue(TEXT("continuacion y rama nueva -> desfases distintos"),
         !FMath::IsNearlyEqual(Wind.Nodes[A0].Phase01, Wind.Nodes[B0].Phase01, 1e-5f));
 
     // 5) DETERMINISMO: misma semilla, mismos datos; semilla distinta, desfases distintos.
@@ -448,6 +463,395 @@ bool FEcoWindData::RunTest(const FString&) {
     Rigid.Build(Sk, *Sp, nullptr, 12345u);
     TestTrue(TEXT("mas rigidez -> menos balanceo"),
         Rigid.Nodes[A1].SwayWeight < Wind.Nodes[A1].SwayWeight);
+
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Troncos organicos y reparto de ramas
+// ---------------------------------------------------------------------------
+
+/** Especie de prueba coherente (cumple d_k < D < d_i) y pequena, para que el
+    SCA termine rapido dentro de la bateria de tests. */
+static USpeciesData* EcoTestSpecies(UObject* Outer)
+{
+    USpeciesData* Sp = NewObject<USpeciesData>(Outer);
+    if (!Sp) { return nullptr; }
+
+    Sp->CrownShape = ECrownShape::Conical;
+    Sp->CrownRadiusCm = 250.f;
+    Sp->CrownHeightCm = 600.f;
+    Sp->TrunkFraction = 0.3f;
+    Sp->NumAttractors = 250;
+
+    Sp->StepLengthD = 40.f;
+    Sp->InfluenceRadiusDi = 200.f;
+    Sp->KillRadiusDk = 30.f;
+    Sp->MaxIter = 40;
+    Sp->LightEvery = 0;              // sin autopoda: aisla la geometria
+    Sp->FineVoxelSizeCm = 35.f;
+
+    Sp->TipRadiusCm = 1.5f;
+    Sp->PipeExp = 2.2f;
+    Sp->RingSegments = 12;
+    return Sp;
+}
+
+/**
+ * El perfil de tronco convierte el cilindro del pipe model en un fuste.
+ *
+ * El esqueleto es una CADENA sin bifurcaciones a proposito: es el caso donde el
+ * pipe model da r_padre = r_hijo exactamente y de donde salia el cilindro
+ * perfecto. Si el perfil no lo arregla aqui, no lo arregla en ningun sitio.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTrunkProfile, "Eco.Arbol.PerfilDeTronco", EcoTestFlags)
+bool FEcoTrunkProfile::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->TrunkFlareStrength = 1.f;
+    Sp->TrunkFlareHeightCm = 100.f;
+    Sp->TrunkTopTaper = 0.7f;
+    Sp->TrunkTaperExp = 1.5f;
+
+    FTreeSkeleton Sk;
+    Sk.InitRoot(FVector::ZeroVector, FVector::UpVector);
+    int32 Prev = 0;
+    for (int32 i = 1; i <= 12; ++i)
+    {
+        Prev = Sk.AddChild(Prev, FVector(0, 0, i * 50.0), FVector::UpVector, BNF_Axis);
+    }
+    const int32 N = Sk.Num();
+
+    SpaceColonization::ComputeRadii(Sk, *Sp);
+
+    // 1) Punto de partida: el pipe model, en una cadena, es un CILINDRO.
+    //    (Es el diagnostico del problema, escrito como test.)
+    TestTrue(TEXT("el pipe model da radio constante en una cadena"),
+        FMath::IsNearlyEqual(Sk.Nodes[0].PipeRadius, Sk.Nodes[N / 2].PipeRadius, 1e-4f));
+
+    SpaceColonization::ApplyTrunkProfile(Sk, *Sp);
+
+    // 2) El pie es claramente mas ancho que el fuste a media altura.
+    TestTrue(TEXT("la base es mas ancha que el fuste"),
+        Sk.Nodes[0].Radius > Sk.Nodes[N / 2].Radius * 1.2f);
+
+    // 3) ... y el fuste afila hacia arriba.
+    TestTrue(TEXT("el eje afila con la altura"),
+        Sk.Nodes[N / 2].Radius > Sk.Nodes[N - 1].Radius);
+
+    // 4) MONOTONIA: ningun nodo mas fino que su hijo. Sin esta pasada el
+    //    afilado deja el eje mas fino que el primer nodo de copa y aparece un
+    //    estrangulamiento en cono invertido, que es muy visible.
+    for (int32 i = 1; i < N; ++i)
+    {
+        const int32 P = Sk.Nodes[i].Parent;
+        TestTrue(TEXT("ningun nodo es mas fino que su hijo"),
+            Sk.Nodes[P].Radius >= Sk.Nodes[i].Radius - KINDA_SMALL_NUMBER);
+    }
+
+    // 5) El radio ESTRUCTURAL no se toca: es la referencia del viento y llevarle
+    //    el ensanche de raiz haria que todo el arbol se balancease de mas.
+    TestTrue(TEXT("el perfil no contamina PipeRadius"),
+        FMath::IsNearlyEqual(Sk.Nodes[0].PipeRadius, Sk.Nodes[N / 2].PipeRadius, 1e-4f));
+    TestTrue(TEXT("el ensanche solo esta en Radius"),
+        Sk.Nodes[0].Radius > Sk.Nodes[0].PipeRadius);
+
+    // 6) Con el perfil desactivado, Radius vuelve a ser exactamente el del pipe model.
+    Sp->TrunkFlareStrength = 0.f;
+    Sp->TrunkTopTaper = 1.f;
+    FTreeSkeleton Plain;
+    Plain.InitRoot(FVector::ZeroVector, FVector::UpVector);
+    Prev = 0;
+    for (int32 i = 1; i <= 12; ++i)
+    {
+        Prev = Plain.AddChild(Prev, FVector(0, 0, i * 50.0), FVector::UpVector, BNF_Axis);
+    }
+    SpaceColonization::ComputeRadii(Plain, *Sp);
+    SpaceColonization::ApplyTrunkProfile(Plain, *Sp);
+    TestTrue(TEXT("perfil desactivado -> Radius == PipeRadius"),
+        FMath::IsNearlyEqual(Plain.Nodes[0].Radius, Plain.Nodes[0].PipeRadius, 1e-4f));
+
+    return true;
+}
+
+/** El angulo de insercion separa la rama lateral de su padre, y ni un grado mas. */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoBranchAngle, "Eco.Arbol.AnguloDeInsercion", EcoTestFlags)
+bool FEcoBranchAngle::RunTest(const FString&) {
+    const FVector Parent = FVector::UpVector;
+    const float MinDeg = 45.f;
+    const float CosMin = FMath::Cos(FMath::DegreesToRadians(MinDeg));
+
+    // 1) Una direccion casi paralela al padre se abre hasta el minimo exacto.
+    {
+        const FVector Almost = FVector(0.05f, 0.f, 1.f).GetSafeNormal();
+        const FVector Out = SpaceColonization::ApplyBranchAngle(Almost, Parent, MinDeg);
+        TestTrue(TEXT("se abre hasta el angulo pedido"),
+            FMath::IsNearlyEqual((float)FVector::DotProduct(Out, Parent), CosMin, 1e-3f));
+        TestTrue(TEXT("sigue siendo unitaria"), FMath::IsNearlyEqual((float)Out.Size(), 1.f, 1e-3f));
+
+        // El giro es MINIMO: se queda en el plano que formaban padre y direccion.
+        const FVector PlaneN = FVector::CrossProduct(Parent, Almost).GetSafeNormal();
+        TestTrue(TEXT("el giro se queda en el plano padre-direccion"),
+            FMath::Abs((float)FVector::DotProduct(Out, PlaneN)) < 1e-3f);
+    }
+
+    // 2) Una direccion que YA se separa lo suficiente no se toca.
+    {
+        const FVector Wide = FVector(1.f, 0.f, 0.2f).GetSafeNormal();
+        const FVector Out = SpaceColonization::ApplyBranchAngle(Wide, Parent, MinDeg);
+        TestTrue(TEXT("no toca lo que ya se separaba"), Out.Equals(Wide, 1e-4));
+    }
+
+    // 3) Caso degenerado: direccion IDENTICA al padre. No hay plano que
+    //    preservar, pero tiene que salir algo unitario y separado, no un NaN.
+    {
+        const FVector Out = SpaceColonization::ApplyBranchAngle(Parent, Parent, MinDeg);
+        TestTrue(TEXT("caso paralelo: unitaria"), FMath::IsNearlyEqual((float)Out.Size(), 1.f, 1e-3f));
+        TestTrue(TEXT("caso paralelo: separada"),
+            (float)FVector::DotProduct(Out, Parent) <= CosMin + 1e-3f);
+    }
+
+    // 4) Angulo 0 = desactivado.
+    {
+        const FVector Almost = FVector(0.05f, 0.f, 1.f).GetSafeNormal();
+        TestTrue(TEXT("0 grados = desactivado"),
+            SpaceColonization::ApplyBranchAngle(Almost, Parent, 0.f).Equals(Almost, 1e-4));
+    }
+
+    return true;
+}
+
+/**
+ * Seccion no circular SIN abrir la costura del tubo.
+ *
+ * Los vertices k = 0 y k = K de cada anillo son el MISMO punto, duplicado solo
+ * para cerrar la UV en u = 1. Cualquier deformacion que no sea exactamente
+ * periodica en el angulo los separa y abre una raja a lo largo de todo el
+ * tronco. Es el fallo mas facil de introducir aqui y el mas dificil de
+ * diagnosticar mirando la malla, asi que va como test y no como comentario.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSectionSeam, "Eco.Arbol.SeccionYCostura", EcoTestFlags)
+bool FEcoSectionSeam::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->SectionLobeAmount = 0.15f;
+    Sp->SectionLobeCount = 3;
+    Sp->BarkReliefAmount = 0.06f;
+    Sp->RingSegments = 12;           // >= 8: el mallador no tiene que subirlo
+
+    uint32 Rng = 4242u;
+    FTreeSkeleton Sk;
+    FTreeLightGridFine Light;
+    FAttractorCloud Cloud;
+    const FSpaceColonizationConfig Cfg;
+    SpaceColonization::GrowTree(*Sp, Rng, FVector::ZeroVector, nullptr, Cfg, Sk, Light, Cloud);
+
+    if (Sk.Num() < 2) { AddError(TEXT("El SCA no produjo esqueleto.")); return false; }
+
+    FTreeMeshData Mesh;
+    TreeMeshBuilder::BuildMesh(Sk, *Sp, /*Seed*/ 4242u, Mesh, &Light);
+
+    const FTreeMeshBuffers& W = Mesh.Wood;
+    const int32 K = 12;
+    const int32 RingVerts = K + 1;
+    const int32 N = Sk.Num();
+
+    if (W.Vertices.Num() < N * RingVerts + 1)
+    {
+        AddError(TEXT("El mallador no produjo el bloque de anillos esperado."));
+        return false;
+    }
+
+    // 1) COSTURA cerrada, bit a bit. No vale "casi igual": la tolerancia se la
+    //    come el desplazamiento del material al aplicar el viento.
+    for (int32 i = 0; i < N; ++i)
+    {
+        const int32 A = i * RingVerts;
+        const int32 B = A + K;
+        if (!(W.Vertices[A] == W.Vertices[B]))
+        {
+            AddError(FString::Printf(TEXT("Costura abierta en el anillo %d: %s vs %s"),
+                i, *W.Vertices[A].ToString(), *W.Vertices[B].ToString()));
+            break;
+        }
+        if (!W.Normals[A].Equals(W.Normals[B], 1e-4))
+        {
+            AddError(FString::Printf(TEXT("Normal distinta a los dos lados de la costura en el anillo %d."), i));
+            break;
+        }
+    }
+
+    // 2) La seccion del tronco YA NO es una circunferencia.
+    {
+        float MinR = TNumericLimits<float>::Max();
+        float MaxR = 0.f;
+        for (int32 k = 0; k < K; ++k)
+        {
+            const float R = (float)FVector::Dist(W.Vertices[k], Sk.Nodes[0].Pos);
+            MinR = FMath::Min(MinR, R);
+            MaxR = FMath::Max(MaxR, R);
+        }
+        TestTrue(TEXT("la seccion del tronco no es circular"), MaxR > MinR * 1.02f);
+    }
+
+    // 3) Las normales dejan de ser radiales puras: si no, el sombreado seguiria
+    //    leyendose como un cilindro liso y la deformacion solo estaria en la
+    //    silueta.
+    {
+        bool bAnyNonRadial = false;
+        for (int32 k = 0; k < K && !bAnyNonRadial; ++k)
+        {
+            const FVector Radial = (W.Vertices[k] - Sk.Nodes[0].Pos).GetSafeNormal();
+            if (FVector::DotProduct(Radial, W.Normals[k]) < 0.999f)
+            {
+                bAnyNonRadial = true;
+            }
+        }
+        TestTrue(TEXT("las normales se recalculan sobre la superficie deformada"), bAnyNonRadial);
+    }
+
+    // 4) Ningun vertice degenerado (el clamp del radio tiene que sostenerse).
+    for (int32 v = 0; v < W.Vertices.Num(); ++v)
+    {
+        if (W.Vertices[v].ContainsNaN())
+        {
+            AddError(FString::Printf(TEXT("Vertice %d con NaN."), v));
+            break;
+        }
+    }
+
+    // 5) DETERMINISMO: misma semilla, misma malla exacta.
+    {
+        uint32 Rng2 = 4242u;
+        FTreeSkeleton Sk2; FTreeLightGridFine L2; FAttractorCloud C2;
+        SpaceColonization::GrowTree(*Sp, Rng2, FVector::ZeroVector, nullptr, Cfg, Sk2, L2, C2);
+        FTreeMeshData Mesh2;
+        TreeMeshBuilder::BuildMesh(Sk2, *Sp, 4242u, Mesh2, &L2);
+
+        TestEqual(TEXT("misma semilla -> mismo numero de vertices"),
+            Mesh2.Wood.Vertices.Num(), W.Vertices.Num());
+        bool bSame = (Mesh2.Wood.Vertices.Num() == W.Vertices.Num());
+        for (int32 v = 0; bSame && v < W.Vertices.Num(); ++v)
+        {
+            bSame = (Mesh2.Wood.Vertices[v] == W.Vertices[v]);
+        }
+        TestTrue(TEXT("misma semilla -> misma geometria"), bSame);
+    }
+
+    return true;
+}
+
+/**
+ * El eje atraviesa la copa y las ramas se reparten por el fuste.
+ *
+ * Es el test de la queja original: en copa conica el radio de la envolvente es
+ * MAXIMO justo en la base de la copa, que era donde moria el tronco, asi que su
+ * punta veia todos los atractores gordos y se los llevaba -> silueta de
+ * paraguas. Con el lider recorriendo la copa, las inserciones tienen que
+ * repartirse en altura.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLeaderSpread, "Eco.Arbol.EjeYRepartoDeRamas", EcoTestFlags)
+bool FEcoLeaderSpread::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->CrownShape = ECrownShape::Conical;
+    Sp->LeaderFraction = 1.f;        // conifera excurrente: el eje llega al apice
+    Sp->SubCrownFraction = 0.15f;
+    Sp->EnvelopeNoise = 0.25f;
+    Sp->BranchAngleDeg = 60.f;
+
+    uint32 Rng = 7u;
+    FTreeSkeleton Sk;
+    FTreeLightGridFine Light;
+    FAttractorCloud Cloud;
+    const FSpaceColonizationConfig Cfg;
+    SpaceColonization::GrowTree(*Sp, Rng, FVector::ZeroVector, nullptr, Cfg, Sk, Light, Cloud);
+
+    const int32 N = Sk.Num();
+    if (N < 8) { AddError(TEXT("El SCA no produjo suficiente esqueleto.")); return false; }
+
+    const float CrownH = Sp->CrownHeightCm;
+    const float TrunkH = CrownH * Sp->TrunkFraction / (1.f - Sp->TrunkFraction);
+    const float CrownBaseZ = TrunkH;
+    const float ApexZ = CrownBaseZ + CrownH;
+
+    // 1) El eje llega ARRIBA, no muere en la base de la copa.
+    float AxisTopZ = 0.f;
+    int32 AxisNodes = 0;
+    for (int32 i = 0; i < N; ++i)
+    {
+        if (Sk.Nodes[i].IsAxis())
+        {
+            AxisTopZ = FMath::Max(AxisTopZ, (float)Sk.Nodes[i].Pos.Z);
+            ++AxisNodes;
+        }
+    }
+    TestTrue(TEXT("el eje atraviesa la copa"), AxisTopZ > CrownBaseZ + CrownH * 0.6f);
+    TestTrue(TEXT("el eje tiene varios nodos"), AxisNodes >= 4);
+
+    // 2) Las INSERCIONES de rama (nodos no-eje colgados del eje) se reparten en
+    //    altura en vez de amontonarse en la punta del fuste.
+    int32 TotalInsertions = 0;
+    int32 LowInsertions = 0;              // por debajo de la mitad de la copa
+    const float MidZ = CrownBaseZ + CrownH * 0.5f;
+    for (int32 i = 1; i < N; ++i)
+    {
+        const int32 P = Sk.Nodes[i].Parent;
+        if (P < 0 || !Sk.Nodes[P].IsAxis() || Sk.Nodes[i].IsAxis()) { continue; }
+
+        ++TotalInsertions;
+        if (Sk.Nodes[P].Pos.Z < MidZ) { ++LowInsertions; }
+    }
+
+    TestTrue(TEXT("hay ramas laterales colgando del eje"), TotalInsertions >= 4);
+    if (TotalInsertions > 0)
+    {
+        const float LowFrac = (float)LowInsertions / (float)TotalInsertions;
+        if (LowFrac < 0.25f)
+        {
+            AddError(FString::Printf(
+                TEXT("Solo el %.0f%% de las inserciones esta en la mitad baja de la copa: las ramas siguen concentradas arriba (silueta de paraguas)."),
+                LowFrac * 100.f));
+        }
+    }
+
+    // 3) La falda de sub-copa siembra atractores POR DEBAJO de la base de copa.
+    {
+        int32 BelowCrown = 0;
+        for (const FAttractor& A : Cloud.Attractors)
+        {
+            if (A.Pos.Z < CrownBaseZ - 1.f) { ++BelowCrown; }
+        }
+        TestTrue(TEXT("la falda siembra bajo la base de copa"), BelowCrown > 0);
+    }
+
+    // 4) El eje afila con la altura: es el "cuanto mas alto, menos grueso" que
+    //    sale del pipe model en cuanto hay ramas laterales repartidas.
+    {
+        int32 LowAxis = INDEX_NONE, HighAxis = INDEX_NONE;
+        for (int32 i = 0; i < N; ++i)
+        {
+            if (!Sk.Nodes[i].IsAxis()) { continue; }
+            if (LowAxis == INDEX_NONE) { LowAxis = i; }
+            HighAxis = i;
+        }
+        if (LowAxis != INDEX_NONE && HighAxis != LowAxis)
+        {
+            TestTrue(TEXT("el eje es mas fino arriba que abajo"),
+                Sk.Nodes[HighAxis].Radius < Sk.Nodes[LowAxis].Radius);
+        }
+    }
+
+    // 5) La copa no se sale de la envolvente por arriba (el eje no se dispara).
+    for (int32 i = 0; i < N; ++i)
+    {
+        if (Sk.Nodes[i].Pos.Z > ApexZ + CrownH * 0.5f)
+        {
+            AddError(TEXT("Hay nodos muy por encima del apice: el eje o el SCA se ha disparado."));
+            break;
+        }
+    }
 
     return true;
 }

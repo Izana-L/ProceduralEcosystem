@@ -39,41 +39,102 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
     const float TrunkH = TotalH - CrownH;              // = Frac * TotalH
     const float CrownBaseZ = TrunkBaseWorld.Z + TrunkH;
 
+    const float EnvNoise = FMath::Clamp(Species.EnvelopeNoise, 0.f, 0.6f);
+    const float Gamma = FMath::Clamp(Species.CrownVerticalBias, 0.25f, 4.f);
+    const float SkirtFrac = FMath::Clamp(Species.SubCrownFraction, 0.f, 0.4f);
+    const int32 NumSkirt = FMath::Clamp(FMath::RoundToInt(N * SkirtFrac), 0, N - 1);
+
+    // Offsets del ruido de envolvente desde un SUB-STREAM derivado por hash del
+    // estado de entrada: asi la envolvente blanda no consume del stream
+    // principal y no desplaza el jitter que el SCA gastara despues.
+    const uint32 EnvSeed = RngState;
+    const FVector NoiseOffset(
+        (float)(EcoRand::Hash32(EnvSeed ^ 0x1B873593u) % 8192u) * 0.125f,
+        (float)(EcoRand::Hash32(EnvSeed ^ 0xCC9E2D51u) % 8192u) * 0.125f,
+        (float)(EcoRand::Hash32(EnvSeed ^ 0x85EBCA6Bu) % 8192u) * 0.125f);
+
     for (int32 i = 0; i < N; ++i)
     {
-        // t = altura normalizada dentro de la copa: 0 = base de copa, 1 = apice.
-        const float T = EcoRand::NextUnit(RngState);
+        // Los ultimos NumSkirt van a la FALDA de sub-copa (bajo la base de copa).
+        const bool bSkirt = (i >= N - NumSkirt);
 
-        // Radio de la envolvente a esa altura, segun la forma de la especie.
+        // Altura normalizada y radio de la envolvente a esa altura. Los dos
+        // caminos consumen el MISMO numero de valores del RNG (3), para que la
+        // secuencia no dependa de cuantos atractores caen en la falda.
+        float T = 0.f;
         float RadiusAtT = 0.f;
-        switch (Species.CrownShape)
-        {
-        case ECrownShape::Conical:
-            RadiusAtT = CrownR * (1.f - T);                 // ancha abajo, punta arriba
-            break;
+        float Z = 0.f;
+        float NoiseT = 0.f;   // coordenada vertical del ruido de contorno
 
-        case ECrownShape::Columnar:
-            RadiusAtT = CrownR * (1.f - 0.15f * T);         // casi recta, leve estrechamiento
-            break;
-
-        case ECrownShape::Spherical:
-        default:
+        if (bSkirt)
         {
-            const float U = 2.f * T - 1.f;                  // -1..1 (centro de copa en T=0.5)
-            RadiusAtT = CrownR * FMath::Sqrt(FMath::Max(0.f, 1.f - U * U)); // elipsoide
-            break;
+            // Falda: unas pocas ramas bajas dispersas por el fuste, con la
+            // densidad y el alcance cayendo hacia el suelo (el cuadrado sesga
+            // las muestras hacia la copa).
+            //
+            // Sin esto el tronco desnudo es una zona PROHIBIDA para las ramas y
+            // la copa arranca de golpe en un plano: eso es exactamente lo que
+            // concentra todas las ramas en la punta del fuste.
+            const float S = EcoRand::NextUnit(RngState);
+            const float Down = S * S;
+            T = 0.f;
+            NoiseT = -0.6f * Down; // el ruido continua por debajo de la copa
+            Z = CrownBaseZ - Down * TrunkH * 0.85f;
+            RadiusAtT = CrownR * FMath::Lerp(0.55f, 0.12f, Down);
         }
+        else
+        {
+            // t = altura normalizada dentro de la copa: 0 = base de copa, 1 = apice.
+            // El exponente Gamma sesga la densidad en vertical sin cambiar la forma.
+            T = FMath::Pow(EcoRand::NextUnit(RngState), Gamma);
+            NoiseT = T;
+            Z = CrownBaseZ + T * CrownH;
+
+            // Radio de la envolvente a esa altura, segun la forma de la especie.
+            switch (Species.CrownShape)
+            {
+            case ECrownShape::Conical:
+                RadiusAtT = CrownR * (1.f - T);                 // ancha abajo, punta arriba
+                break;
+
+            case ECrownShape::Columnar:
+                RadiusAtT = CrownR * (1.f - 0.15f * T);         // casi recta, leve estrechamiento
+                break;
+
+            case ECrownShape::Spherical:
+            default:
+            {
+                const float U = 2.f * T - 1.f;                  // -1..1 (centro de copa en T=0.5)
+                RadiusAtT = CrownR * FMath::Sqrt(FMath::Max(0.f, 1.f - U * U)); // elipsoide
+                break;
+            }
+            }
         }
 
         // Disco horizontal area-uniforme (r = R*sqrt(U), sin apelmazar en el eje).
         const float Angle = EcoRand::NextRange(RngState, 0.f, 2.f * PI);
+
+        // Ruido de contorno. Tiene que ser COHERENTE en azimut y altura, no
+        // blanco: con ruido blanco la silueta no cambiaria, porque el maximo
+        // estadistico de cientos de muestras reconstruye la envolvente exacta.
+        // Se muestrea en (cos, sin, altura), lo que ademas lo hace periodico en
+        // el azimut por construccion (no hay costura en Angle = 0).
+        if (EnvNoise > 0.f)
+        {
+            const FVector NoisePos = NoiseOffset + FVector(
+                FMath::Cos(Angle) * 1.9f,
+                FMath::Sin(Angle) * 1.9f,
+                NoiseT * 2.6f);
+            RadiusAtT *= FMath::Clamp(1.f + EnvNoise * FMath::PerlinNoise3D(NoisePos), 0.15f, 1.85f);
+        }
+
         const float Rr = RadiusAtT * FMath::Sqrt(EcoRand::NextUnit(RngState));
 
         FAttractor A;
         A.Pos = FVector(
             TrunkBaseWorld.X + FMath::Cos(Angle) * Rr,
             TrunkBaseWorld.Y + FMath::Sin(Angle) * Rr,
-            CrownBaseZ + T * CrownH);
+            Z);
         A.bAlive = true;
         A.BestNode = INDEX_NONE;
         A.BestDist = 0.f;

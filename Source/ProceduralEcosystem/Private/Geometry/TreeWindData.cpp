@@ -68,6 +68,45 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
     BranchRoot.SetNumUninitialized(N);
     TArray<int32> Level;      Level.SetNumZeroed(N);
 
+    // -----------------------------------------------------------------------
+    // 2a) Que hijo CONTINUA la rama de su padre en cada bifurcacion.
+    //
+    // No basta con "si el padre bifurco, el hijo abre rama nueva": con un eje
+    // principal que atraviesa la copa, el eje bifurca en cada insercion lateral
+    // y se contaria a si mismo como rama nueva en cada una. Su pivote se
+    // reiniciaria a media altura y el TRONCO acabaria balanceandose como una
+    // ramita colgada del punto equivocado.
+    //
+    // Regla: continua el hijo MAS GRUESO (y el eje siempre gana), que ademas es
+    // lo botanicamente correcto -una rama no "termina" donde le sale una hija,
+    // termina donde se acaba-. Los hermanos mas finos si abren rama nueva.
+    //
+    // Se usa el radio ESTRUCTURAL: el de mallado lleva encima el ensanche de
+    // base, que cerca del suelo puede invertir el orden de grosores.
+    // -----------------------------------------------------------------------
+    TArray<int32> Continuation; Continuation.Init(INDEX_NONE, N);
+    {
+        TArray<float> BestScore; BestScore.Init(-1.f, N);
+        for (int32 i = 1; i < N; ++i)
+        {
+            const int32 P = FMath::Clamp(Skeleton.Nodes[i].Parent, 0, N - 1);
+
+            float Score = Skeleton.Nodes[i].GetPipeRadius();
+            if (Skeleton.Nodes[i].IsAxis() && Skeleton.Nodes[P].IsAxis())
+            {
+                Score += 1.e6f; // el eje continua al eje, pase lo que pase
+            }
+
+            // Comparacion ESTRICTA: en empate gana el de indice menor, asi que
+            // el resultado no depende del orden de recorrido -> determinista.
+            if (Score > BestScore[P])
+            {
+                BestScore[P] = Score;
+                Continuation[P] = i;
+            }
+        }
+    }
+
     BranchRoot[0] = 0;
     Level[0] = 0;
 
@@ -81,10 +120,11 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
 
         MaxAlong = FMath::Max(MaxAlong, AlongLen[i]);
 
-        if (ChildCount[P] > 1)
+        if (ChildCount[P] > 1 && Continuation[P] != i)
         {
-            // El padre bifurco: este nodo ARRANCA una rama nueva y su pivote es
-            // el punto de insercion, o sea el propio padre.
+            // El padre bifurco y este NO es el hijo que continua la rama: este
+            // nodo ARRANCA una rama nueva y su pivote es el punto de insercion,
+            // o sea el propio padre.
             BranchRoot[i] = i;
             Level[i] = Level[P] + 1;
         }
@@ -105,7 +145,12 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
 
     // Radio del tronco en la base: sirve de referencia de "grosor maximo" para
     // decidir que es rigido y que es flexible.
-    const float BaseRadius = FMath::Max(Skeleton.Nodes[0].Radius, KINDA_SMALL_NUMBER);
+    //
+    // Es el radio ESTRUCTURAL, no el de mallado: el ensanche de raiz puede casi
+    // duplicar el radio del pie sin que el arbol sea ni un gramo mas rigido, y
+    // usarlo aqui haria que TODO el arbol se considerase relativamente fino y se
+    // balancease de mas.
+    const float BaseRadius = FMath::Max(Skeleton.Nodes[0].GetPipeRadius(), KINDA_SMALL_NUMBER);
 
     // Rigidez de la especie: 1 = conifera rigida (apenas se mueve), 0 = especie
     // de rama larga y flexible. Se dobla en la malla, asi que el material no
@@ -145,7 +190,7 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
         //       Sale gratis del pipe model de la Fase 3, que ya calculo el radio
         //       de cada nodo -- otra sinergia de generar la geometria nosotros.
         const float T = FMath::Clamp(AlongLen[i] * InvMaxAlong, 0.f, 1.f);
-        const float Thin = 1.f - FMath::Clamp(Node.Radius / BaseRadius, 0.f, 1.f);
+        const float Thin = 1.f - FMath::Clamp(Node.GetPipeRadius() / BaseRadius, 0.f, 1.f);
         const float Shape = FMath::Pow(T, SwayFalloffExp) * (0.30f + 0.70f * Thin);
 
         Out.SwayWeight = FMath::Clamp(Shape * SpeciesFlex, 0.f, 1.f);

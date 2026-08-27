@@ -46,8 +46,23 @@ struct FSpaceColonizationConfig
      * Ese abanico de munones es el artefacto de "apice abierto". Un nodo
      * saturado deja de reclamar atractores, que pasan al siguiente nodo en
      * rango, en vez de quedarse bloqueados.
+     *
+     * A 2 la ramificacion es BINARIA, que es lo botanicamente tipico: el primer
+     * hijo continua la rama y el segundo la bifurca. A 3 ya se lee como
+     * deshilachado.
      */
-    int32 MaxChildrenPerNode = 3;
+    int32 MaxChildrenPerNode = 2;
+
+    /**
+     * Igual, pero para los nodos del EJE PRINCIPAL (BNF_Axis).
+     *
+     * El eje se pre-construye entero antes del bucle del SCA, asi que cada uno
+     * de sus nodos interiores YA gasta un hijo en su propia continuacion. Con
+     * el presupuesto general de 2 solo podria sacar una rama lateral y el
+     * fuste saldria pelado; con 3 saca dos, que es lo que da un verticilo
+     * decente sin volver al abanico.
+     */
+    int32 MaxAxisChildrenPerNode = 3;
 };
 
 /**
@@ -83,12 +98,43 @@ namespace SpaceColonization
     PROCEDURALECOSYSTEM_API FVector JitterDirection(const FVector& Dir, float NoiseAmount, uint32& RngState);
 
     /**
+     * Fuerza que una rama lateral se SEPARE de la direccion de su padre al
+     * menos MinAngleDeg (doc: angulo de insercion). Si Dir ya se separa lo
+     * suficiente se devuelve tal cual; si no, se gira dentro del plano que
+     * forman Dir y ParentDir, que es el giro minimo posible y por tanto el que
+     * menos estropea la direccion que eligio el SCA.
+     *
+     * Solo debe aplicarse al PRIMER nodo de la rama: aplicado a toda la cadena
+     * impediria que el SCA la dirigiese hacia sus atractores.
+     */
+    PROCEDURALECOSYSTEM_API FVector ApplyBranchAngle(const FVector& Dir, const FVector& ParentDir, float MinAngleDeg);
+
+    /**
      * Radios de rama por pipe model (doc. 3.6): r_padre^n = sum r_hijo^n. Una
      * pasada de las puntas a la base aprovechando la invariante de FTreeSkeleton
      * (Parent < indice): recorrer en indice decreciente visita hijos antes que
      * padres, sin ordenar. Las puntas arrancan con TipRadiusCm.
      */
     PROCEDURALECOSYSTEM_API void ComputeRadii(FTreeSkeleton& Skeleton, const USpeciesData& Species);
+
+    /**
+     * Perfil de tronco sobre los radios del pipe model (ensanche de base +
+     * afilado del eje). Escribe FBranchNode::Radius y NO toca PipeRadius, que
+     * es la referencia estructural que consumen los datos de viento.
+     *
+     * POR QUE HACE FALTA: el pipe model da r_padre = r_hijo EXACTAMENTE en una
+     * cadena sin bifurcaciones, asi que el tronco desnudo salia como un
+     * cilindro perfecto. El pipe model no esta mal -describe la madera
+     * funcional-, simplemente no describe la geometria externa de un tronco,
+     * que acumula corteza y albura y ensancha en el pie para repartir el
+     * momento de vuelco.
+     *
+     * Termina con una pasada de MONOTONIA (ningun nodo mas fino que su hijo
+     * mas grueso). Sin ella, el afilado puede dejar el eje mas fino que el
+     * primer nodo de copa y aparece un estrangulamiento en cono invertido
+     * justo bajo la copa.
+     */
+    PROCEDURALECOSYSTEM_API void ApplyTrunkProfile(FTreeSkeleton& Skeleton, const USpeciesData& Species);
 
     /**
      * Genera el esqueleto de UN arbol por colonizacion del espacio.

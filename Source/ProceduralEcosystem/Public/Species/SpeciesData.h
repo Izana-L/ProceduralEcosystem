@@ -115,6 +115,55 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Copa", meta = (ClampMin = "1"))
     int32 NumAttractors = 400;
 
+    /**
+     * Hasta dónde sube el EJE PRINCIPAL dentro de la copa, como fracción de la
+     * altura de copa. 0 = el tronco muere en la base de la copa (comportamiento
+     * anterior); 1 = líder central que llega al ápice.
+     *
+     * Es la palanca excurrente/decurrente y arregla de raíz el artefacto de
+     * "todas las ramas salen de la cima del tronco": si el eje termina en la
+     * base de la copa, ese nodo es el ÚNICO que ve los atractores más gordos
+     * (en una copa cónica el radio máximo cae justo ahí) y se los lleva todos,
+     * de donde sale la silueta de paraguas. Con el eje atravesando la copa hay
+     * nodos a todas las alturas y las ramas se reparten por el fuste.
+     *
+     * Y el afilado sale GRATIS del pipe model: cada rama lateral aporta su r^n
+     * al eje por debajo de su inserción, así que el eje es grueso abajo y fino
+     * arriba sin ningún truco. Conífera 0.9-1.0; roble/haya 0.3-0.5.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Copa", meta = (ClampMin = "0", ClampMax = "1"))
+    float LeaderFraction = 0.5f;
+
+    /**
+     * Amplitud del ruido que deforma el CONTORNO de la envolvente de copa.
+     * 0 = molde exacto (cónico/esférico/columnar perfecto), 0.25 = lóbulos y
+     * golfos naturales. El ruido es COHERENTE en azimut y altura, no blanco:
+     * con ruido blanco la silueta no cambiaría, porque el máximo estadístico
+     * de cientos de muestras reconstruye la envolvente original.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Copa", meta = (ClampMin = "0", ClampMax = "0.6"))
+    float EnvelopeNoise = 0.25f;
+
+    /**
+     * Sesgo vertical de la densidad de atractores dentro de la copa (exponente
+     * de la altura normalizada). 1 = uniforme; < 1 lleva masa hacia el ápice;
+     * > 1 la baja hacia la base de la copa. Controla "dónde está el grueso de
+     * la copa" sin cambiar su forma.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Copa", meta = (ClampMin = "0.25", ClampMax = "4"))
+    float CrownVerticalBias = 1.f;
+
+    /**
+     * Fracción de atractores sembrados POR DEBAJO de la base de copa, con la
+     * densidad cayendo hacia el suelo ("falda" de sub-copa).
+     *
+     * Sin esto el tronco desnudo es una zona prohibida para las ramas y la copa
+     * arranca de golpe en un plano, que es lo que se lee como artificial. Un
+     * 10-15% basta para las ramas bajas dispersas de un árbol real.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Copa", meta = (ClampMin = "0", ClampMax = "0.4"))
+    float SubCrownFraction = 0.12f;
+
     // --- Tropismos: dirección de crecimiento por iteración (doc. §3.4) ---
     /** Peso del llenado de espacio (dirección promedio hacia los atractores). */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tropismos", meta = (ClampMin = "0"))
@@ -135,6 +184,34 @@ public:
     /** Jitter de dirección por-árbol (0..1): variación reproducible desde el RngState. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tropismos", meta = (ClampMin = "0", ClampMax = "1"))
     float DirNoise = 0.1f;
+
+    /**
+     * SEMIángulo del cono de percepción del paso "asociar" del SCA: un nodo
+     * solo compite por los atractores que caen dentro de ese cono alrededor de
+     * su propia dirección. 180 = esfera completa (desactivado).
+     *
+     * Es el clásico "ángulo de percepción" del SCA (Runions et al., 2007) y el
+     * arreglo más barato del abanico de ramas: sin él, un nodo reclama incluso
+     * los atractores que tiene DETRÁS, y la punta del eje -que está centrada-
+     * resulta ser la más cercana a casi todo y se lo lleva todo.
+     *
+     * Ojo al bajarlo: un cono demasiado estrecho deja atractores huérfanos y el
+     * árbol se queda corto. Baja desde 95 en pasos pequeños.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tropismos", meta = (ClampMin = "20", ClampMax = "180"))
+    float PerceptionAngleDeg = 95.f;
+
+    /**
+     * Ángulo MÍNIMO de inserción de una rama lateral respecto a la dirección de
+     * su padre. 0 = desactivado (la rama sale con la dirección que le den los
+     * tropismos, que puede ser casi paralela al padre y se lee como si el eje
+     * se hubiera deshilachado). 45-80 en coníferas da la lectura de verticilo.
+     *
+     * Solo se aplica al PRIMER nodo de la rama: si se aplicara a toda la cadena,
+     * el SCA dejaría de poder dirigirla hacia los atractores.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tropismos", meta = (ClampMin = "0", ClampMax = "85"))
+    float BranchAngleDeg = 45.f;
 
     // --- Radios del SCA: debe cumplirse d_k < D < d_i (doc. §3.1, Apéndice A) ---
     /** D: longitud del internodo (paso por iteración), cm. Fija la resolución del esqueleto. */
@@ -176,10 +253,77 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|PipeModel", meta = (ClampMin = "0.05", ClampMax = "1.0"))
     float TipTaper = 0.35f;
 
+    // ================================================================
+    // --- Perfil de tronco: lo que el pipe model NO describe ---
+    // ================================================================
+    // El pipe model (r_padre^n = Σ r_hijo^n) modela la MADERA FUNCIONAL, o sea
+    // la conservación del área de xilema, y es correcto como tal. Pero en una
+    // cadena sin bifurcaciones da r_padre = r_hijo EXACTAMENTE, así que el
+    // tronco desnudo salía como un cilindro matemáticamente perfecto.
+    //
+    // Un tronco real no es eso: acumula albura, duramen y corteza durante
+    // décadas, y en el pie añade el ensanche de raíz (root flare / butt swell)
+    // que reparte el momento de vuelco al suelo. Eso es geometría externa, no
+    // hidráulica, y por tanto va aquí encima y no dentro del pipe model.
+
+    /** Cuánto se ensancha el pie del tronco sobre su radio estructural.
+        0.8 = el pie es un 80% más ancho que el fuste. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0", ClampMax = "3"))
+    float TrunkFlareStrength = 0.8f;
+
+    /** Altura característica del ensanche (cm): decae como exp(-h/esto), así
+        que a 3x esta altura ya no queda nada. Típico: 8-12% de la altura total. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "1"))
+    float TrunkFlareHeightCm = 120.f;
+
+    /** Radio del eje en su punta como fracción del que le da el pipe model.
+        < 1 afila el fuste con la altura. 1 = solo el pipe model. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0.2", ClampMax = "1"))
+    float TrunkTopTaper = 0.82f;
+
+    /** Curvatura del afilado a lo largo del eje. > 1 concentra el adelgazamiento
+        arriba (fuste recto y luego afila); < 1 lo reparte desde abajo. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0.25", ClampMax = "4"))
+    float TrunkTaperExp = 1.5f;
+
+    /** Desviación máxima de la vertical del eje, en grados: la curvatura suave
+        de todo el fuste (un árbol se inclina como un todo). 0 = poste recto. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0", ClampMax = "20"))
+    float TrunkSweepDeg = 4.f;
+
+    /** Serpenteo de alta frecuencia, nodo a nodo, en grados. Pequeño: es el
+        detalle que quita la lectura de "extrusión perfecta". */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0", ClampMax = "8"))
+    float TrunkWobbleDeg = 1.2f;
+
     // --- Mallado: de esqueleto a malla (doc. §3.7) ---
-    /** K: nº de vértices del anillo de sección de cada rama (tubos). */
+    /** K: nº de vértices del anillo de sección de cada rama (tubos).
+        OJO: por debajo de 8 no hay resolución angular para el relieve de
+        sección; el mallador sube el mínimo efectivo si hay deformación activa. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "3", ClampMax = "16"))
-    int32 RingSegments = 6;
+    int32 RingSegments = 10;
+
+    /**
+     * Amplitud de los LÓBULOS de la sección, como fracción del radio. La sección
+     * deja de ser una circunferencia y pasa a ser un polígono redondeado que
+     * además GIRA lentamente con la altura, que es lo que se lee como "tronco
+     * retorcido" en vez de "cilindro".
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "0", ClampMax = "0.4"))
+    float SectionLobeAmount = 0.10f;
+
+    /** Nº de lóbulos de la sección. 2 = sección elíptica, 3-4 = tronco acostillado. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "2", ClampMax = "6"))
+    int32 SectionLobeCount = 3;
+
+    /**
+     * Relieve grueso de la superficie (bultos y hendiduras), como fracción del
+     * radio. Deliberadamente PEQUEÑO: las grietas finas de la corteza son
+     * trabajo del material -las texturas de Materials_TreeBark ya traen normal
+     * y height- y meterlas como geometría solo gasta triángulos.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Malla", meta = (ClampMin = "0", ClampMax = "0.2"))
+    float BarkReliefAmount = 0.05f;
 
     // --- Follaje: filotaxis (ver Geometry/TreeFoliage.h) ---
     // Las hojas se reparten a lo largo de las ramillas, una por ranura cada

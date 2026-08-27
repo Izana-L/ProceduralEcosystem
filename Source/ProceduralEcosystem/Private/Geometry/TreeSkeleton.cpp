@@ -20,11 +20,13 @@ int32 FTreeSkeleton::InitRoot(const FVector& TrunkBaseWorld, const FVector& Init
     Root.Depth = 0;
     Root.Dir = InitialDir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
     Root.Radius = 0.f;
+    Root.PipeRadius = 0.f;
+    Root.Flags = BNF_Axis; // la raiz es, por definicion, el pie del eje principal
 
     return Nodes.Add(Root); // siempre 0: Nodes se acaba de vaciar
 }
 
-int32 FTreeSkeleton::AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir)
+int32 FTreeSkeleton::AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir, uint8 InFlags)
 {
     // La invariante Parent < indice exige que el padre ya exista. Si no,
     // devolvemos -1 en vez de corromper el esqueleto (el SCA nunca deberia
@@ -40,6 +42,8 @@ int32 FTreeSkeleton::AddChild(int32 ParentIndex, const FVector& Pos, const FVect
     Child.Depth = Nodes[ParentIndex].Depth + 1;
     Child.Dir = Dir.GetSafeNormal(SMALL_NUMBER, Nodes[ParentIndex].Dir);
     Child.Radius = 0.f;
+    Child.PipeRadius = 0.f;
+    Child.Flags = InFlags;
 
     return Nodes.Add(Child);
 }
