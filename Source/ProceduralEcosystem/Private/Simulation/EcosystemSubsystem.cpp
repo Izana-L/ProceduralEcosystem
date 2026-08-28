@@ -146,6 +146,13 @@ static FAutoConsoleCommandWithWorld GEcoLogDeaths(TEXT("Eco.Deaths.Log"),
     TEXT("Loguea el nº total de muertes y las ultimas del buffer (Fase 5)."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogRecentDeaths(); }));
 
+// Estructura demografica por especie: es lo que hay que mirar para calibrar la
+// longevidad, porque el recuento de poblacion no distingue un bosque maduro de
+// un vivero (mil plantones y mil arboles de dosel son el mismo numero).
+static FAutoConsoleCommandWithWorld GEcoDemographics(TEXT("Eco.Demografia"),
+    TEXT("Reparto por especie y estado, edades y fraccion de arboles ya crecidos."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogDemographics(); }));
+
 // --- Fase 5 (Paso 5): descomposicion visible en el terreno ---
 static FAutoConsoleCommandWithWorld GEcoPaintDecomp(TEXT("Eco.PaintDecomposition"),
     TEXT("Pinta el heatmap de descomposicion (puntos de muerte recientes) sobre el terreno."),
@@ -1107,12 +1114,35 @@ void UEcosystemSubsystem::SeedInitialPopulation(int32 Count)
         if (!Sp) { continue; }
 
         const uint32 AgentSeed = Rng.U32(EEcoRngStream::Colonization);
-        const float InitialBiomass = Sp->MaxBiomass * Rng.RangeF(EEcoRngStream::Colonization, 0.005f, 0.03f);
 
-        Agents_Read.Add(Site, static_cast<uint16>(SpeciesIdx), AgentSeed, /*Age*/ 0.f, InitialBiomass);
+        // EDAD ESCALONADA, no toda la cohorte a cero.
+        //
+        // Con Age = 0 para todos, la poblacion fundadora es una unica cohorte que
+        // envejece en bloque y muere en bloque: no se nota al arrancar, pero
+        // alrededor de la mediana de muerte (~1.28*Longevity^0.8 años) se abre un
+        // claro simultaneo en todo el mapa y el bosque se reinicia solo. Con la
+        // longevidad recalibrada eso pasaria a los ~200 años simulados, o sea
+        // justo cuando uno se pone a mirar el bosque maduro.
+        //
+        // El tope 0.35 deja a los fundadores repartidos por la mitad joven de la
+        // curva: hay adultos desde el primer momento, pero ninguno arranca ya
+        // senescente (la senescencia entra en 0.40*Longevity).
+        const float InitialAge = Rng.RangeF(EEcoRngStream::Colonization, 0.f, 0.35f * Sp->Longevity);
+
+        // La biomasa acompaña a la edad: un fundador de 150 años con biomasa de
+        // plantula seria un arbol viejo del tamano de un arbusto durante las
+        // primeras decadas, y ademas sombrearia como tal (el grid de luz lee
+        // Height, que sale de Biomass).
+        const float AgeRatio = FMath::Clamp(InitialAge / FMath::Max(Sp->Longevity, KINDA_SMALL_NUMBER), 0.f, 1.f);
+        const float InitialBiomass = FMath::Min(
+            Sp->MaxBiomass * (Rng.RangeF(EEcoRngStream::Colonization, 0.005f, 0.03f) + 1.6f * AgeRatio),
+            Sp->MaxBiomass);
+
+        Agents_Read.Add(Site, static_cast<uint16>(SpeciesIdx), AgentSeed, InitialAge, InitialBiomass);
     }
 
-    UE_LOG(LogEco, Log, TEXT("[Eco] Sembradas %d plantulas (poblacion total: %d)."), Count, Agents_Read.Num());
+    UE_LOG(LogEco, Log, TEXT("[Eco] Sembrados %d arboles con edades escalonadas (poblacion total: %d)."),
+        Count, Agents_Read.Num());
 }
 // ---------------------------------------------------------------------------
 //  Hero trees (Fase 3)
@@ -1197,6 +1227,84 @@ void UEcosystemSubsystem::LogPopulationStats() const
 
     UE_LOG(LogEco, Log, TEXT("[Eco] Tick %lld | Poblacion total: %d | %s"),
         TickCount, GetLivePopulationCount(), *Breakdown);
+}
+
+void UEcosystemSubsystem::LogDemographics() const
+{
+    if (Agents_Read.Num() == 0)
+    {
+        UE_LOG(LogEco, Log, TEXT("[Eco] Demografia | tick %lld: no hay arboles."), TickCount);
+        return;
+    }
+
+    struct FSpeciesDemo
+    {
+        int32 Saplings = 0, Mature = 0, Senescent = 0;
+        int32 Grown = 0;      // >= 70% de MaxBiomass: los que "llenan" el bosque
+        double AgeSum = 0.0;
+        float  AgeMax = 0.f;
+    };
+
+    TArray<FSpeciesDemo> BySpecies;
+    BySpecies.SetNum(ResolvedSpecies.Num());
+
+    int32 Counted = 0;
+    for (int32 i = 0; i < Agents_Read.Num(); ++i)
+    {
+        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+
+        const int32 s = Agents_Read.SpeciesId[i];
+        if (!BySpecies.IsValidIndex(s)) { continue; }
+
+        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(s));
+        if (!Sp) { continue; }
+
+        FSpeciesDemo& D = BySpecies[s];
+        switch (Agents_Read.State[i])
+        {
+        case ETreeState::Sapling:   ++D.Saplings;  break;
+        case ETreeState::Mature:    ++D.Mature;    break;
+        case ETreeState::Senescent: ++D.Senescent; break;
+        default: break;
+        }
+
+        const float Age = Agents_Read.Age[i];
+        D.AgeSum += Age;
+        D.AgeMax = FMath::Max(D.AgeMax, Age);
+        if (Agents_Read.Biomass[i] >= 0.7f * Sp->MaxBiomass) { ++D.Grown; }
+        ++Counted;
+    }
+
+    UE_LOG(LogEco, Log, TEXT("[Eco] Demografia | tick %lld | %d arboles vivos | %lld muertes acumuladas"),
+        TickCount, Counted, DeathEventCounter);
+
+    for (int32 s = 0; s < BySpecies.Num(); ++s)
+    {
+        const FSpeciesDemo& D = BySpecies[s];
+        const int32 Live = D.Saplings + D.Mature + D.Senescent;
+        if (Live == 0) { continue; }
+
+        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(s));
+        const float InvLive = 1.f / static_cast<float>(Live);
+
+        // "Mediana teorica" = 1.282*L^0.8, la edad a la que la mortalidad por edad
+        // se lleva a la mitad de una cohorte (ver USpeciesData::Longevity). Se
+        // imprime al lado de la edad maxima observada porque juntas dicen de un
+        // vistazo si el bosque esta llegando donde deberia.
+        const float MedianTarget = Sp ? 1.282f * FMath::Pow(FMath::Max(Sp->Longevity, 1.f), 0.8f) : 0.f;
+
+        UE_LOG(LogEco, Log,
+            TEXT("  %-16s n=%4d | plantula %4.1f%% adulto %4.1f%% senescente %4.1f%% | crecidos %4.1f%% | edad media %6.1f max %6.1f (mediana esperada %6.1f)"),
+            Sp ? *Sp->SpeciesName.ToString() : TEXT("?"),
+            Live,
+            100.f * D.Saplings * InvLive,
+            100.f * D.Mature * InvLive,
+            100.f * D.Senescent * InvLive,
+            100.f * D.Grown * InvLive,
+            static_cast<float>(D.AgeSum) * InvLive,
+            D.AgeMax,
+            MedianTarget);
+    }
 }
 
 // ---------------------------------------------------------------------------

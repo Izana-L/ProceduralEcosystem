@@ -120,6 +120,20 @@ public:
     void LogStateFingerprint() const;
     void LogFiniteCheck() const;
 
+    /**
+     * Estructura DEMOGRAFICA del bosque por especie (consola: Eco.Demografia):
+     * reparto por estado, edades, que fraccion de la poblacion ya esta crecida y
+     * cuantas muertes lleva acumuladas.
+     *
+     * Es el instrumento con el que se calibra la longevidad. LogPopulationStats
+     * dice CUANTOS arboles hay, que es justo lo que no distingue un bosque maduro
+     * de un vivero: mil plantones y mil arboles de dosel son el mismo numero.
+     *
+     * Solo lee: no toca estado de simulacion ni consume RNG, asi que llamarlo no
+     * cambia el fingerprint ni la evolucion de la partida.
+     */
+    void LogDemographics() const;
+
     /** Desglose del coste del tick por etapas + memoria de las estructuras
         (consola: Eco.Profile). Es el punto de partida obligatorio de la Fase 6. */
     void LogTickProfile() const;

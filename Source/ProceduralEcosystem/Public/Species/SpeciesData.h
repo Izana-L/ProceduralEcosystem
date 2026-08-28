@@ -21,6 +21,66 @@ enum class ECrownShape : uint8
 };
 
 /**
+ * Como se dobla el tronco de un arbol al que le ha tocado una capa de
+ * deformacion (ver FTrunkDeformLayerSpec y el namespace TrunkDeformer).
+ */
+UENUM(BlueprintType)
+enum class ETrunkDeformType : uint8
+{
+    /** Inclinacion RIGIDA: todo el arbol gira el mismo angulo alrededor de su
+        pie. Se lee como "plantado torcido" o crecido en ladera. Con angulos
+        grandes parece que se cae: mantenlo por debajo de ~10 grados. */
+    Lean,
+
+    /** Arqueado progresivo (angulo * t^ShapeParam): sale vertical del suelo y se
+        va tumbando con la altura. ES el arbol arqueado, y el unico tipo cuya
+        lectura mejora con angulos grandes. */
+    Arc,
+
+    /** Sinuoso: el tronco serpentea (ShapeParam = nº de ondas en toda la
+        altura). Con 1.5-2 se lee como madera de ribera; con mas, como ruido. */
+    SCurve
+};
+
+/**
+ * UNA capa de deformacion de tronco declarada por la especie.
+ *
+ * Cada arbol tira los dados por CADA capa del array de forma independiente, asi
+ * que la especie no describe "como es su tronco" sino la DISTRIBUCION de
+ * troncos que produce: con Probability 0.4 sobre una capa Arc, cuatro de cada
+ * diez individuos salen arqueados y el resto rectos, y los cuatro con angulos
+ * y azimuts distintos.
+ *
+ * Componer varias capas es la forma de conseguir formas que ninguna da sola
+ * (p.ej. Arc suave + SCurve pequena = tronco volcado y ademas ondulado).
+ */
+USTRUCT(BlueprintType)
+struct FTrunkDeformLayerSpec
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deformacion")
+    ETrunkDeformType Type = ETrunkDeformType::Arc;
+
+    /** Probabilidad de que a un arbol le toque ESTA capa [0..1]. 0 = desactivada
+        (pero sigue consumiendo sus muestras: ver el contrato de TrunkDeformer). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deformacion", meta = (ClampMin = "0", ClampMax = "1"))
+    float Probability = 0.25f;
+
+    /** Angulo minimo de la capa, en grados. Se sortea uniforme en [Min, Max]. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deformacion", meta = (ClampMin = "0", ClampMax = "45"))
+    float MinAngleDeg = 5.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deformacion", meta = (ClampMin = "0", ClampMax = "45"))
+    float MaxAngleDeg = 18.f;
+
+    /** Exponente t^k del arqueo (Arc) o nº de ondas (SCurve). Ignorado en Lean.
+        En Arc: < 1 arquea desde abajo, > 1 mantiene el pie recto y vuelca arriba. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deformacion", meta = (ClampMin = "0.25", ClampMax = "6"))
+    float ShapeParam = 1.5f;
+};
+
+/**
 
 /**
  * Parámetros de especie. Son compartidos y de solo lectura en runtime: la
@@ -55,9 +115,34 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0.01"))
     float MaxBiomass = 100.f;
 
-    /** Longevidad en años simulados. Divisor en la mortalidad por edad: debe ser > 0. */
+    /**
+     * ESCALA de la mortalidad por edad, en años simulados. Divisor en la
+     * fórmula, debe ser > 0.
+     *
+     * NO ES "LA EDAD A LA QUE MUERE EL ÁRBOL", y confundirlo es el error que
+     * dejaba el bosque lleno de plantones. La mortalidad por edad es un hazard
+     * acumulativo, pAge = dt·(Edad/Longevity)^4 por año (EcologyRules.h), así
+     * que la EDAD MEDIANA DE MUERTE no es Longevity sino
+     *
+     *      T_mediana ≈ 1.282 · Longevity^0.8          (con YearsPerTick = 1)
+     *
+     * y para calibrarla al revés, si quieres que la mitad de los árboles pase
+     * de T años:
+     *
+     *      Longevity = (T / 1.282)^1.25
+     *
+     * Con el viejo 200 la mediana caía en ~89 años: la mayor parte de la
+     * población moría antes de terminar de crecer (a vigor medio, el logístico
+     * tarda ~55 años en llegar al 95% de MaxBiomass). Con 600 la mediana sube a
+     * ~214 años y un árbol pasa tres cuartas partes de su vida ya crecido, que
+     * es lo que llena el bosque de adultos de distinta altura en vez de
+     * plantones.
+     *
+     * Valores de referencia: 400 -> mediana ~155 años (pionera de vida corta);
+     * 600 -> ~214; 800 -> ~269 (árbol de dosel longevo).
+     */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0.01"))
-    float Longevity = 200.f;
+    float Longevity = 600.f;
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ciclo vital", meta = (ClampMin = "0"))
     float MaturityAge = 20.f;
@@ -296,6 +381,32 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco", meta = (ClampMin = "0", ClampMax = "8"))
     float TrunkWobbleDeg = 1.2f;
 
+    // ================================================================
+    // --- Deformación de tronco: arqueado / torcido POR ÁRBOL ---
+    // ================================================================
+    // TrunkSweepDeg y TrunkWobbleDeg de arriba son sinuosidad SIEMPRE ACTIVA y
+    // sutil: todos los árboles de la especie la llevan, y su tope duro (~20°,
+    // MaxAxisTiltRad) existe porque viven dentro del bucle que encadena el eje,
+    // que avanza en Z y pararía de avanzar con ángulos grandes.
+    //
+    // Esto es otra cosa: una TIRADA por árbol que decide si ESE individuo sale
+    // arqueado, y cuánto. Se aplica como un doblado isométrico del esqueleto
+    // YA TERMINADO (namespace TrunkDeformer), así que puede llegar a ángulos que
+    // el eje del SCA no puede alcanzar, y dobla también la copa.
+
+    /**
+     * Capas de deformación de tronco de esta especie. Array VACÍO = ningún árbol
+     * se deforma, y la geometría sale bit a bit idéntica a la de antes de que
+     * existiera este sistema (el deformador ni siquiera se ejecuta).
+     *
+     * OJO AL ORDEN: cada capa consume un nº fijo de muestras del sub-stream del
+     * árbol, en orden de array. Añadir capas AL FINAL no altera las que ya
+     * había; reordenarlas o insertar en medio reparte otras formas a otros
+     * árboles (no rompe nada, pero tu bosque calibrado cambia).
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Tronco|Deformacion")
+    TArray<FTrunkDeformLayerSpec> TrunkDeformLayers;
+
     // --- Mallado: de esqueleto a malla (doc. §3.7) ---
     /** K: nº de vértices del anillo de sección de cada rama (tubos).
         OJO: por debajo de 8 no hay resolución angular para el relieve de
@@ -406,9 +517,33 @@ public:
 // probabilidad de morir se multiplica. De aqui salen los tocones/snags
 // y el auto-aclareo visible del bosque.
 
-/** Fraccion de la longevidad a partir de la cual el arbol entra en senescencia. */
+/**
+ * Fraccion de la longevidad a partir de la cual el arbol entra en senescencia.
+ *
+ * Ojo a como se compone con la mediana de muerte (ver Longevity): a 0.75 la
+ * senescencia entraba MUY por detras de la mediana (0.75·L frente a 1.282·L^0.8)
+ * y encima multiplicaba una pAge que en esa zona ya era enorme -a 0.75·L con
+ * L=200, pAge ≈ 0.32/año, y el x3 la subia a ~0.95/año-. O sea que no era una
+ * fase de declive: era la ejecucion, y por eso "los longevos morian rapido".
+ *
+ * A 0.35 la senescencia entra JUSTO ANTES de la mediana, cuando pAge todavia
+ * ronda 0.015/año: el multiplicador es entonces un empujon y no una sentencia, y
+ * la senescencia vuelve a leerse como lo que debia ser (crecimiento parado,
+ * menos semilla, snags que aparecen poco a poco).
+ *
+ * El 0.35 no es arbitrario, es el optimo medido (L = 600, multiplicador 2):
+ *
+ *   fraccion   entra a   % de la cohorte    coste en vida
+ *              (años)    que la alcanza     mediana (años)
+ *     0.25       150          89 %              -22
+ *     0.35       210          54 %               -2      <- aqui
+ *     0.45       270          11 %                0
+ *
+ * Por debajo la senescencia empieza a acortar la vida de verdad; por encima
+ * casi ningun arbol llega a estar senescente y la fase deja de existir.
+ */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
-    float SenescenceAgeFraction = 0.75f;
+    float SenescenceAgeFraction = 0.35f;
 
     /** Estres sostenido (>=) que fuerza la senescencia aunque el arbol sea joven. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
@@ -418,16 +553,33 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
     float SenescentGrowthScale = 0.1f;
 
-    /** Multiplicador de la probabilidad de morir cuando esta senescente. */
+    /**
+     * Multiplicador de la probabilidad de morir cuando esta senescente.
+     *
+     * Baja de 3 a 2, pero por una razon distinta a la que parece: con
+     * SenescenceAgeFraction en 0.35 este multiplicador ya casi no decide cuanto
+     * vive un arbol viejo (medido con L = 600: mediana 215 años con
+     * multiplicador 1, y 213 con multiplicador 3). Lo que si decide es la suerte
+     * de los PLANTONES SUPRIMIDOS, que entran en senescencia por ESTRES y no por
+     * vejez, porque multiplica la pDeath TOTAL y no solo la parte de edad.
+     *
+     * O sea que este parametro se calibra mirando el sotobosque, no el dosel: a 2
+     * un suprimido con estres maximo muere a ~0.4/año, que es la criba que hace
+     * falta para que no se acumulen arbolitos condenados. A 1.5 se quedaria en
+     * 0.3 y durarian demasiado; a 3 (el valor viejo) se llevaba por delante
+     * tambien a los viejos sanos.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "1"))
-    float SenescentMortalityMultiplier = 3.f;
+    float SenescentMortalityMultiplier = 2.f;
     /** Fraccion de la tasa de semillas que CONSERVA un arbol senescente.
        0 = deja de reproducirse (comportamiento anterior). Cortarlo a cero
        silenciaba justo la ventana de maxima fecundidad -la biomasa, y por tanto
        SeedRate*Biomass, es maxima en los ultimos años- cuando en un bosque real
        los dominantes viejos son la PRINCIPAL fuente de semilla. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Senescencia", meta = (ClampMin = "0", ClampMax = "1"))
-    float SenescentSeedScale = 0.4f;
+    float SenescentSeedScale = 0.3f; // baja de 0.4: con la longevidad recalibrada
+    // hay MUCHOS mas senescentes vivos a la vez, y a 0.4 dominarian la lluvia de
+    // semillas ellos solos.
 
     // ================================================================
     // --- Fase 6: viento (doc. 6.1) ---

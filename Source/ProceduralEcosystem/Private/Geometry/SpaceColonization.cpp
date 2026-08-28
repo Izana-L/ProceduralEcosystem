@@ -2,6 +2,7 @@
 #include "Geometry/TreeSkeleton.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Geometry/AttractorCloud.h"
+#include "Geometry/TrunkDeformer.h" // doblado por-arbol del esqueleto terminado
 #include "Terrain/LightFieldCoarse.h"
 #include "Species/SpeciesData.h"
 #include "Core/EcoCore.h"     // EcoRand
@@ -299,6 +300,25 @@ namespace SpaceColonization
         // tronco cambiaria tambien todo el jitter posterior de la copa.
         const uint32 TreeSeed = RngState;
 
+        // Deformacion de tronco de ESTE arbol (arqueado / torcido). Se resuelve
+        // aqui arriba, antes de nada, por dos motivos: su alcance lateral
+        // dimensiona la rejilla de luz fina (mas abajo), y su sub-stream se
+        // deriva por hash igual que el del eje, sin tocar RngState -> un arbol
+        // sin capas de deformacion sale bit a bit como salia antes.
+        const uint32 DeformSeed = (Config.DeformSeedOverride >= 0)
+            ? static_cast<uint32>(Config.DeformSeedOverride)
+            : EcoRand::Hash32(TreeSeed ^ 0x0DEF0B75u);
+        const TrunkDeformer::FTrunkDeformState Deform = TrunkDeformer::Sample(Species, DeformSeed);
+
+        // Geometria vertical del arbol. Sube hasta aqui (antes se calculaba
+        // junto al eje principal) porque TotalH hace falta para el margen de la
+        // rejilla fina y para la altura normalizada del deformador.
+        const float TrunkFrac = FMath::Clamp(Species.TrunkFraction, 0.f, 0.95f);
+        const float CrownH = FMath::Max(Species.CrownHeightCm, 1.f);
+        const float TrunkH = CrownH * TrunkFrac / (1.f - TrunkFrac);
+        const float CrownBaseZ = (float)TrunkBaseWorld.Z + TrunkH;
+        const float TotalH = TrunkH + CrownH;
+
         const float LeafShadowR = D * FMath::Max(Config.LeafShadowRadiusScale, 0.f);
         const float LeafShadowDepth = D * FMath::Max(Config.LeafShadowDepthScale, 0.f);
         const bool  bHasCoarse = (CoarseLight != nullptr) && CoarseLight->IsValid();
@@ -313,7 +333,18 @@ namespace SpaceColonization
             EnvBounds += A.Pos;
         }
         EnvBounds += TrunkBaseWorld; // que la rejilla cubra tambien el tronco
-        OutFineLight.InitForBounds(EnvBounds, Species.FineVoxelSizeCm, Config.FineGridPaddingCm);
+
+        // Margen extra por si a este arbol le toca doblarse: la copa deformada
+        // muestrea AO por vertice y heliotropismo de hoja en posiciones que la
+        // rejilla ajustada a la envolvente RECTA ya no cubriria. No reventaria
+        // (WorldToVoxelClamped clampa a los bordes), pero el gradiente se aplana
+        // contra el borde y las hojas dejan de orientarse a la luz.
+        //
+        // Se dimensiona con los MAXIMOS del asset, no con la tirada de este
+        // arbol: asi todos los arboles de la especie usan la misma rejilla y no
+        // hay un salto de calidad de AO entre el recto y el arqueado.
+        OutFineLight.InitForBounds(EnvBounds, Species.FineVoxelSizeCm,
+            Config.FineGridPaddingCm + TrunkDeformer::MaxLateralReachCm(Species, TotalH));
 
         if (bHasCoarse)
         {
@@ -331,11 +362,8 @@ namespace SpaceColonization
         OutSkeleton.Reserve(OutAttractors.Num() * 2 + 64);
         OutSkeleton.InitRoot(TrunkBaseWorld, FVector::UpVector);
 
-        const float TrunkFrac = FMath::Clamp(Species.TrunkFraction, 0.f, 0.95f);
-        const float CrownH = FMath::Max(Species.CrownHeightCm, 1.f);
-        const float TrunkH = CrownH * TrunkFrac / (1.f - TrunkFrac);
-        const float CrownBaseZ = (float)TrunkBaseWorld.Z + TrunkH;
-        const float TotalH = TrunkH + CrownH;
+        // (TrunkFrac / CrownH / TrunkH / CrownBaseZ / TotalH se calculan arriba,
+        //  antes de la rejilla fina, porque TotalH dimensiona su margen.)
 
         // El eje ya NO muere en la base de la copa: la ATRAVIESA hasta
         // LeaderFraction de su altura (ver USpeciesData::LeaderFraction). Con el
@@ -539,6 +567,19 @@ namespace SpaceColonization
                 break; // no quedan atractores que perseguir
             }
         }
+
+        // --- Deformacion de tronco: doblar el arbol YA CRECIDO ---
+        // Va aqui, entre el fin del SCA y los radios, y no en otro sitio:
+        //   - despues del SCA porque dobla el arbol ENTERO (tronco y copa) como
+        //     una vara; hacerlo dentro del bucle solo torceria el eje y dejaria
+        //     las ramas ya colgadas donde estaban;
+        //   - antes de ComputeRadii/ApplyTrunkProfile porque asi el ensanche del
+        //     pie y el afilado del fuste SIGUEN al tronco doblado. Y sale gratis:
+        //     el deformador es isometrico y el perfil trabaja sobre longitud de
+        //     arco (ComputeAlongLengths), que no cambia al doblar;
+        //   - antes de mallar porque el mallador orienta cada anillo de seccion
+        //     con FBranchNode::Dir, que el deformador rota a la vez que Pos.
+        TrunkDeformer::ApplyToSkeleton(OutSkeleton, Deform, TrunkBaseWorld, TotalH);
 
         // --- Radios de rama: pipe model sobre el esqueleto terminado ---
         ComputeRadii(OutSkeleton, Species);

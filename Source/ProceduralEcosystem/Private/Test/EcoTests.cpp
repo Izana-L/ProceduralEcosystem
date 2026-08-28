@@ -14,6 +14,8 @@
 #include "Geometry/AttractorCloud.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Geometry/TreeMeshBuilder.h"
+#include "Geometry/TrunkDeformer.h"   // deformacion de tronco por arbol
+#include "Render/TreeLibrary.h"       // VariantDeformSeed (identidad de curvatura)
 #include "Species/SpeciesData.h"      // Fase 6
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -853,6 +855,375 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
         }
     }
 
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Deformacion de tronco por arbol (arqueado / torcido)
+// ---------------------------------------------------------------------------
+
+/** Crece un arbol de prueba y devuelve el esqueleto. Centraliza el boilerplate
+    de los tests de deformacion (que crecen el mismo arbol muchas veces). */
+static void EcoGrowTestTree(const USpeciesData& Sp, uint32 Seed, FTreeSkeleton& OutSk,
+    int64 DeformSeedOverride = -1, uint32* OutFinalRng = nullptr)
+{
+    uint32 Rng = Seed;
+    FTreeLightGridFine Light;
+    FAttractorCloud Cloud;
+    FSpaceColonizationConfig Cfg;
+    Cfg.DeformSeedOverride = DeformSeedOverride;
+    SpaceColonization::GrowTree(Sp, Rng, FVector::ZeroVector, nullptr, Cfg, OutSk, Light, Cloud);
+    if (OutFinalRng) { *OutFinalRng = Rng; }
+}
+
+/** Anade una capa de deformacion al asset de prueba. */
+static void EcoAddDeformLayer(USpeciesData& Sp, ETrunkDeformType Type, float Probability,
+    float MinDeg, float MaxDeg, float ShapeParam)
+{
+    FTrunkDeformLayerSpec L;
+    L.Type = Type;
+    L.Probability = Probability;
+    L.MinAngleDeg = MinDeg;
+    L.MaxAngleDeg = MaxDeg;
+    L.ShapeParam = ShapeParam;
+    Sp.TrunkDeformLayers.Add(L);
+}
+
+/** Desplazamiento horizontal de la punta del arbol respecto a la base, en
+    fraccion de su altura. Es la medida de "cuanto se ha doblado". */
+static float EcoTipLeanRatio(const FTreeSkeleton& Sk)
+{
+    int32 Top = INDEX_NONE;
+    double TopZ = -TNumericLimits<double>::Max();
+    for (int32 i = 0; i < Sk.Num(); ++i)
+    {
+        if (Sk.Nodes[i].Pos.Z > TopZ) { TopZ = Sk.Nodes[i].Pos.Z; Top = i; }
+    }
+    if (Top == INDEX_NONE || TopZ <= 0.0) { return 0.f; }
+
+    const FVector Tip = Sk.Nodes[Top].Pos - Sk.Nodes[0].Pos;
+    return static_cast<float>(FVector2D(Tip.X, Tip.Y).Size() / TopZ);
+}
+
+/**
+ * SIN capas: el arbol tiene que salir BIT A BIT como salia antes de que este
+ * sistema existiera, y el stream RNG principal tiene que quedar en el mismo
+ * sitio.
+ *
+ * Lo segundo es lo que de verdad se esta probando: el deformador consume un
+ * sub-stream derivado por hash, no RngState. Si algun dia alguien lo "simplifica"
+ * tirando del stream principal, la copa de TODOS los arboles cambiaria al anadir
+ * una capa a UNA especie, y este test es el unico sitio donde eso se ve.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformNoOp, "Eco.Arbol.DeformNoOp", EcoTestFlags)
+bool FEcoDeformNoOp::RunTest(const FString&) {
+    USpeciesData* Base = EcoTestSpecies(GetTransientPackage());
+    USpeciesData* WithLayers = EcoTestSpecies(GetTransientPackage());
+    if (!Base || !WithLayers) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+
+    // Capa presente pero IMPOSIBLE: sigue consumiendo sus 4 muestras del
+    // sub-stream, que es justo lo que no debe notarse fuera.
+    EcoAddDeformLayer(*WithLayers, ETrunkDeformType::Arc, /*Probability*/ 0.f, 10.f, 30.f, 1.5f);
+
+    FTreeSkeleton A, B;
+    uint32 RngA = 0, RngB = 0;
+    EcoGrowTestTree(*Base, 909u, A, -1, &RngA);
+    EcoGrowTestTree(*WithLayers, 909u, B, -1, &RngB);
+
+    TestEqual(TEXT("el deformador no desplaza el stream RNG principal"), RngB, RngA);
+    TestEqual(TEXT("mismo numero de nodos"), B.Num(), A.Num());
+
+    bool bSame = (A.Num() == B.Num());
+    for (int32 i = 0; bSame && i < A.Num(); ++i)
+    {
+        bSame = (A.Nodes[i].Pos == B.Nodes[i].Pos) && (A.Nodes[i].Radius == B.Nodes[i].Radius);
+    }
+    TestTrue(TEXT("sin capas activas la geometria es identica bit a bit"), bSame);
+    return true;
+}
+
+/**
+ * La deformacion es una ISOMETRIA: dobla el arbol sin estirarlo.
+ *
+ * Es la propiedad de la que cuelga todo lo demas. Si las longitudes de internodo
+ * cambiasen, la longitud de arco cambiaria con ellas, y con ella el ensanche del
+ * pie y el afilado del fuste (ApplyTrunkProfile trabaja sobre AlongLen) y las UV
+ * de la corteza: un arbol arqueado tendria el pie de otro tamano que su gemelo
+ * recto, cuando el punto entero es que sea el MISMO arbol doblado.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformIsometry, "Eco.Arbol.DeformIsometria", EcoTestFlags)
+bool FEcoDeformIsometry::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->LeaderFraction = 1.f;
+
+    // Arbol de referencia SIN deformar.
+    FTreeSkeleton Straight;
+    EcoGrowTestTree(*Sp, 31337u, Straight);
+    if (Straight.Num() < 8) { AddError(TEXT("El SCA no produjo esqueleto.")); return false; }
+
+    // El MISMO arbol (misma semilla de crecimiento) con una capa segura.
+    EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, /*Probability*/ 1.f, 25.f, 25.f, 1.f);
+    FTreeSkeleton Bent;
+    EcoGrowTestTree(*Sp, 31337u, Bent);
+
+    if (Bent.Num() != Straight.Num())
+    {
+        AddError(TEXT("La deformacion cambio la TOPOLOGIA del esqueleto: solo debe mover nodos."));
+        return false;
+    }
+
+    float WorstError = 0.f;
+    for (int32 i = 1; i < Bent.Num(); ++i)
+    {
+        const int32 P = Bent.Nodes[i].Parent;
+        if (P < 0) { continue; }
+
+        const float LenBefore = (float)FVector::Dist(Straight.Nodes[i].Pos, Straight.Nodes[P].Pos);
+        const float LenAfter = (float)FVector::Dist(Bent.Nodes[i].Pos, Bent.Nodes[P].Pos);
+        WorstError = FMath::Max(WorstError, FMath::Abs(LenAfter - LenBefore));
+
+        if (Bent.Nodes[i].Pos.ContainsNaN())
+        {
+            AddError(FString::Printf(TEXT("Nodo %d con NaN tras deformar."), i));
+            return false;
+        }
+        if (!FMath::IsNearlyEqual(Bent.Nodes[i].Dir.Size(), 1.f, 1e-3f))
+        {
+            AddError(FString::Printf(TEXT("Nodo %d con Dir no unitaria (%.4f) tras deformar."),
+                i, Bent.Nodes[i].Dir.Size()));
+            return false;
+        }
+    }
+    TestTrue(FString::Printf(TEXT("las longitudes de internodo se conservan (peor error %.4f cm)"), WorstError),
+        WorstError < 0.05f);
+
+    // La raiz no se mueve: el arbol sigue plantado donde estaba.
+    TestTrue(TEXT("la base del tronco no se mueve"),
+        Bent.Nodes[0].Pos.Equals(Straight.Nodes[0].Pos, 1e-3));
+
+    // Y el perfil de tronco sale IGUAL, porque depende de la longitud de arco:
+    // esa es la razon de aplicar el doblado antes de ApplyTrunkProfile.
+    TestTrue(TEXT("el radio del pie es el mismo doblado que recto"),
+        FMath::IsNearlyEqual(Bent.Nodes[0].Radius, Straight.Nodes[0].Radius, 0.05f));
+
+    return true;
+}
+
+/**
+ * Arc arquea de verdad, y mas angulo = mas arqueo (monotonia).
+ *
+ * El umbral se calibra desde la propia formula del deformador y no a ojo: con
+ * alfa(t) = Angle * t^k, el desplazamiento de la punta es
+ * aproximadamente H*Angle/(k+1). Con Angle = 30 grados (0.524 rad) y k = 1 sale
+ * ~0.26*H si el eje llegase al apice; se pide bastante menos para dejar margen a
+ * que la punta mas alta sea una rama de copa y no el propio eje.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformArcs, "Eco.Arbol.DeformArquea", EcoTestFlags)
+bool FEcoDeformArcs::RunTest(const FString&) {
+    auto GrowWithArc = [this](float AngleDeg, float& OutLean) -> bool
+        {
+            USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+            if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+            Sp->LeaderFraction = 1.f;   // el eje llega al apice: el arqueo se lee entero
+            Sp->TrunkSweepDeg = 0.f;    // aisla la deformacion de la sinuosidad base
+            Sp->TrunkWobbleDeg = 0.f;
+            if (AngleDeg > 0.f)
+            {
+                EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, 1.f, AngleDeg, AngleDeg, 1.f);
+            }
+
+            FTreeSkeleton Sk;
+            EcoGrowTestTree(*Sp, 20250828u, Sk);
+            if (Sk.Num() < 8) { AddError(TEXT("El SCA no produjo esqueleto.")); return false; }
+            OutLean = EcoTipLeanRatio(Sk);
+            return true;
+        };
+
+    float LeanNone = 0.f, LeanMild = 0.f, LeanStrong = 0.f;
+    if (!GrowWithArc(0.f, LeanNone)) { return false; }
+    if (!GrowWithArc(15.f, LeanMild)) { return false; }
+    if (!GrowWithArc(30.f, LeanStrong)) { return false; }
+
+    TestTrue(FString::Printf(TEXT("sin deformacion el arbol es casi vertical (desvio %.3f)"), LeanNone),
+        LeanNone < 0.10f);
+    TestTrue(FString::Printf(TEXT("Arc 30 grados arquea el arbol (desvio %.3f)"), LeanStrong),
+        LeanStrong > 0.12f);
+    TestTrue(FString::Printf(TEXT("mas angulo, mas arqueo (%.3f < %.3f)"), LeanMild, LeanStrong),
+        LeanMild < LeanStrong);
+    return true;
+}
+
+/**
+ * La probabilidad se respeta: con p = 0.5 se doblan aproximadamente la mitad de
+ * los arboles, y CADA UNO de forma distinta.
+ *
+ * Es lo que pedia el diseño ("cada arbol tiene una probabilidad de crecer
+ * arqueado"), y el unico test que lo comprueba como distribucion y no como caso
+ * particular. Se mide sobre el muestreo (TrunkDeformer::Sample) y no creciendo
+ * 200 arboles: el SCA completo x200 dentro de la bateria de tests es carisimo, y
+ * la puerta de probabilidad vive entera en Sample.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformProbability, "Eco.Arbol.DeformProbabilidad", EcoTestFlags)
+bool FEcoDeformProbability::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, /*Probability*/ 0.5f, 10.f, 30.f, 1.5f);
+
+    const int32 Samples = 2000;
+    int32 Bent = 0;
+    TSet<uint32> DistinctAngles;
+    for (int32 i = 0; i < Samples; ++i)
+    {
+        const TrunkDeformer::FTrunkDeformState S =
+            TrunkDeformer::Sample(*Sp, EcoRand::Hash32(static_cast<uint32>(i) ^ 0xABCDu));
+        if (!S.IsIdentity())
+        {
+            ++Bent;
+            DistinctAngles.Add(static_cast<uint32>(FMath::RoundToInt(S.Layers[0].AngleRad * 10000.f)));
+
+            const float Deg = FMath::RadiansToDegrees(S.Layers[0].AngleRad);
+            if (Deg < 9.9f || Deg > 30.1f)
+            {
+                AddError(FString::Printf(TEXT("Angulo %.2f fuera del rango [10, 30] del asset."), Deg));
+                return false;
+            }
+        }
+    }
+
+    const float Frac = static_cast<float>(Bent) / static_cast<float>(Samples);
+    TestTrue(FString::Printf(TEXT("con p=0.5 se dobla ~la mitad (%.2f)"), Frac),
+        Frac > 0.45f && Frac < 0.55f);
+    TestTrue(TEXT("cada arbol doblado recibe su propio angulo"), DistinctAngles.Num() > Bent / 2);
+
+    // Editar la Probability de una capa NO puede desplazar las muestras de las
+    // siguientes: es el contrato de muestreo de TrunkDeformer y lo que permite
+    // recalibrar un asset sin re-repartir formas por todo el bosque.
+    {
+        USpeciesData* Two = EcoTestSpecies(GetTransientPackage());
+        USpeciesData* TwoEdited = EcoTestSpecies(GetTransientPackage());
+        if (!Two || !TwoEdited) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+
+        EcoAddDeformLayer(*Two, ETrunkDeformType::Lean, 0.5f, 5.f, 8.f, 1.f);
+        EcoAddDeformLayer(*Two, ETrunkDeformType::Arc, 1.f, 20.f, 20.f, 1.f);
+
+        EcoAddDeformLayer(*TwoEdited, ETrunkDeformType::Lean, 0.9f, 5.f, 8.f, 1.f); // <- solo cambia esto
+        EcoAddDeformLayer(*TwoEdited, ETrunkDeformType::Arc, 1.f, 20.f, 20.f, 1.f);
+
+        bool bStable = true;
+        for (int32 i = 0; i < 64 && bStable; ++i)
+        {
+            const uint32 Seed = EcoRand::Hash32(static_cast<uint32>(i));
+            const TrunkDeformer::FTrunkDeformState A = TrunkDeformer::Sample(*Two, Seed);
+            const TrunkDeformer::FTrunkDeformState B = TrunkDeformer::Sample(*TwoEdited, Seed);
+
+            // La capa Arc (p=1) esta siempre; es la ULTIMA de cada estado.
+            bStable = !A.IsIdentity() && !B.IsIdentity()
+                && FMath::IsNearlyEqual(A.Layers.Last().AzimuthRad, B.Layers.Last().AzimuthRad, 1e-6f);
+        }
+        TestTrue(TEXT("cambiar la probabilidad de una capa no mueve las muestras de las siguientes"), bStable);
+    }
+
+    return true;
+}
+
+/**
+ * La IDENTIDAD de la deformacion viaja aparte de la semilla de crecimiento.
+ *
+ * Es el mecanismo del que dependen las dos cosas que no pueden fallar en el
+ * render instanciado: que un arbol no se enderece al cruzar de bucket de edad, y
+ * que no se enderece al promocionar a hero delante del jugador.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformIdentity, "Eco.Arbol.DeformIdentidad", EcoTestFlags)
+bool FEcoDeformIdentity::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->LeaderFraction = 1.f;
+    Sp->TrunkSweepDeg = 0.f;
+    Sp->TrunkWobbleDeg = 0.f;
+    EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, 1.f, 25.f, 25.f, 1.f);
+
+    // 1) Dos claves de arquetipo que SOLO difieren en el bucket de edad tienen
+    //    que dar la misma semilla de deformacion: es la garantia de "un arbol no
+    //    se endereza al crecer". Se comprueba pasando por las claves reales,
+    //    porque el fallo que se quiere atrapar es que alguien meta el bucket en
+    //    la formula.
+    {
+        const FArchetypeKey Young(/*Species*/ 1, /*AgeBucket*/ 0, /*Variant*/ 2);
+        const FArchetypeKey Old(/*Species*/ 1, /*AgeBucket*/ 4, /*Variant*/ 2);
+        TestEqual(TEXT("la curvatura de una variante ignora el bucket de edad"),
+            UTreeLibrary::VariantDeformSeed(Young.Species, Young.Variant),
+            UTreeLibrary::VariantDeformSeed(Old.Species, Old.Variant));
+    }
+    TestNotEqual(TEXT("variantes distintas reciben curvaturas distintas"),
+        UTreeLibrary::VariantDeformSeed(1, 0), UTreeLibrary::VariantDeformSeed(1, 3));
+    TestNotEqual(TEXT("especies distintas reciben curvaturas distintas"),
+        UTreeLibrary::VariantDeformSeed(0, 1), UTreeLibrary::VariantDeformSeed(2, 1));
+
+    // 2) Dos arboles con semillas de CRECIMIENTO distintas pero el mismo
+    //    DeformSeedOverride se doblan igual (hero <-> instancia).
+    const int64 Override = static_cast<int64>(UTreeLibrary::VariantDeformSeed(0, 1));
+    FTreeSkeleton HeroLike, InstanceLike;
+    EcoGrowTestTree(*Sp, 111u, HeroLike, Override);
+    EcoGrowTestTree(*Sp, 222u, InstanceLike, Override);
+
+    const float LeanA = EcoTipLeanRatio(HeroLike);
+    const float LeanB = EcoTipLeanRatio(InstanceLike);
+    TestTrue(FString::Printf(TEXT("mismo override -> misma curvatura (%.3f vs %.3f)"), LeanA, LeanB),
+        FMath::Abs(LeanA - LeanB) < 0.05f);
+
+    // 3) Determinismo puro: misma semilla, misma geometria exacta.
+    {
+        FTreeSkeleton R1, R2;
+        EcoGrowTestTree(*Sp, 4444u, R1);
+        EcoGrowTestTree(*Sp, 4444u, R2);
+        bool bSame = (R1.Num() == R2.Num());
+        for (int32 i = 0; bSame && i < R1.Num(); ++i)
+        {
+            bSame = (R1.Nodes[i].Pos == R2.Nodes[i].Pos);
+        }
+        TestTrue(TEXT("misma semilla -> mismo arbol doblado"), bSame);
+    }
+
+    return true;
+}
+
+/**
+ * El tope de doblado acumulado se sostiene aunque el asset pida un disparate.
+ *
+ * Un asset con cuatro capas a 45 grados es un error de edicion, no un caso de
+ * uso, pero tiene que salir un arbol raro y no NaN, geometria invertida o un
+ * arbol tumbado en el suelo.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformClamp, "Eco.Arbol.DeformTope", EcoTestFlags)
+bool FEcoDeformClamp::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    Sp->LeaderFraction = 1.f;
+    for (int32 i = 0; i < 4; ++i)
+    {
+        EcoAddDeformLayer(*Sp, ETrunkDeformType::Lean, 1.f, 45.f, 45.f, 1.f);
+    }
+
+    FTreeSkeleton Sk;
+    EcoGrowTestTree(*Sp, 5150u, Sk);
+    if (Sk.Num() < 8) { AddError(TEXT("El SCA no produjo esqueleto.")); return false; }
+
+    for (int32 i = 0; i < Sk.Num(); ++i)
+    {
+        if (Sk.Nodes[i].Pos.ContainsNaN() || Sk.Nodes[i].Dir.ContainsNaN())
+        {
+            AddError(FString::Printf(TEXT("Nodo %d con NaN con las capas al maximo."), i));
+            return false;
+        }
+    }
+
+    // MaxTrunkBendRad = 1 rad (~57 grados): tan(57) ~ 1.55, con margen para las
+    // ramas de copa que salen hacia el lado del vuelco.
+    const float Lean = EcoTipLeanRatio(Sk);
+    TestTrue(FString::Printf(TEXT("el tope acota el vuelco (%.2f)"), Lean), Lean < 2.5f);
+    TestTrue(TEXT("el arbol sigue creciendo hacia arriba"), Sk.Nodes[Sk.Num() - 1].Pos.Z > 0.0);
     return true;
 }
 

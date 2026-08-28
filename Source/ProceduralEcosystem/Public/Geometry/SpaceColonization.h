@@ -63,6 +63,26 @@ struct FSpaceColonizationConfig
      * decente sin volver al abanico.
      */
     int32 MaxAxisChildrenPerNode = 3;
+
+    /**
+     * IDENTIDAD DE DEFORMACION: fija que curvatura de tronco le toca a este
+     * arbol, con independencia de la semilla con la que crece. -1 = derivarla de
+     * la propia semilla del arbol (lo normal).
+     *
+     * Existe porque la curvatura tiene que sobrevivir a dos cosas que la semilla
+     * de crecimiento no sobrevive:
+     *   1. Envejecer. En la libreria de arquetipos la semilla incluye el bucket
+     *      de edad, asi que sin este override un arbol cambiaria de recto a
+     *      arqueado al cruzar de bucket -exactamente el fallo que el jitter de
+     *      variante evita a mano en UTreeLibrary::GetArchetypeSpecies-.
+     *   2. Promocionar a hero. Un arbol cercano regenera con semilla propia
+     *      (Hash32(StableId)); sin igualar la deformacion, la instancia arqueada
+     *      se convertiria en un hero recto delante del jugador.
+     *
+     * int64 y no uint32 para que el centinela -1 no colisione con una semilla
+     * valida (0xFFFFFFFF es un uint32 perfectamente legitimo).
+     */
+    int64 DeformSeedOverride = -1;
 };
 
 /**

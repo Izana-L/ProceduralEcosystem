@@ -80,6 +80,23 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree")
     bool bEnablePhototropism = true;
 
+    /**
+     * Identidad de la deformacion de tronco (ver
+     * FSpaceColonizationConfig::DeformSeedOverride). -1 = derivarla de la semilla
+     * del arbol, que es lo correcto para un hero suelto en editor o generado a
+     * mano con Eco.GrowHeroTree.
+     *
+     * El gestor de LOD SI lo rellena al promocionar un arbol del bosque, con la
+     * semilla de la variante de su instancia: sin eso, una instancia arqueada se
+     * enderezaria al convertirse en hero delante del jugador, que es el pop mas
+     * visible que puede producir este sistema.
+     *
+     * int64 (y no uint32) para que el centinela -1 no colisione con una semilla
+     * valida; no es UPROPERTY editable porque no es un parametro de diseño sino
+     * plumbing entre capas.
+     */
+    int64 DeformSeedOverride = -1;
+
     // --- Debug draw (esqueleto + atractores) ---
     /** Usa SetDrawDebug() en codigo: ademas de este flag, enciende/apaga el Tick
         del actor (que solo existe para este dibujo, ver C7 en el constructor). */

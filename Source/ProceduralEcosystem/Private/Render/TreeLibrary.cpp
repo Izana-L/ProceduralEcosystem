@@ -155,6 +155,15 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     Sp->wSCA = Jitter(Sp->wSCA, 0.15f);
     Sp->wPrev = Jitter(Sp->wPrev, 0.20f);
 
+    // Sinuosidad base del fuste: tambien varia por variante. Va AL FINAL de la
+    // lista a proposito -anadirlo en medio desplazaria las tiradas de VRng de
+    // arriba y cambiaria la copa de todos los arquetipos ya calibrados-.
+    //
+    // Es el complemento de las capas de TrunkDeformLayers: aquellas deciden
+    // "arqueado o recto" (binario por arbol), y esto reparte la ondulacion sutil
+    // que llevan TODOS, de modo que los "rectos" tampoco son iguales entre si.
+    Sp->TrunkSweepDeg = Jitter(Sp->TrunkSweepDeg, 0.30f);
+
     // --- Red de seguridad: reimponer las invariantes del SCA tras el jitter ---
     // Sin esto, una variante desafortunada puede dar d_i <= hueco de tronco y el
     // SCA no arranca (ningun atractor en rango del nodo base): arquetipo vacio.
@@ -285,7 +294,14 @@ bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
     FTreeSkeleton Skeleton;
     FTreeLightGridFine FineLight;
     FAttractorCloud Attractors;
-    const FSpaceColonizationConfig Cfg;
+
+    FSpaceColonizationConfig Cfg;
+    // La curvatura de tronco se ata a (especie, variante) IGNORANDO el bucket:
+    // los buckets de una variante son las etapas de un mismo arbol, y sin esto
+    // un individuo pasaria de recto a arqueado al cruzar de bucket de edad
+    // (mismo motivo por el que el jitter de morfologia de GetArchetypeSpecies
+    // tampoco mira el bucket). Ver UTreeLibrary::VariantDeformSeed.
+    Cfg.DeformSeedOverride = static_cast<int64>(VariantDeformSeed(Key.Species, Key.Variant));
 
     SpaceColonization::GrowTree(*Sp, Rng, FVector::ZeroVector, /*CoarseLight*/ nullptr, Cfg,
         Skeleton, FineLight, Attractors);

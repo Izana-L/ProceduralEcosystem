@@ -95,6 +95,10 @@ void AHeroTreeActor::BuildNow()
     FSpaceColonizationConfig Config;
     Config.bEnableSelfPruning = bEnableSelfPruning;
     Config.bEnablePhototropism = bEnablePhototropism;
+    // -1 (el caso del hero suelto en editor) = curvatura derivada de la semilla
+    // del propio arbol. El gestor de LOD lo rellena con la semilla de la variante
+    // para que el hero doble EXACTAMENTE como doblaba su instancia.
+    Config.DeformSeedOverride = DeformSeedOverride;
 
     // Luz gruesa FRESCA del subsistema vivo (nunca un puntero cacheado de otro
     // frame: el dueño del grid es el subsistema y este actor puede sobrevivirle

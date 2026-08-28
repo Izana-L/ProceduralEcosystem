@@ -74,6 +74,42 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
         Fail();
     }
 
+    // --- Deformacion de tronco por arbol (arqueado / torcido) ---
+    {
+        float SumMaxDeg = 0.f;
+        for (int32 i = 0; i < TrunkDeformLayers.Num(); ++i)
+        {
+            const FTrunkDeformLayerSpec& L = TrunkDeformLayers[i];
+
+            if (L.MaxAngleDeg < L.MinAngleDeg)
+            {
+                Context.AddWarning(FText::FromString(FString::Printf(
+                    TEXT("TrunkDeformLayers[%d]: MaxAngleDeg (%.0f) < MinAngleDeg (%.0f). El deformador los ordena solo, pero el asset se lee al reves de lo que hace."),
+                    i, L.MaxAngleDeg, L.MinAngleDeg)));
+            }
+
+            if (L.Type == ETrunkDeformType::Lean && FMath::Max(L.MinAngleDeg, L.MaxAngleDeg) > 12.f)
+            {
+                Context.AddWarning(FText::FromString(FString::Printf(
+                    TEXT("TrunkDeformLayers[%d]: Lean a %.0f grados inclina el arbol ENTERO en bloque y se lee como que se cae, no como arqueado. Para angulos grandes usa Arc."),
+                    i, FMath::Max(L.MinAngleDeg, L.MaxAngleDeg))));
+            }
+
+            if (L.Probability > 0.f)
+            {
+                SumMaxDeg += FMath::Max(L.MinAngleDeg, L.MaxAngleDeg);
+            }
+        }
+
+        // 57 grados = MaxTrunkBendRad (1 rad), el tope que aplica TrunkDeformer.
+        if (SumMaxDeg > 57.f)
+        {
+            Context.AddWarning(FText::FromString(FString::Printf(
+                TEXT("La suma de angulos maximos de TrunkDeformLayers (%.0f grados) supera el tope de doblado acumulado (57). Los arboles con varias capas a la vez saldran recortados: baja los angulos o las probabilidades."),
+                SumMaxDeg)));
+        }
+    }
+
     const bool bDeformsSection = (SectionLobeAmount > 0.01f) || (BarkReliefAmount > 0.01f);
     if (bDeformsSection && RingSegments < 8)
     {

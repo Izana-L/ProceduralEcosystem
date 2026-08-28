@@ -139,6 +139,26 @@ public:
      */
     void ApplyWindSettings(const FTreeLibraryConfig& InConfig);
 
+    /**
+     * Semilla de la DEFORMACION DE TRONCO de una variante (ver
+     * FSpaceColonizationConfig::DeformSeedOverride).
+     *
+     * El bucket se fuerza a 0 A PROPOSITO, igual que hace el jitter de morfologia
+     * de GetArchetypeSpecies y por la misma razon: los NumAgeBuckets buckets de
+     * una variante son las etapas de UN MISMO arbol. Si el bucket entrase aqui,
+     * un individuo arqueado se enderezaria al cumplir años, que es exactamente lo
+     * que no puede pasar.
+     *
+     * Publica y estatica porque la necesitan DOS sitios que no se conocen entre
+     * si: el horneado de la libreria (BakeArchetype) y la promocion a hero
+     * (UTreeRenderSubsystem). Una sola copia de la formula = hero e instancia
+     * doblan igual, y no hay pop de forma al acercarse.
+     */
+    static uint32 VariantDeformSeed(uint16 InSpecies, uint8 InVariant)
+    {
+        return EcoRand::Hash32(FArchetypeKey(InSpecies, 0, InVariant).Pack() * 0x9E3779B9u ^ 0x0DEF0B75u);
+    }
+
 private:
     bool BakeArchetype(const FArchetypeKey& Key);
     /** Devuelve no-const a proposito: GetArchetypeSpecies necesita duplicar el

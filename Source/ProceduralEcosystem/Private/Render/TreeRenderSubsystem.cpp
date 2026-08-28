@@ -1078,6 +1078,14 @@ void UTreeRenderSubsystem::ProcessHeroQueue(int32 MaxThisFrame)
         // vertice del hero (ver AHeroTreeActor::BuildNow), asi que un hero
         // apretado contra un vecino no solo crece ladeado: tambien se ve mas
         // oscuro por el lado que le da sombra.
+        // La curvatura del tronco viaja por la VARIANTE, no por la semilla del
+        // arbol: el hero regenera con Hash32(StableId) -morfologia unica, luz de
+        // su sitio- pero se dobla exactamente igual que la instancia que acaba de
+        // sustituir. Sin esta linea, acercarse a un arbol arqueado lo enderezaba
+        // de golpe (ver UTreeLibrary::VariantDeformSeed).
+        Slot.Actor->DeformSeedOverride =
+            static_cast<int64>(UTreeLibrary::VariantDeformSeed(Info.Key.Species, Info.Key.Variant));
+
         Slot.Actor->Generate(ArchetypeSp, EcoRand::Hash32(StableId), &Eco->GetLightCoarse(), Info.Position);
         Slot.Actor->SetActorRotation(FRotator::ZeroRotator); // ver nota de A3 en el SpawnActor
         Slot.Actor->SetActorScale3D(FVector(Info.Scale));
