@@ -92,10 +92,12 @@ namespace TreeArchetype
         return EcoRand::Hash32(StableId ^ Salt);
     }
 
-    /** Valor estable en [0,1) derivado del id del arbol. */
+    /** Valor estable en [0,1) derivado del id del arbol. Es EcoRand::HashUnit
+        (copia unica del idioma hash -> [0,1)); aqui solo se le pone el nombre
+        del dominio de render. */
     FORCEINLINE float StableUnit(uint32 StableId, uint32 Salt)
     {
-        return EcoRand::UnitFromBits(StableHash(StableId, Salt));
+        return EcoRand::HashUnit(StableId, Salt);
     }
 
     /**

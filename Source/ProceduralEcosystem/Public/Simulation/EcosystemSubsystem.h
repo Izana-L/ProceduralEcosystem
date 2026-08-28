@@ -216,6 +216,20 @@ private:
     void RebuildCoarseLight();
     void DrawDebug();
     void EnsureHeatmapDecal();
+
+    /** Camino UNICO de todos los heatmaps (los seis Eco.Paint* tenian el mismo
+        cuerpo copiado): sube Values al visualizador, garantiza el decal y loguea.
+        bAutoRange=false fija la escala a [MinValue, MaxValue] en vez de usar el
+        min/max del buffer. */
+    void PaintField(const TArray<float>& Values, const TCHAR* LogLabel,
+        bool bAutoRange = true, float MinValue = 0.f, float MaxValue = 1.f,
+        bool bLogResult = true);
+
+    /** Punto aleatorio sobre el terreno (XY uniforme en los limites, Z del
+        relieve), consumiendo DOS valores del stream indicado. Lo comparten la
+        siembra inicial (stream Colonization) y los agentes de debug (stream
+        Debug), que antes lo calculaban cada uno por su lado. */
+    FVector RandomPointOnTerrain(EEcoRngStream Stream);
     void LogPopulationStats() const;
     void RecordDeathEvent(const FPendingDeathPulse& Pulse); // Fase 5 (Paso 1)
     /** Serializa/deserializa un bake completo sobre Payload. Deserializar sobre un

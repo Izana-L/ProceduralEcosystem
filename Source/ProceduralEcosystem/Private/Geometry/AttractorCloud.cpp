@@ -128,7 +128,11 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
             RadiusAtT *= FMath::Clamp(1.f + EnvNoise * FMath::PerlinNoise3D(NoisePos), 0.15f, 1.85f);
         }
 
-        const float Rr = RadiusAtT * FMath::Sqrt(EcoRand::NextUnit(RngState));
+        // Misma correccion sqrt que la dispersion de semillas y la hojarasca
+        // (EcoRand::SampleDispersalDistance): aqui no se puede usar el helper de
+        // disco completo porque el ruido de contorno se intercala entre el
+        // angulo y el radio, pero la formula del radio es la UNICA copia.
+        const float Rr = EcoRand::SampleDispersalDistance(RngState, RadiusAtT);
 
         FAttractor A;
         A.Pos = FVector(

@@ -115,6 +115,29 @@ namespace EcoRand
         return MaxRadiusCm * FMath::Sqrt(NextUnit(State));
     }
 
+    /**
+     * Desplazamiento XY (cm) uniforme POR AREA dentro de un disco de radio
+     * RadiusCm: angulo uniforme + radio con la correccion sqrt de arriba.
+     *
+     * UNICA copia del patron. Estaba escrito a mano en tres sitios que hacian
+     * exactamente lo mismo con nombres distintos -la dispersion de semillas
+     * (EcologyRules::SampleSeedOffsetCm), el scatter de hojarasca de la capa de
+     * suelo y el disco horizontal de la envolvente de copa-, de modo que
+     * cambiar el kernel de dispersion obligaba a acordarse de los tres.
+     *
+     * ORDEN DE CONSUMO DEL RNG (parte del contrato de reproducibilidad):
+     * primero el angulo, despues el radio. Quien necesite intercalar algo entre
+     * los dos -como la envolvente de copa, que perturba el radio con ruido-
+     * debe llamar a NextRange y SampleDispersalDistance por separado, en ese
+     * mismo orden.
+     */
+    FORCEINLINE FVector2D SampleDiscOffsetCm(uint32& State, float RadiusCm)
+    {
+        const float Angle = NextRange(State, 0.f, 2.f * PI);
+        const float Dist = SampleDispersalDistance(State, RadiusCm);
+        return FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Dist;
+    }
+
     /** Mezcla de bits (finalizer estilo Murmur3): deriva semillas hijas estables. */
     FORCEINLINE uint32 Hash32(uint32 x)
     {
@@ -122,6 +145,21 @@ namespace EcoRand
         x ^= x >> 15; x *= 0x846ca68bu;
         x ^= x >> 16;
         return x;
+    }
+
+    /**
+     * Valor estable en [0, 1) derivado de un entero (mezcla de bits + los 24
+     * bits altos). Es "aleatorio" reproducible SIN estado: no consume ningun
+     * stream, asi que se puede llamar desde el mallador o desde el render sin
+     * desplazar la secuencia que gasta la simulacion.
+     *
+     * UNICA copia de un idioma que estaba repetido con cuatro nombres distintos:
+     * TreeArchetype::StableUnit, el StableUnit local de TreeWindData.cpp, el
+     * LeafUnit de TreeFoliage.cpp y cuatro usos sueltos en TreeMeshBuilder.cpp.
+     */
+    FORCEINLINE float HashUnit(uint32 Value, uint32 Salt = 0u)
+    {
+        return UnitFromBits(Hash32(Value ^ Salt));
     }
 
     /** Semilla estable por-índice: no depende del orden de proceso. */

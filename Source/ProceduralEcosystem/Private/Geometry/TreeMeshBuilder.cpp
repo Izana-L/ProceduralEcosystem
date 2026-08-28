@@ -4,7 +4,8 @@
 #include "Geometry/TreeFoliage.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h" // EcoRand::Hash32 / UnitFromBits (hashes, NO consumo de RNG)
+#include "Core/EcoCore.h"     // EcoRand::HashUnit (hashes estables, NO consumo de RNG)
+#include "Core/EcoGeometry.h" // AnyPerpendicular (copia unica, ver la cabecera)
 
 namespace
 {
@@ -28,17 +29,6 @@ namespace
 
     /** Escala del relieve grueso, en radios de la base del tronco. */
     constexpr float ReliefWaveInBaseRadii = 1.2f;
-
-    /** Una perpendicular cualquiera y estable a T (T debe venir normalizado). */
-    FVector AnyPerpendicular(const FVector& T)
-    {
-        FVector P = FVector::CrossProduct(T, FVector::RightVector);
-        if (P.IsNearlyZero())
-        {
-            P = FVector::CrossProduct(T, FVector::ForwardVector);
-        }
-        return P.GetSafeNormal(SMALL_NUMBER, FVector::ForwardVector);
-    }
 }
 
 namespace TreeMeshBuilder
@@ -97,7 +87,7 @@ namespace TreeMeshBuilder
             FVector Nrm;
             if (Node.Parent < 0)
             {
-                Nrm = AnyPerpendicular(T);
+                Nrm = EcoGeometry::AnyPerpendicular(T);
             }
             else
             {
@@ -109,12 +99,12 @@ namespace TreeMeshBuilder
                 const FQuat Q = FQuat::FindBetweenNormals(Tp, T);
                 FVector Np = Q.RotateVector(FrameN[P]);
                 // Reortogonaliza contra T (elimina deriva numerica).
-                Np = (Np - FVector::DotProduct(Np, T) * T).GetSafeNormal(SMALL_NUMBER, AnyPerpendicular(T));
+                Np = (Np - FVector::DotProduct(Np, T) * T).GetSafeNormal(SMALL_NUMBER, EcoGeometry::AnyPerpendicular(T));
                 Nrm = Np;
             }
 
             FrameN[i] = Nrm;
-            FrameB[i] = FVector::CrossProduct(T, Nrm).GetSafeNormal(SMALL_NUMBER, FVector::CrossProduct(T, AnyPerpendicular(T)));
+            FrameB[i] = FVector::CrossProduct(T, Nrm).GetSafeNormal(SMALL_NUMBER, FVector::CrossProduct(T, EcoGeometry::AnyPerpendicular(T)));
         }
 
         // --- MADERA: reparto del buffer de vertices ---
@@ -154,11 +144,11 @@ namespace TreeMeshBuilder
         // Fase de los lobulos y offset del ruido: hash de la semilla, NUNCA
         // EcoRand::Next*. El mallador no debe consumir RNG (ver la cabecera):
         // desplazaria el stream que el SCA gasto antes sobre el mismo arbol.
-        const float LobeSeedPhase = EcoRand::UnitFromBits(EcoRand::Hash32(Seed ^ 0x7F4A7C15u)) * 2.f * PI;
+        const float LobeSeedPhase = EcoRand::HashUnit(Seed, 0x7F4A7C15u) * 2.f * PI;
         const FVector ReliefOffset(
-            EcoRand::UnitFromBits(EcoRand::Hash32(Seed ^ 0x9E3779B9u)) * 512.f,
-            EcoRand::UnitFromBits(EcoRand::Hash32(Seed ^ 0x85EBCA6Bu)) * 512.f,
-            EcoRand::UnitFromBits(EcoRand::Hash32(Seed ^ 0xC2B2AE35u)) * 512.f);
+            EcoRand::HashUnit(Seed, 0x9E3779B9u) * 512.f,
+            EcoRand::HashUnit(Seed, 0x85EBCA6Bu) * 512.f,
+            EcoRand::HashUnit(Seed, 0xC2B2AE35u) * 512.f);
 
         for (int32 i = 0; i < N; ++i)
         {
@@ -224,8 +214,7 @@ namespace TreeMeshBuilder
                 W.UVs[Vi] = FVector2D((float)k / (float)K, V);
                 W.Tangents[Vi] = (-S * Nrm + C * Bin);
 
-                W.SetWindVertex(Vi, Wn.PivotLocalCm, Wn.BranchLevel01,
-                    Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
+                W.SetWindVertex(Vi, Wn);
             }
         }
 
@@ -253,8 +242,7 @@ namespace TreeMeshBuilder
             W.Normals[Av] = Axis;
             W.UVs[Av] = FVector2D(0.5f, (AlongLen[i] + TipLen) * UvAlongScale);
             W.Tangents[Av] = FrameN[i];
-            W.SetWindVertex(Av, Wn.PivotLocalCm, Wn.BranchLevel01,
-                Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
+            W.SetWindVertex(Av, Wn);
         }
 
         // --- MADERA: centro de la tapa de la base ---
@@ -265,8 +253,7 @@ namespace TreeMeshBuilder
             W.Normals[BaseCapVert] = -Root.Dir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
             W.UVs[BaseCapVert] = FVector2D(0.5f, 0.f);
             W.Tangents[BaseCapVert] = FrameN[0];
-            W.SetWindVertex(BaseCapVert, Wn.PivotLocalCm, Wn.BranchLevel01,
-                Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
+            W.SetWindVertex(BaseCapVert, Wn);
         }
 
         // --- MADERA: conectar cada anillo con el de su padre ---

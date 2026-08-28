@@ -43,6 +43,23 @@ namespace EcoGrid
         return (Iz * Height + Iy) * Width + Ix;
     }
 
+    /**
+     * Pone a cero un buffer de floats de rejilla con un memset.
+     *
+     * Los dos grids de luz tenian su propio ClearShadow y NO hacian lo mismo: el
+     * grueso ya usaba Memzero, el fino recorria el array celda a celda. Y el fino
+     * es el que se limpia MAS veces (una por refresco de luz del SCA, o sea
+     * varias por arbol horneado), asi que la version lenta estaba justo donde
+     * mas dolia. Una sola copia, la rapida, para los dos.
+     */
+    FORCEINLINE void ZeroFloats(TArray<float>& Buffer)
+    {
+        if (Buffer.Num() > 0)
+        {
+            FMemory::Memzero(Buffer.GetData(), Buffer.Num() * sizeof(float));
+        }
+    }
+
     /** Luz disponible tras la sombra acumulada: Q = clamp(FullSun - Sombra, 0). */
     FORCEINLINE float LightFromShadow(float Shadow, float FullSun)
     {
@@ -61,6 +78,72 @@ namespace EcoGrid
         OutW = FMath::Clamp(FMath::CeilToInt32(Size.X / CellSize), 1, MaxPerAxis);
         OutH = FMath::Clamp(FMath::CeilToInt32(Size.Y / CellSize), 1, MaxPerAxis);
         OutD = FMath::Clamp(FMath::CeilToInt32(Size.Z / CellSize), 1, MaxPerAxis);
+    }
+
+    /**
+     * Recorre las celdas de un bloque de (2R+1)^3 centrado en (Cx,Cy,Cz),
+     * RECORTADO a la rejilla WxHxD, e invoca Fn(int32 CellIndex) en cada una.
+     *
+     * UNICA copia del triple bucle clampado que antes estaba escrito -con
+     * nombres distintos y una dimension de diferencia- en FSpatialHash::
+     * ForEachNeighbor (2D) y FAttractorCloud::ForEachInRange (3D). Sirve para
+     * las dos: una rejilla 2D es este mismo recorrido con D = 1 y Cz = 0, y en
+     * ese caso el bucle de Z da exactamente una vuelta.
+     *
+     * De paso es MAS RAPIDO que las dos versiones que sustituye: aquellas
+     * iteraban -R..R en cada eje y descartaban dentro con un `if` por celda; aqui
+     * los limites se recortan UNA vez por eje y el cuerpo del bucle no vuelve a
+     * comprobar nada.
+     *
+     * ORDEN DE VISITA: z, luego y, luego x, todos ascendentes -el mismo de
+     * antes-. Importa: las consultas de vecindad alimentan decisiones de la
+     * simulacion y del SCA, y el orden fijo es parte del contrato de
+     * determinismo.
+     */
+    template <typename FCellFn>
+    void ForEachCellInBox(int32 Cx, int32 Cy, int32 Cz, int32 R,
+        int32 Width, int32 Height, int32 Depth, FCellFn&& Fn)
+    {
+        const int32 X0 = FMath::Max(Cx - R, 0), X1 = FMath::Min(Cx + R, Width - 1);
+        const int32 Y0 = FMath::Max(Cy - R, 0), Y1 = FMath::Min(Cy + R, Height - 1);
+        const int32 Z0 = FMath::Max(Cz - R, 0), Z1 = FMath::Min(Cz + R, Depth - 1);
+
+        for (int32 Iz = Z0; Iz <= Z1; ++Iz)
+        {
+            for (int32 Iy = Y0; Iy <= Y1; ++Iy)
+            {
+                const int32 RowBase = (Iz * Height + Iy) * Width;
+                for (int32 Ix = X0; Ix <= X1; ++Ix)
+                {
+                    Fn(RowBase + Ix);
+                }
+            }
+        }
+    }
+
+    /**
+     * Igual, pero desenrollando ya el indice CSR: invoca Fn(int32 ItemIndex) por
+     * cada item guardado en esas celdas. Es literalmente el cuerpo que tenian
+     * FSpatialHash::ForEachNeighbor y FAttractorCloud::ForEachInRange, y ahora
+     * las dos se reducen a calcular su celda central y llamar aqui.
+     *
+     * Incluye TODOS los items de las celdas tocadas (el bloque es un cubo, no
+     * una esfera): el filtrado fino por distancia real lo hace el llamador, que
+     * es lo barato.
+     */
+    template <typename FItemFn>
+    void ForEachItemInBox(const TArray<int32>& CellStart, const TArray<int32>& SortedIdx,
+        int32 Cx, int32 Cy, int32 Cz, int32 R,
+        int32 Width, int32 Height, int32 Depth, FItemFn&& Fn)
+    {
+        ForEachCellInBox(Cx, Cy, Cz, R, Width, Height, Depth,
+            [&CellStart, &SortedIdx, &Fn](int32 Cell)
+            {
+                for (int32 K = CellStart[Cell]; K < CellStart[Cell + 1]; ++K)
+                {
+                    Fn(SortedIdx[K]);
+                }
+            });
     }
 
     /**

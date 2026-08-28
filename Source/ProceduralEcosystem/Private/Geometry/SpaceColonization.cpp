@@ -4,7 +4,8 @@
 #include "Geometry/AttractorCloud.h"
 #include "Terrain/LightFieldCoarse.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h" // EcoRand
+#include "Core/EcoCore.h"     // EcoRand
+#include "Core/EcoGeometry.h" // AnyPerpendicular (copia unica, ver la cabecera)
 
 namespace
 {
@@ -16,17 +17,6 @@ namespace
      * hace que el eje avance casi nada por paso y el bucle se dispare.
      */
     constexpr float MaxAxisTiltRad = 0.35f;
-
-    /** Una perpendicular cualquiera y estable a T (T debe venir normalizado). */
-    FVector AnyPerpendicular(const FVector& T)
-    {
-        FVector P = FVector::CrossProduct(T, FVector::RightVector);
-        if (P.IsNearlyZero())
-        {
-            P = FVector::CrossProduct(T, FVector::ForwardVector);
-        }
-        return P.GetSafeNormal(SMALL_NUMBER, FVector::ForwardVector);
-    }
 
     /**
      * Direccion del eje principal a la altura H sobre la base.
@@ -58,6 +48,29 @@ namespace
 
         return FVector(TanT * FMath::Cos(Phi), TanT * FMath::Sin(Phi), 1.f)
             .GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
+    }
+
+    /**
+     * Marca como alcanzados los atractores vivos a menos de RadiusCm de Pos
+     * (paso "MATAR" del SCA).
+     *
+     * El SCA lo hacia dos veces con el bloque copiado: una tras pre-construir el
+     * eje -que atraviesa la copa y se come atractores por el camino- y otra por
+     * cada hijo nuevo de cada iteracion. Con una sola copia, el criterio de
+     * "alcanzado" (consulta por rango + distancia real al cuadrado) no puede
+     * divergir entre las dos.
+     */
+    void KillAttractorsNear(FAttractorCloud& Cloud, const FVector& Pos, float RadiusCm)
+    {
+        const float Radius2 = RadiusCm * RadiusCm;
+        Cloud.ForEachInRange(Pos, RadiusCm, [&Cloud, &Pos, Radius2](int32 Ai)
+            {
+                FAttractor& A = Cloud.Attractors[Ai];
+                if (A.bAlive && FVector::DistSquared(A.Pos, Pos) <= Radius2)
+                {
+                    A.bAlive = false;
+                }
+            });
     }
 }
 
@@ -122,9 +135,9 @@ namespace SpaceColonization
         FVector Perp = Dn - C * P;
         if (Perp.IsNearlyZero())
         {
-            Perp = AnyPerpendicular(P);
+            Perp = EcoGeometry::AnyPerpendicular(P);
         }
-        Perp = Perp.GetSafeNormal(SMALL_NUMBER, AnyPerpendicular(P));
+        Perp = Perp.GetSafeNormal(SMALL_NUMBER, EcoGeometry::AnyPerpendicular(P));
 
         return (CosMin * P + FMath::Sin(MinAngle) * Perp).GetSafeNormal(SMALL_NUMBER, Dn);
     }
@@ -378,18 +391,9 @@ namespace SpaceColonization
         // al fuste apuntando a puntos que el propio fuste ya ocupa.
         {
             const int32 NumAxisNodes = OutSkeleton.Num();
-            const float AxisKill2 = d_k * d_k;
             for (int32 v = 0; v < NumAxisNodes; ++v)
             {
-                const FVector AxisPos = OutSkeleton.Nodes[v].Pos;
-                OutAttractors.ForEachInRange(AxisPos, d_k, [&](int32 Ai)
-                    {
-                        FAttractor& A = OutAttractors.Attractors[Ai];
-                        if (A.bAlive && FVector::DistSquared(A.Pos, AxisPos) <= AxisKill2)
-                        {
-                            A.bAlive = false;
-                        }
-                    });
+                KillAttractorsNear(OutAttractors, OutSkeleton.Nodes[v].Pos, d_k);
             }
         }
 
@@ -514,18 +518,9 @@ namespace SpaceColonization
             }
 
             // ---- MATAR: atractores dentro de d_k de algun hijo nuevo ----
-            const float d_k2 = d_k * d_k;
             for (int32 Ci : NewChildren)
             {
-                const FVector ChildPos = OutSkeleton.Nodes[Ci].Pos;
-                OutAttractors.ForEachInRange(ChildPos, d_k, [&](int32 Ai)
-                    {
-                        FAttractor& A = OutAttractors.Attractors[Ai];
-                        if (A.bAlive && FVector::DistSquared(A.Pos, ChildPos) <= d_k2)
-                        {
-                            A.bAlive = false;
-                        }
-                    });
+                KillAttractorsNear(OutAttractors, OutSkeleton.Nodes[Ci].Pos, d_k);
             }
 
             // ---- Refresco de luz / autopoda emergente ----

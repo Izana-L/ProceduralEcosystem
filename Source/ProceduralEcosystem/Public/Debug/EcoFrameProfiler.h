@@ -82,6 +82,17 @@ private:
     /** Percentil sobre una copia ordenada de la ventana (p en [0,1]). */
     float Percentile(float P) const;
 
+    /** Media de los frames medidos (ms), 0 si aun no hay ninguno. El bucle de
+        suma estaba escrito en LogFrameBudget y otra vez en DrawHUD, que es
+        exactamente la clase de duplicado que hace que el log y el HUD acaben
+        diciendo numeros distintos. */
+    float WindowAverageMs() const;
+
+    /** Coste del ecosistema en el frame: tick de simulacion + re-nivelado de LOD.
+        Lo leian por separado el log y el HUD, cada uno con su ternario sobre
+        Render, que puede ser nulo. */
+    void GetEcoCostMs(float& OutTickMs, float& OutRelevelMs) const;
+
     UPROPERTY(Transient) TObjectPtr<UEcosystemSubsystem> Eco = nullptr;
     UPROPERTY(Transient) TObjectPtr<UTreeRenderSubsystem> Render = nullptr;
 

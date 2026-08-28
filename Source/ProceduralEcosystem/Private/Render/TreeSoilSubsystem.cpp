@@ -95,20 +95,12 @@ bool UTreeSoilSubsystem::EnsureInitialized()
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
-    Host = World->SpawnActor<ATreeInstanceHost>(ATreeInstanceHost::StaticClass(), FTransform::Identity);
+    // Spawn del host + garantia de root: identico al de la capa de arboles, asi
+    // que vive una sola vez en ATreeInstanceHost::SpawnHost.
+    Host = ATreeInstanceHost::SpawnHost(World, TEXT("TreeSoilHost (Fase 5)"));
     if (!Host)
     {
         return false;
-    }
-#if WITH_EDITOR
-    Host->SetActorLabel(TEXT("TreeSoilHost (Fase 5)"));
-#endif
-    // Garantiza un root al que colgar los ISM (por si el host no lo trae).
-    if (!Host->GetRootComponent())
-    {
-        USceneComponent* Root = NewObject<USceneComponent>(Host, TEXT("SoilRoot"));
-        Root->RegisterComponent();
-        Host->SetRootComponent(Root);
     }
 
     UStaticMesh* SnagMesh = S->SnagMesh.LoadSynchronous();
@@ -162,31 +154,12 @@ bool UTreeSoilSubsystem::EnsureInitialized()
 UHierarchicalInstancedStaticMeshComponent* UTreeSoilSubsystem::CreateISM(UStaticMesh* Mesh,
     UMaterialInterface* Mat, bool bCastShadow, const TCHAR* Name)
 {
-    if (!Mesh || !Host)
-    {
-        return nullptr;
-    }
-
-    UHierarchicalInstancedStaticMeshComponent* Comp =
-        NewObject<UHierarchicalInstancedStaticMeshComponent>(Host, Name);
-    if (!Comp)
-    {
-        return nullptr;
-    }
-
-    Comp->SetMobility(EComponentMobility::Movable);
-    Comp->SetStaticMesh(Mesh);
-    if (Mat)
-    {
-        Comp->SetMaterial(0, Mat);
-    }
-    Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    Comp->SetCanEverAffectNavigation(false);
-    Comp->SetCastShadow(bCastShadow);
-    Comp->SetupAttachment(Host->GetRootComponent());
-    Comp->RegisterComponent();
-    Host->AddInstanceComponent(Comp);
-    return Comp;
+    // Configuracion comun (movilidad, colision, navmesh, sombra, registro): la
+    // MISMA fabrica que usa la libreria de arboles. Lo unico propio del suelo es
+    // el material, que aqui viene por parametro en vez de venir en la malla, y
+    // que la fabrica aplica antes de registrar el componente.
+    return ATreeInstanceHost::CreateInstancedComponent(Host, Mesh, FName(Name), bCastShadow,
+        /*NumCustomDataFloats*/ 0, Mat);
 }
 
 // ---------------------------------------------------------------------------
@@ -458,10 +431,11 @@ void UTreeSoilSubsystem::QueueLitterAround(const FVector& Base, const UEcosystem
 
     for (int32 k = 0; k < Count; ++k)
     {
-        // Disco uniforme por area (r = R*sqrt(U), igual criterio que la dispersion de semillas).
-        const float Ang = EcoRand::NextRange(RngState, 0.f, 2.f * PI);
-        const float Rad = SpreadCm * FMath::Sqrt(EcoRand::NextUnit(RngState));
-        FVector P = Base + FVector(FMath::Cos(Ang) * Rad, FMath::Sin(Ang) * Rad, 0.f);
+        // Disco uniforme por area: LA MISMA funcion que dispersa las semillas
+        // (EcoRand::SampleDiscOffsetCm). Antes estaba reescrita aqui a mano, asi
+        // que la hojarasca y las semillas podian acabar con kernels distintos.
+        const FVector2D Offset = EcoRand::SampleDiscOffsetCm(RngState, SpreadCm);
+        FVector P = Base + FVector(Offset.X, Offset.Y, 0.f);
         if (Eco)
         {
             P.Z = Eco->GetHeightField().SampleHeight(P.X, P.Y);

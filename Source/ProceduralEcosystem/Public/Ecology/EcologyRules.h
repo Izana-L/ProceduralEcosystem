@@ -155,12 +155,12 @@ namespace EcologyRules
         return EcoRand::PoissonInt(RngState, Lambda);
     }
 
-    /** Desplazamiento XY (cm) de una semilla respecto al arbol madre. */
+    /** Desplazamiento XY (cm) de una semilla respecto al arbol madre: disco
+        uniforme por area (copia unica en EcoRand::SampleDiscOffsetCm, la misma
+        que usa el scatter de hojarasca de la capa de suelo). */
     FORCEINLINE FVector2D SampleSeedOffsetCm(float DispersalRadiusCm, uint32& RngState)
     {
-        const float Angle = EcoRand::NextRange(RngState, 0.f, 2.f * PI);
-        const float Dist = EcoRand::SampleDispersalDistance(RngState, DispersalRadiusCm);
-        return FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Dist;
+        return EcoRand::SampleDiscOffsetCm(RngState, DispersalRadiusCm);
     }
 
     /** Probabilidad de germinar en el punto de caida, dado el vigor alli. */

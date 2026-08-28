@@ -6,6 +6,7 @@
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
 #include "Core/EcoCore.h"
+#include "Core/EcoGeometry.h" // PerpendicularTo (copia unica, ver la cabecera)
 
 namespace
 {
@@ -22,27 +23,21 @@ namespace
     constexpr float MaxSizeScale = 1.25f;
     constexpr float MinAttachRadiusCm = 0.05f;
 
+    /** Valor estable en [0,1) para (arbol, rama, ranura de hoja): solo mezcla la
+        clave y delega en la copia unica del hash (EcoRand::HashUnit). */
     FORCEINLINE float LeafUnit(uint32 Seed, int32 BranchRoot, int32 Slot, uint32 Salt)
     {
-        const uint32 Bits = EcoRand::Hash32(Seed ^ Salt
+        return EcoRand::HashUnit(Seed
             ^ (static_cast<uint32>(BranchRoot) * 2654435761u)
-            ^ (static_cast<uint32>(Slot) * 40503u));
-        return EcoRand::UnitFromBits(Bits);
+            ^ (static_cast<uint32>(Slot) * 40503u), Salt);
     }
 
-    /** Perpendicular a Along lo mas cerca posible de Pref, con dos reservas. */
-    FVector SideAxis(const FVector& Along, const FVector& Pref, const FVector& Fallback)
+    /** Perpendicular a Along lo mas cerca posible de Pref, con dos reservas.
+        La logica es la compartida de EcoGeometry (misma que usan el SCA y el
+        mallador); aqui solo cambia el vector de ultimo recurso. */
+    FORCEINLINE FVector SideAxis(const FVector& Along, const FVector& Pref, const FVector& Fallback)
     {
-        FVector Side = FVector::CrossProduct(Along, Pref);
-        if (Side.IsNearlyZero())
-        {
-            Side = FVector::CrossProduct(Along, Fallback);
-        }
-        if (Side.IsNearlyZero())
-        {
-            Side = FVector::CrossProduct(Along, FVector::ForwardVector);
-        }
-        return Side.GetSafeNormal(SMALL_NUMBER, FVector::RightVector);
+        return EcoGeometry::PerpendicularTo(Along, Pref, Fallback, FVector::RightVector);
     }
 }
 
@@ -176,8 +171,7 @@ namespace TreeFoliage
                 {
                     OutLeaves.Normals.Add(Norm);
                     OutLeaves.Tangents.Add(Side);
-                    OutLeaves.AppendWindVertex(Wn.PivotLocalCm, Wn.BranchLevel01,
-                        Sway, Phase, Wn.CanopyAO, Wn.TintVariation);
+                    OutLeaves.AppendWindVertex(Wn, Sway, Phase);
                 }
 
                 OutLeaves.Triangles.Add(Base + 0);

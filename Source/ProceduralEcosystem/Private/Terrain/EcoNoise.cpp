@@ -13,11 +13,11 @@ namespace
 
 FVector2D EcoNoise::SeedOffset(uint32 Seed, uint32 Salt)
 {
-    // 16 bits * 0.1 mantiene el offset en [0, 6553.6]: lejos del origen pero
-    // sin degradar la precision del double dentro del PerlinNoise2D.
-    const double X = (EcoRand::Hash32(Seed ^ Salt) & 0xFFFF) * 0.1;
-    const double Y = (EcoRand::Hash32(Seed ^ Salt ^ 0x9E3779B9u) & 0xFFFF) * 0.1;
-    return FVector2D(X, Y);
+    // La conversion hash -> offset esta en OffsetFromHash (copia unica: la
+    // comparte el campo de nutrientes, que deriva sus dos sales por su cuenta).
+    return FVector2D(
+        OffsetFromHash(EcoRand::Hash32(Seed ^ Salt)),
+        OffsetFromHash(EcoRand::Hash32(Seed ^ Salt ^ 0x9E3779B9u)));
 }
 
 int32 EcoNoise::ClampOctavesToNyquist(int32 Octaves,

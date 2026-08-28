@@ -5,6 +5,36 @@
 
 namespace
 {
+    /**
+     * Recorre los 8 vecinos de Moore de (x, y) que caen dentro de la rejilla e
+     * invoca Fn(k, nx, ny) con k = indice del offset.
+     *
+     * Las dos pasadas de ThermalErode -la que mide el exceso sobre el talud y la
+     * que recoge el reparto- llevaban el MISMO bucle con el mismo test de
+     * limites copiado. Y no es cosmetico: el reparto solo cuadra si emisor y
+     * receptor recorren los vecinos en el mismo orden y con las mismas
+     * distancias; tenerlo escrito una sola vez lo garantiza por construccion.
+     */
+    template <typename FNeighborFn>
+    FORCEINLINE void ForEachMooreNeighbor(int32 x, int32 y, int32 W, int32 H, FNeighborFn&& Fn)
+    {
+        // Vecindad de Moore. Las distancias son simetricas (mismo |offset| visto
+        // desde ambos lados), asi que emisor y receptor calculan el MISMO exceso.
+        static constexpr int32 DX[8] = { 1, -1,  0,  0,  1,  1, -1, -1 };
+        static constexpr int32 DY[8] = { 0,  0,  1, -1,  1, -1,  1, -1 };
+
+        for (int32 k = 0; k < 8; ++k)
+        {
+            const int32 nx = x + DX[k];
+            const int32 ny = y + DY[k];
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+            {
+                continue;
+            }
+            Fn(k, nx, ny);
+        }
+    }
+
     /** Bilinear sobre un buffer suelto (la gota trabaja en coordenadas de
         rejilla fraccionales; el llamador garantiza 0 <= x < W-1, idem y). */
     FORCEINLINE float SampleGrid(const TArray<float>& Hgt, int32 W, float X, float Y)
@@ -38,10 +68,8 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
     // con 1.0 el pico crece; con <=0.8 converge siempre hacia el talud).
     const float Strength = FMath::Clamp(P.Strength, 0.f, 0.8f);
 
-    // Vecindad de Moore. Las distancias son simetricas (mismo |offset| visto
-    // desde ambos lados), asi que emisor y receptor calculan el MISMO exceso.
-    static const int32 DX[8] = { 1, -1,  0,  0,  1,  1, -1, -1 };
-    static const int32 DY[8] = { 0,  0,  1, -1,  1, -1,  1, -1 };
+    // Los offsets de la vecindad viven en ForEachMooreNeighbor; aqui solo las
+    // distancias, que dependen del tamano de celda de ESTE relieve.
     const float Diag = Cell * 1.41421356f;
     const float Dist[8] = { Cell, Cell, Cell, Cell, Diag, Diag, Diag, Diag };
 
@@ -70,21 +98,15 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
 
                     float MaxExcess = 0.f;
                     float SumExcess = 0.f;
-                    for (int32 k = 0; k < 8; ++k)
-                    {
-                        const int32 nx = x + DX[k];
-                        const int32 ny = y + DY[k];
-                        if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+                    ForEachMooreNeighbor(x, y, W, H, [&](int32 k, int32 nx, int32 ny)
                         {
-                            continue;
-                        }
-                        const float Excess = (h - Data[ny * W + nx]) - TalusTan * Dist[k];
-                        if (Excess > 0.f)
-                        {
-                            SumExcess += Excess;
-                            MaxExcess = FMath::Max(MaxExcess, Excess);
-                        }
-                    }
+                            const float Excess = (h - Data[ny * W + nx]) - TalusTan * Dist[k];
+                            if (Excess > 0.f)
+                            {
+                                SumExcess += Excess;
+                                MaxExcess = FMath::Max(MaxExcess, Excess);
+                            }
+                        });
                     TotalEx[i] = SumExcess;
                     MoveM[i] = (SumExcess > 0.f) ? 0.5f * Strength * MaxExcess : 0.f;
                 }
@@ -101,24 +123,18 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
                 {
                     const int32 i = y * W + x;
                     float Dh = -MoveM[i];
-                    for (int32 k = 0; k < 8; ++k)
-                    {
-                        const int32 nx = x + DX[k];
-                        const int32 ny = y + DY[k];
-                        if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+                    ForEachMooreNeighbor(x, y, W, H, [&](int32 k, int32 nx, int32 ny)
                         {
-                            continue;
-                        }
-                        const int32 j = ny * W + nx;
-                        if (MoveM[j] > 0.f)
-                        {
-                            const float ExcessFromJ = (Data[j] - Data[i]) - TalusTan * Dist[k];
-                            if (ExcessFromJ > 0.f)
+                            const int32 j = ny * W + nx;
+                            if (MoveM[j] > 0.f)
                             {
-                                Dh += MoveM[j] * ExcessFromJ / TotalEx[j];
+                                const float ExcessFromJ = (Data[j] - Data[i]) - TalusTan * Dist[k];
+                                if (ExcessFromJ > 0.f)
+                                {
+                                    Dh += MoveM[j] * ExcessFromJ / TotalEx[j];
+                                }
                             }
-                        }
-                    }
+                        });
                     Next[i] = Data[i] + Dh;
                 }
             });

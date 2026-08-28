@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Geometry/TreeWindData.h" // FTreeWindNode: los canales de viento por nodo
 
 class USpeciesData;
 struct FTreeSkeleton;
@@ -102,14 +103,34 @@ struct FTreeMeshBuffers
         Colors[Vi] = FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f);
     }
 
-    /** Igual, anadiendo al final (los buffers que crecen vertice a vertice). */
+    /** Sobrecarga: los canales de UN vertice tomados directamente del nodo de
+        viento. Los tres sitios del mallador que escribian estos seis campos
+        repetian la MISMA lista de argumentos; asi solo se nombra el nodo. */
+    void SetWindVertex(int32 Vi, const FTreeWindNode& Wn)
+    {
+        SetWindVertex(Vi, Wn.PivotLocalCm, Wn.BranchLevel01,
+            Wn.SwayWeight, Wn.Phase01, Wn.CanopyAO, Wn.TintVariation);
+    }
+
+    /** Igual, anadiendo al final (los buffers que crecen vertice a vertice).
+        DELEGA en SetWindVertex: el empaquetado de los canales estaba escrito dos
+        veces, y son el contrato con el material -si las dos copias divergen, el
+        hero tree y la instancia horneada dejan de moverse igual. */
     void AppendWindVertex(const FVector& PivotLocalCm, float BranchLevel01,
         float SwayWeight, float Phase01, float CanopyAO, float Tint)
     {
-        UV1.Add(FVector2D(PivotLocalCm.X * CmToM, PivotLocalCm.Y * CmToM));
-        UV2.Add(FVector2D(PivotLocalCm.Z * CmToM, BranchLevel01));
-        UV3.Add(FVector2D(SwayWeight, Phase01));
-        Colors.Add(FLinearColor(CanopyAO, Tint, BranchLevel01, 1.f));
+        const int32 Vi = UV1.AddUninitialized();
+        UV2.AddUninitialized();
+        UV3.AddUninitialized();
+        Colors.AddUninitialized();
+        SetWindVertex(Vi, PivotLocalCm, BranchLevel01, SwayWeight, Phase01, CanopyAO, Tint);
+    }
+
+    /** Idem, anadiendo al final. */
+    void AppendWindVertex(const FTreeWindNode& Wn, float SwayWeight, float Phase01)
+    {
+        AppendWindVertex(Wn.PivotLocalCm, Wn.BranchLevel01,
+            SwayWeight, Phase01, Wn.CanopyAO, Wn.TintVariation);
     }
 
     bool IsEmpty() const { return Vertices.Num() == 0 || Triangles.Num() == 0; }

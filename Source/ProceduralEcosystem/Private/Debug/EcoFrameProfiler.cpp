@@ -151,10 +151,9 @@ void UEcoFrameProfiler::Tick(float DeltaTime)
             Row.TimeSec = CaptureElapsed;
             Row.FrameMs = FrameMs;
             Row.Population = PopNow;
-            Row.TickMs = static_cast<float>(Eco->GetTickProfile().TotalMs);
+            GetEcoCostMs(Row.TickMs, Row.RelevelMs);
             if (Render)
             {
-                Row.RelevelMs = static_cast<float>(Render->GetLastRelevelMs());
                 Render->GetTierCounts(Row.Hero, Row.Instance, Row.Impostor, Row.Culled);
             }
             Samples.Add(Row);
@@ -193,6 +192,27 @@ float UEcoFrameProfiler::Percentile(float P) const
     return SortScratch[Idx];
 }
 
+float UEcoFrameProfiler::WindowAverageMs() const
+{
+    if (WindowFilled == 0)
+    {
+        return 0.f;
+    }
+
+    float Sum = 0.f;
+    for (int32 i = 0; i < WindowFilled; ++i)
+    {
+        Sum += Window[i];
+    }
+    return Sum / WindowFilled;
+}
+
+void UEcoFrameProfiler::GetEcoCostMs(float& OutTickMs, float& OutRelevelMs) const
+{
+    OutTickMs = Eco ? static_cast<float>(Eco->GetTickProfile().TotalMs) : 0.f;
+    OutRelevelMs = Render ? static_cast<float>(Render->GetLastRelevelMs()) : 0.f;
+}
+
 void UEcoFrameProfiler::LogFrameBudget() const
 {
     if (!bInitialized || WindowFilled == 0)
@@ -204,17 +224,16 @@ void UEcoFrameProfiler::LogFrameBudget() const
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     const float Budget = FMath::Max(1.f, S->FrameBudgetMs);
 
-    float Sum = 0.f, Max = 0.f;
+    float Max = 0.f;
     for (int32 i = 0; i < WindowFilled; ++i)
     {
-        Sum += Window[i];
         Max = FMath::Max(Max, Window[i]);
     }
-    const float Avg = Sum / WindowFilled;
+    const float Avg = WindowAverageMs();
     const float P95 = Percentile(0.95f);
 
-    const float TickMs = static_cast<float>(Eco->GetTickProfile().TotalMs);
-    const float RelevelMs = Render ? static_cast<float>(Render->GetLastRelevelMs()) : 0.f;
+    float TickMs, RelevelMs;
+    GetEcoCostMs(TickMs, RelevelMs);
     const float OursMs = TickMs + RelevelMs;
 
     UE_LOG(LogEcoProfile, Log, TEXT("=== [Eco/F6] Presupuesto de frame (objetivo %.1f ms = %.0f fps) ==="), Budget, 1000.f / Budget);
@@ -261,12 +280,10 @@ void UEcoFrameProfiler::DrawHUD() const
     const UEcosystemSettings* S = UEcosystemSettings::Get();
     const float Budget = FMath::Max(1.f, S->FrameBudgetMs);
 
-    float Sum = 0.f;
-    for (int32 i = 0; i < WindowFilled; ++i) { Sum += Window[i]; }
-    const float Avg = Sum / WindowFilled;
+    const float Avg = WindowAverageMs();
 
-    const float TickMs = static_cast<float>(Eco->GetTickProfile().TotalMs);
-    const float RelevelMs = Render ? static_cast<float>(Render->GetLastRelevelMs()) : 0.f;
+    float TickMs, RelevelMs;
+    GetEcoCostMs(TickMs, RelevelMs);
 
     const FColor Color = (Avg <= Budget) ? FColor::Green : (Avg <= Budget * 1.5f ? FColor::Yellow : FColor::Red);
 

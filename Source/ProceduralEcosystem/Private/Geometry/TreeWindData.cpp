@@ -3,17 +3,10 @@
 #include "Geometry/TreeSkeleton.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h" // EcoRand::Hash32
+#include "Core/EcoCore.h" // EcoRand::HashUnit (hash estable -> [0,1), copia unica)
 
 namespace
 {
-    /** Valor estable en [0,1) a partir de un entero (misma conversion compartida
-        que TreeArchetype: EcoRand::UnitFromBits). */
-    FORCEINLINE float StableUnit(uint32 Value)
-    {
-        return EcoRand::UnitFromBits(EcoRand::Hash32(Value));
-    }
-
     /** Suelo del AO: por debajo de esto no se oscurece mas (evita negros planos). */
     constexpr float MinCanopyAO = 0.15f;
 
@@ -199,8 +192,8 @@ void FTreeWindData::Build(const FTreeSkeleton& Skeleton, const USpeciesData& Spe
         // Por rama y no por nodo a proposito: si cada nodo tuviera su propio
         // desfase, los vertices consecutivos de un mismo tubo se moverian en
         // direcciones distintas y la rama se retorceria como una goma.
-        Out.Phase01 = StableUnit(Seed ^ (static_cast<uint32>(Root) * 2654435761u));
-        Out.TintVariation = StableUnit(Seed ^ (static_cast<uint32>(Root) * 40503u + 0x9E3779B9u));
+        Out.Phase01 = EcoRand::HashUnit(Seed ^ (static_cast<uint32>(Root) * 2654435761u));
+        Out.TintVariation = EcoRand::HashUnit(Seed ^ (static_cast<uint32>(Root) * 40503u + 0x9E3779B9u));
 
         // --- AO de copa desde la rejilla fina del SCA (doc. 6.2) ---
         if (FineLight && FineLight->IsValid())

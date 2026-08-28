@@ -35,6 +35,29 @@ namespace
         const int32 Cy = FMath::FloorToInt(Gy);
         const int32 CellRadius = FMath::CeilToInt(RadiusCm / Geometry.CellSize);
 
+        // Bloque de celdas afectado, RECORTADO una sola vez a la rejilla. Antes
+        // el doble bucle -con su test de limites por celda- estaba escrito dos
+        // veces, una por pasada, y el comentario de la pasada 2 tenia que pedir
+        // "mismo recorrido" a mano: si alguien tocaba uno y no el otro, el orden
+        // de emision dejaba de coincidir y con el se iba el determinismo de la
+        // reduccion. Ahora hay UNA sola definicion del recorrido y las dos
+        // pasadas la comparten por construccion.
+        const int32 X0 = FMath::Max(Cx - CellRadius, 0), X1 = FMath::Min(Cx + CellRadius, Geometry.Width - 1);
+        const int32 Y0 = FMath::Max(Cy - CellRadius, 0), Y1 = FMath::Min(Cy + CellRadius, Geometry.Height - 1);
+
+        auto ForEachCellInDisc = [&](auto&& CellFn)
+            {
+                for (int32 Iy = Y0; Iy <= Y1; ++Iy)
+                {
+                    const int32 dy = Iy - Cy;
+                    const int32 RowBase = Iy * Geometry.Width;
+                    for (int32 Ix = X0; Ix <= X1; ++Ix)
+                    {
+                        CellFn(Ix - Cx, dy, RowBase + Ix);
+                    }
+                }
+            };
+
         // Pesos de las celdas visitadas, en orden de visita. Inline: el radio
         // efectivo por defecto es ~1 celda (bloque 3x3); 64 cubre hasta 7x7 sin
         // tocar el heap, y con radios mayores simplemente reserva.
@@ -42,22 +65,13 @@ namespace
 
         // --- Pasada 1: peso crudo de cada celda dentro del radio (cacheado) ---
         float WeightSum = 0.f;
-        for (int32 dy = -CellRadius; dy <= CellRadius; ++dy)
-        {
-            const int32 Iy = Cy + dy;
-            if (Iy < 0 || Iy >= Geometry.Height) continue;
-
-            for (int32 dx = -CellRadius; dx <= CellRadius; ++dx)
+        ForEachCellInDisc([&](int32 dx, int32 dy, int32 /*Cell*/)
             {
-                const int32 Ix = Cx + dx;
-                if (Ix < 0 || Ix >= Geometry.Width) continue;
-
                 const double CellDistCm = FVector2D(dx, dy).Size() * Geometry.CellSize;
                 const float W = FMath::Max(0.f, 1.f - static_cast<float>(CellDistCm / RadiusCm));
                 Weights.Add(W);
                 WeightSum += W;
-            }
-        }
+            });
 
         if (WeightSum <= KINDA_SMALL_NUMBER)
         {
@@ -75,22 +89,13 @@ namespace
         // determinismo de la reduccion), sin recomputar ninguna distancia.
         const float InvWeightSum = 1.f / WeightSum;
         int32 WeightIdx = 0;
-        for (int32 dy = -CellRadius; dy <= CellRadius; ++dy)
-        {
-            const int32 Iy = Cy + dy;
-            if (Iy < 0 || Iy >= Geometry.Height) continue;
-
-            for (int32 dx = -CellRadius; dx <= CellRadius; ++dx)
+        ForEachCellInDisc([&](int32 /*dx*/, int32 /*dy*/, int32 Cell)
             {
-                const int32 Ix = Cx + dx;
-                if (Ix < 0 || Ix >= Geometry.Width) continue;
-
                 const float W = Weights[WeightIdx++];
-                if (W <= 0.f) continue;
+                if (W <= 0.f) { return; }
 
-                Sink(Iy * Geometry.Width + Ix, TotalAmount * (W * InvWeightSum));
-            }
-        }
+                Sink(Cell, TotalAmount * (W * InvWeightSum));
+            });
     }
 }
 

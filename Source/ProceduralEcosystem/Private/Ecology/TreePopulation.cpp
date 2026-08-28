@@ -2,20 +2,15 @@
 
 void FTreePopulation::Reserve(int32 ExpectedNum)
 {
-    Position.Reserve(ExpectedNum);
-    SpeciesId.Reserve(ExpectedNum);
-    Age.Reserve(ExpectedNum);
-    Biomass.Reserve(ExpectedNum);
-    Height.Reserve(ExpectedNum);
-    Stress.Reserve(ExpectedNum);
-    State.Reserve(ExpectedNum);
-    RngState.Reserve(ExpectedNum);
-    StableId.Reserve(ExpectedNum);
+    ForEachArray([ExpectedNum](auto& Array) { Array.Reserve(ExpectedNum); });
 }
 
 int32 FTreePopulation::Add(const FVector& InPosition, uint16 InSpeciesId, uint32 InRngState,
     float InAge, float InBiomass)
 {
+    // Este SI enumera los campos: cada uno recibe un valor DISTINTO, asi que no
+    // hay nada que factorizar (a diferencia de Reserve/CompactDead/CopyFrom, que
+    // hacen lo mismo con los nueve y usan el visitor ForEachArray).
     const int32 Index = Position.Add(InPosition);
     SpeciesId.Add(InSpeciesId);
     Age.Add(InAge);
@@ -41,49 +36,21 @@ int32 FTreePopulation::CompactDead()
         }
         if (Write != Read)
         {
-            Position[Write] = Position[Read];
-            SpeciesId[Write] = SpeciesId[Read];
-            Age[Write] = Age[Read];
-            Biomass[Write] = Biomass[Read];
-            Height[Write] = Height[Read];
-            Stress[Write] = Stress[Read];
-            State[Write] = State[Read];
-            RngState[Write] = RngState[Read];
-            StableId[Write] = StableId[Read];
+            // Antes eran nueve asignaciones escritas a mano; si se anadia un
+            // campo al agente y se olvidaba esta linea, el array nuevo se
+            // quedaba con los datos de OTRO arbol tras la primera muerte.
+            ForEachArray([Write, Read](auto& Array) { Array[Write] = Array[Read]; });
         }
         ++Write;
     }
 
-    Position.SetNum(Write, EAllowShrinking::No);
-    SpeciesId.SetNum(Write, EAllowShrinking::No);
-    Age.SetNum(Write, EAllowShrinking::No);
-    Biomass.SetNum(Write, EAllowShrinking::No);
-    Height.SetNum(Write, EAllowShrinking::No);
-    Stress.SetNum(Write, EAllowShrinking::No);
-    State.SetNum(Write, EAllowShrinking::No);
-    RngState.SetNum(Write, EAllowShrinking::No);
-    StableId.SetNum(Write, EAllowShrinking::No);
-    checkSlow(  Position.Num() == SpeciesId.Num() &&
-                Position.Num() == Age.Num() &&
-                Position.Num() == Biomass.Num() &&
-                Position.Num() == Height.Num() &&
-                Position.Num() == Stress.Num() &&
-                Position.Num() == State.Num() &&
-                Position.Num() == RngState.Num() &&
-                Position.Num() == StableId.Num());
+    ForEachArray([Write](auto& Array) { Array.SetNum(Write, EAllowShrinking::No); });
+    checkSlow(AllArraysHaveNum(Write));
     return OldNum - Write;
 }
 
 void FTreePopulation::CopyFrom(const FTreePopulation& Src)
 {
-    Position = Src.Position;
-    SpeciesId = Src.SpeciesId;
-    Age = Src.Age;
-    Biomass = Src.Biomass;
-    Height = Src.Height;
-    Stress = Src.Stress;
-    State = Src.State;
-    RngState = Src.RngState;
-    StableId = Src.StableId;
+    ForEachArrayPair(*this, Src, [](auto& Dst, const auto& From) { Dst = From; });
     NextStableId = Src.NextStableId;
 }

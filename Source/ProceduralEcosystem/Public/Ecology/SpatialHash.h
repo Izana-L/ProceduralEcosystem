@@ -98,23 +98,11 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
         const int32 Cy = EcoGrid::WorldToCellClamped(P.Y, Origin.Y, CellSize, GridH);
         const int32 R = FMath::CeilToInt32(Radius / CellSize);
 
-        for (int32 Dy = -R; Dy <= R; ++Dy)
-        {
-            const int32 Ny = Cy + Dy;
-            if (Ny < 0 || Ny >= GridH) continue;
-
-            for (int32 Dx = -R; Dx <= R; ++Dx)
-            {
-                const int32 Nx = Cx + Dx;
-                if (Nx < 0 || Nx >= GridW) continue;
-
-                const int32 C = Ny * GridW + Nx;
-                for (int32 K = CellStart[C]; K < CellStart[C + 1]; ++K)
-                {
-                    Fn(SortedIdx[K]);
-                }
-            }
-        }
+        // Recorrido compartido con FAttractorCloud (EcoGrid::ForEachItemInBox):
+        // una rejilla 2D es la 3D con una sola capa. Mismo orden de visita que
+        // antes (y ademas sin el test de limites por celda).
+        EcoGrid::ForEachItemInBox(CellStart, SortedIdx, Cx, Cy, /*Cz*/ 0, R,
+            GridW, GridH, /*Depth*/ 1, Forward<FuncT>(Fn));
     }
 
     /** Bytes de los buffers persistentes (para Eco.Profile). */

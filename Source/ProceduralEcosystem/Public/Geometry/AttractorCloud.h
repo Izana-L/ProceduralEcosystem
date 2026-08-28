@@ -93,29 +93,11 @@ struct PROCEDURALECOSYSTEM_API FAttractorCloud
         const int32 Cz = EcoGrid::WorldToCell(P.Z, GridOrigin.Z, CellSize);
         const int32 R = FMath::CeilToInt(Radius / CellSize);
 
-        for (int32 Dz = -R; Dz <= R; ++Dz)
-        {
-            const int32 Nz = Cz + Dz;
-            if (Nz < 0 || Nz >= GridD) continue;
-
-            for (int32 Dy = -R; Dy <= R; ++Dy)
-            {
-                const int32 Ny = Cy + Dy;
-                if (Ny < 0 || Ny >= GridH) continue;
-
-                for (int32 Dx = -R; Dx <= R; ++Dx)
-                {
-                    const int32 Nx = Cx + Dx;
-                    if (Nx < 0 || Nx >= GridW) continue;
-
-                    const int32 C = (Nz * GridH + Ny) * GridW + Nx;
-                    for (int32 K = CellStart[C]; K < CellStart[C + 1]; ++K)
-                    {
-                        Fn(SortedIdx[K]);
-                    }
-                }
-            }
-        }
+        // Recorrido compartido con FSpatialHash (EcoGrid::ForEachItemInBox):
+        // este bucle estaba duplicado entre las dos estructuras y es el mas
+        // caliente del SCA (una consulta por nodo y por iteracion).
+        EcoGrid::ForEachItemInBox(CellStart, SortedIdx, Cx, Cy, Cz, R,
+            GridW, GridH, GridD, Forward<FuncT>(Fn));
     }
 
 private:

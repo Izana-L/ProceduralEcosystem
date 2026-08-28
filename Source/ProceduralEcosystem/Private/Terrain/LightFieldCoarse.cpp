@@ -34,11 +34,7 @@ void FLightFieldCoarse::SetGroundHeights(TArray<float>&& InGroundZ)
 
 void FLightFieldCoarse::ClearShadow()
 {
-    // memset rapido: mas barato que un bucle celda a celda.
-    if (Shadow.Num() > 0)
-    {
-        FMemory::Memzero(Shadow.GetData(), Shadow.Num() * sizeof(float));
-    }
+    EcoGrid::ZeroFloats(Shadow); // memset compartido con el grid fino
 }
 
 void FLightFieldCoarse::WorldToVoxelClamped(const FVector& WorldPos, int32& OutIx, int32& OutIy, int32& OutIz) const

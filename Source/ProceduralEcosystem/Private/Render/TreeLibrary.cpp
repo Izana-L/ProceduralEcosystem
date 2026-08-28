@@ -1,5 +1,6 @@
 #include "Render/TreeLibrary.h"
 #include "Render/TreeMeshBaker.h"
+#include "Render/TreeInstanceHost.h" // fabrica comun de componentes de instancing
 
 #include "Core/EcoStats.h" // Fase 6: instrumentacion (stat EcoRender / Insights)
 #include "Species/SpeciesData.h"
@@ -395,23 +396,20 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
         return nullptr;
     }
 
-    UHierarchicalInstancedStaticMeshComponent* Comp =
-        NewObject<UHierarchicalInstancedStaticMeshComponent>(Host,
-            *FString::Printf(TEXT("ISM_%s%s"), *Key.ToString(), bImpostor ? TEXT("_Imp") : TEXT("")));
+    // Configuracion comun de todo componente de instancing del proyecto
+    // (movilidad, colision, navmesh, sombra): la comparte con la capa de suelo.
+    const FName CompName(*FString::Printf(TEXT("ISM_%s%s"),
+        *Key.ToString(), bImpostor ? TEXT("_Imp") : TEXT("")));
+    UHierarchicalInstancedStaticMeshComponent* Comp = ATreeInstanceHost::CreateInstancedComponent(
+        Host, Mesh, CompName,
+        bImpostor ? Config.bImpostorsCastShadow : Config.bInstancesCastShadow,
+        Config.NumInstanceCustomDataFloats);
     if (!Comp)
     {
         return nullptr;
     }
 
-    // Movable: se anaden y quitan instancias en runtime. Con Static, UE asume
-    // que el buffer de instancias no cambia tras registrar el componente.
-    Comp->SetMobility(EComponentMobility::Movable);
-    Comp->SetStaticMesh(Mesh);
-    Comp->NumCustomDataFloats = FMath::Max(0, Config.NumInstanceCustomDataFloats);
-    Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    Comp->SetCanEverAffectNavigation(false); // si no, cada alta/baja pide rebuild de navmesh
-    Comp->SetCastShadow(bImpostor ? Config.bImpostorsCastShadow : Config.bInstancesCastShadow);
-
+    // Y lo especifico de los ARBOLES: viento y cull por distancia.
     // Fase 6: viento + margen de bounds (ver ConfigureWind).
     ConfigureWind(Comp, bImpostor);
 
@@ -426,10 +424,6 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
         const int32 Start = FMath::RoundToInt(EndCull * 0.9f);
         Comp->SetCullDistances(Start, End);
     }
-
-    Comp->SetupAttachment(Host->GetRootComponent());
-    Comp->RegisterComponent();
-    Host->AddInstanceComponent(Comp);
 
     Slot = Comp;
     return Comp;

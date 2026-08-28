@@ -64,6 +64,18 @@ static UTreeRenderSubsystem* GetRender(UWorld* World)
     return World ? World->GetSubsystem<UTreeRenderSubsystem>() : nullptr;
 }
 
+/**
+ * Convencion de TODOS los CVars numericos de esta capa: un valor negativo
+ * significa "no lo fuerzo, usa Project Settings". Estaba escrita a mano cinco
+ * veces (tres radios de LOD + fuerza y direccion del viento) con el ternario
+ * repetido y el nombre del cvar dentro; aqui se lee una vez.
+ */
+static float CVarOverrideOr(const TAutoConsoleVariable<float>& CVar, float SettingsValue)
+{
+    const float Override = CVar.GetValueOnGameThread();
+    return (Override >= 0.f) ? Override : SettingsValue;
+}
+
 // Fase 5 (estacional): "sequedad" [0,1] por arbol para PerInstanceCustomData[1].
 // 0 = follaje sano y verde; 1 = seco/senescente. Los hero trees no tienen custom
 // data, asi que leen 0 (sano) por defecto: por eso 0 = sano y no al reves.
@@ -176,14 +188,12 @@ bool UTreeRenderSubsystem::EnsureInitialized()
 
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
-    Host = World->SpawnActor<ATreeInstanceHost>(ATreeInstanceHost::StaticClass(), FTransform::Identity);
+    // Spawn del host: identico al de la capa de suelo -> fabrica compartida.
+    Host = ATreeInstanceHost::SpawnHost(World, TEXT("TreeInstanceHost (Fase 4)"));
     if (!Host)
     {
         return false;
     }
-#if WITH_EDITOR
-    Host->SetActorLabel(TEXT("TreeInstanceHost (Fase 4)"));
-#endif
 
     FTreeLibraryConfig Cfg;
     Cfg.NumAgeBuckets = S->NumAgeBuckets;
@@ -235,13 +245,15 @@ bool UTreeRenderSubsystem::EnsureInitialized()
 }
 
 
-void UTreeRenderSubsystem::ReleaseEverything()
+/**
+ * Destruye los actores hero cacheados y vacia el bookkeeping asociado.
+ *
+ * Lo hacian por duplicado RebuildAll y ReleaseEverything, con el mismo bucle
+ * copiado: olvidar uno de los tres Reset() en cualquiera de las dos copias deja
+ * entradas apuntando a actores ya destruidos, que es un crash diferido.
+ */
+void UTreeRenderSubsystem::DestroyAllHeroActors()
 {
-    if (Eco)
-    {
-        Eco->OnStateLoaded.RemoveAll(this); // el delegate sobrevive a este subsistema
-    }
-
     for (TPair<uint32, FHeroSlot>& It : HeroActors)
     {
         if (It.Value.Actor)
@@ -252,6 +264,16 @@ void UTreeRenderSubsystem::ReleaseEverything()
     HeroActors.Reset();
     HeroQueue.Reset();
     HeroInfo.Reset();
+}
+
+void UTreeRenderSubsystem::ReleaseEverything()
+{
+    if (Eco)
+    {
+        Eco->OnStateLoaded.RemoveAll(this); // el delegate sobrevive a este subsistema
+    }
+
+    DestroyAllHeroActors();
     HeroSet.Reset();
     HeroBest.Reset();
     DistSqCache.Reset();
@@ -305,16 +327,7 @@ void UTreeRenderSubsystem::RebuildAll()
         Library->ClearAllInstances();
     }
 
-    for (TPair<uint32, FHeroSlot>& It : HeroActors)
-    {
-        if (It.Value.Actor)
-        {
-            It.Value.Actor->Destroy();
-        }
-    }
-    HeroActors.Reset();
-    HeroQueue.Reset();
-    HeroInfo.Reset();
+    DestroyAllHeroActors();
 
     bForceRelevel = true;
 }
@@ -479,9 +492,9 @@ void UTreeRenderSubsystem::UpdateLOD(const FVector& ViewLocation)
     const FTreePopulation& Pop = Eco->GetPopulation();
     const int32 PopNum = Pop.Num();
 
-    const float HeroR = CVarHeroRadius.GetValueOnGameThread() >= 0.f ? CVarHeroRadius.GetValueOnGameThread() : S->HeroRadiusCm;
-    const float ImpR = CVarImpostorRadius.GetValueOnGameThread() >= 0.f ? CVarImpostorRadius.GetValueOnGameThread() : S->ImpostorRadiusCm;
-    const float CullR = CVarCullRadius.GetValueOnGameThread() >= 0.f ? CVarCullRadius.GetValueOnGameThread() : S->CullRadiusCm;
+    const float HeroR = CVarOverrideOr(CVarHeroRadius, S->HeroRadiusCm);
+    const float ImpR = CVarOverrideOr(CVarImpostorRadius, S->ImpostorRadiusCm);
+    const float CullR = CVarOverrideOr(CVarCullRadius, S->CullRadiusCm);
 
     const double HeroR2 = static_cast<double>(HeroR) * HeroR;
     const double ImpR2 = static_cast<double>(ImpR) * ImpR;
@@ -1337,11 +1350,8 @@ void UTreeRenderSubsystem::UpdateWind(float DeltaTime)
 
     const bool bWindOn = S->bEnableWind && (CVarWind.GetValueOnGameThread() != 0);
 
-    const float StrengthOverride = CVarWindStrength.GetValueOnGameThread();
-    const float BaseStrength = (StrengthOverride >= 0.f) ? StrengthOverride : S->WindStrength;
-
-    const float DirOverride = CVarWindDir.GetValueOnGameThread();
-    const float BaseDirDeg = (DirOverride >= 0.f) ? DirOverride : S->WindDirectionDeg;
+    const float BaseStrength = CVarOverrideOr(CVarWindStrength, S->WindStrength);
+    const float BaseDirDeg = CVarOverrideOr(CVarWindDir, S->WindDirectionDeg);
 
     // --- Rafagas: ruido temporal barato y REPRODUCIBLE ---
     // Dos senos de periodos inconmensurables (P y P*0.37): la suma no se repite

@@ -53,8 +53,67 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     /** Siguiente id a repartir. Se copia en CopyFrom para que los ids de la
         germinacion sobre el buffer de escritura sean deterministas. */
     uint32 NextStableId = 1;
+
+    /**
+     * =====================================================================
+     *  EL UNICO SITIO DONDE SE ENUMERAN LOS ARRAYS DEL SoA
+     * =====================================================================
+     * Invoca Visit(Array) sobre los NUEVE arrays paralelos, en orden fijo.
+     *
+     * POR QUE: la lista de campos estaba escrita a mano en SEIS sitios
+     * distintos -Reserve, el bloque de copia de CompactDead, sus SetNum, su
+     * checkSlow, CopyFrom y la serializacion del bake (mas la validacion de
+     * longitudes al cargarlo)-. Anadir un campo nuevo al agente obligaba a
+     * acordarse de todos; olvidar uno no da error de compilacion, da un array
+     * descuadrado que revienta -o peor, mezcla datos de arboles distintos- a
+     * mitad de una partida larga. Con el visitor, el campo se declara una vez
+     * aqui, se anade a esta lista, y los seis sitios quedan correctos solos.
+     *
+     * Visit tiene que ser un lambda GENERICO (auto&), porque los arrays son de
+     * tipos distintos. Se expande e inlinea entero: no cuesta nada en runtime.
+     */
+    template <typename FVisit>
+    FORCEINLINE void ForEachArray(FVisit&& Visit)
+    {
+        Visit(Position);  Visit(SpeciesId); Visit(Age);   Visit(Biomass);
+        Visit(Height);    Visit(Stress);    Visit(State); Visit(RngState);
+        Visit(StableId);
+    }
+
+    template <typename FVisit>
+    FORCEINLINE void ForEachArray(FVisit&& Visit) const
+    {
+        Visit(Position);  Visit(SpeciesId); Visit(Age);   Visit(Biomass);
+        Visit(Height);    Visit(Stress);    Visit(State); Visit(RngState);
+        Visit(StableId);
+    }
+
+    /** Igual, pero emparejando los arrays de DOS poblaciones (destino, origen).
+        Lo usa CopyFrom; el orden es el mismo que el de ForEachArray. */
+    template <typename FVisit>
+    FORCEINLINE static void ForEachArrayPair(FTreePopulation& Dst, const FTreePopulation& Src, FVisit&& Visit)
+    {
+        Visit(Dst.Position,  Src.Position);  Visit(Dst.SpeciesId, Src.SpeciesId);
+        Visit(Dst.Age,       Src.Age);       Visit(Dst.Biomass,   Src.Biomass);
+        Visit(Dst.Height,    Src.Height);    Visit(Dst.Stress,    Src.Stress);
+        Visit(Dst.State,     Src.State);     Visit(Dst.RngState,  Src.RngState);
+        Visit(Dst.StableId,  Src.StableId);
+    }
     /** Numero de arboles actualmente en el array (vivos + muertos sin compactar). */
     int32 Num() const { return Position.Num(); }
+
+    /**
+     * true si los NUEVE arrays paralelos tienen exactamente ExpectedNum
+     * elementos. Es la invariante del SoA: la comprueba CompactDead y la usa
+     * LoadState para rechazar un bake descuadrado ANTES de pisar el estado vivo
+     * (antes esa validacion era otra lista de campos escrita a mano).
+     */
+    bool AllArraysHaveNum(int32 ExpectedNum) const
+    {
+        bool bOk = true;
+        ForEachArray([ExpectedNum, &bOk](const auto& Array) { bOk = bOk && (Array.Num() == ExpectedNum); });
+        return bOk;
+    }
 
     /** Reserva espacio en todos los arrays a la vez (evita realojos durante germinacion masiva). */
     void Reserve(int32 ExpectedNum);

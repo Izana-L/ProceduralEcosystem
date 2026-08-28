@@ -34,7 +34,10 @@ void FTreeLightGridFine::InitForBounds(const FBox& WorldBounds, float InVoxelSiz
 
 void FTreeLightGridFine::ClearShadow()
 {
-    for (float& S : Shadow) { S = 0.f; }
+    // Antes era un bucle celda a celda. Ahora es el MISMO memset que usa el grid
+    // grueso (EcoGrid::ZeroFloats): esta rejilla se limpia una vez por refresco
+    // de luz del SCA, asi que es la que mas lo agradece.
+    EcoGrid::ZeroFloats(Shadow);
 }
 
 void FTreeLightGridFine::SeedFromCoarse(const FLightFieldCoarse& Coarse)

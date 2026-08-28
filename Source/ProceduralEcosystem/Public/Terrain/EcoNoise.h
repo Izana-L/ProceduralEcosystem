@@ -84,6 +84,20 @@ namespace EcoNoise
         FVector2D WarpOffsetB = FVector2D::ZeroVector;
     };
 
+    /**
+     * Hash de 32 bits -> desplazamiento en el espacio del ruido.
+     *
+     * 16 bits * 0.1 mantiene el offset en [0, 6553.6]: lejos del origen (para
+     * descorrelacionar campos) pero sin degradar la precision del double dentro
+     * del PerlinNoise2D. La constante estaba escrita dos veces -aqui y a mano en
+     * FNutrientField::GeneratePatchyBase-, asi que tocar la escala en un sitio
+     * dejaba los dos campos en espacios de ruido distintos sin avisar.
+     */
+    FORCEINLINE double OffsetFromHash(uint32 Hashed)
+    {
+        return (Hashed & 0xFFFF) * 0.1;
+    }
+
     /** Desplazamiento en el espacio del ruido derivado de (Seed, Salt): cada
         Salt abre un stream descorrelacionado. Misma convencion que usaba
         FHeightField (Hash32 truncado a 16 bits, escala 0.1). */

@@ -1,6 +1,5 @@
 #include "Terrain/HeightField.h"
 #include "Core/EcoCore.h"
-#include "Async/ParallelFor.h"
 
 void FHeightField::Generate(const FTerrainGenParams& Params)
 {
@@ -25,31 +24,18 @@ void FHeightField::Generate(const FTerrainGenParams& Params)
     N.WarpOctaves = EcoNoise::ClampOctavesToNyquist(N.WarpOctaves,
         N.WarpWavelengthCm, /*Lacunarity del warp*/ 2.0, Params.CellSizeCm);
 
-    const int32 W = Field.Width;
-    const int32 Ht = Field.Height;
     const double Cell = Field.CellSize;
 
     // -----------------------------------------------------------------
-    // 2) Ruido compuesto, en paralelo por filas. Cada fila escribe celdas
-    //    distintas y TerrainSample es puro -> el resultado NO depende del
-    //    orden de los hilos (determinista).
+    // 2 y 3) Ruido compuesto en paralelo por filas y normalizacion al rango
+    //    REAL del ruido (el relieve ocupa todo [0, HeightScaleCm], que es la
+    //    amplitud pico-valle). Las dos cosas las hace FField2D::
+    //    GenerateNormalized, que es la copia unica del patron: TerrainSample es
+    //    puro y cada fila escribe celdas distintas -> determinista.
     // -----------------------------------------------------------------
-    TArray<float> Raw;
-    Raw.SetNumUninitialized(W * Ht);
-
-    ParallelFor(Ht, [&](int32 y)
-        {
-            for (int32 x = 0; x < W; ++x)
-            {
-                Raw[y * W + x] = EcoNoise::TerrainSample(x * Cell, y * Cell, N);
-            }
-        });
-
-    // -----------------------------------------------------------------
-    // 3) Normaliza al rango REAL del ruido: el relieve ocupa todo
-    //    [0, HeightScaleCm] y HeightScaleCm es la amplitud pico-valle.
-    // -----------------------------------------------------------------
-    Field.FillNormalizedFrom(Raw, static_cast<float>(Params.HeightScaleCm));
+    Field.GenerateNormalized(
+        [Cell, &N](int32 x, int32 y) { return EcoNoise::TerrainSample(x * Cell, y * Cell, N); },
+        static_cast<float>(Params.HeightScaleCm));
 
     // -----------------------------------------------------------------
     // 4) Erosion (bake unico): la hidraulica talla la red de drenaje y

@@ -62,8 +62,8 @@ namespace EcoVigor
                     const int32 i = y * W + x;
 
                     // Nodo -> mundo (convencion de FField2D: el valor vive en el nodo).
-                    const double Xcm = Ref.Origin.X + x * Ref.CellSize;
-                    const double Ycm = Ref.Origin.Y + y * Ref.CellSize;
+                    const double Xcm = Ref.NodeWorldX(x);
+                    const double Ycm = Ref.NodeWorldY(y);
                     const double Zcm = Height.SampleHeight(Xcm, Ycm); // luz a ras de suelo
 
                     const float Wv = Water.SampleWater(Xcm, Ycm);

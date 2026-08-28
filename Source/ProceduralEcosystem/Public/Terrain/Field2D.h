@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Math/Box2D.h"
+#include "Async/ParallelFor.h"
 #include "Core/GridMath.h"
 
 /**
@@ -53,6 +54,13 @@ struct PROCEDURALECOSYSTEM_API FField2D
     /** Extension en mundo (cm) que cubre la rejilla. */
     FBox2D GetWorldBounds() const;
 
+    /** Coordenada de mundo (cm) del NODO (Ix, Iy). Es la convencion del campo
+        -el valor vive en el nodo, no en el centro de celda- y estaba reescrita a
+        mano en el bake de idoneidad, en el heatmap de luz y en la exportacion de
+        heightmap. */
+    FORCEINLINE double NodeWorldX(int32 Ix) const { return Origin.X + Ix * CellSize; }
+    FORCEINLINE double NodeWorldY(int32 Iy) const { return Origin.Y + Iy * CellSize; }
+
     /** Mundo -> coordenadas de rejilla (en muestras, fraccional). */
     FORCEINLINE void WorldToGrid(double Xcm, double Ycm, double& OutGx, double& OutGy) const
     {
@@ -72,4 +80,41 @@ struct PROCEDURALECOSYSTEM_API FField2D
      * mismo numero de celdas que la rejilla.
      */
     void FillNormalizedFrom(const TArray<float>& Raw, float OutputMax);
+
+    /**
+     * Genera el campo entero desde una funcion de rejilla y lo normaliza a
+     * [0, OutputMax]: Gen(x, y) -> valor crudo.
+     *
+     * Es el patron "buffer crudo -> ParallelFor por filas -> FillNormalizedFrom"
+     * que estaba copiado literalmente en FHeightField::Generate y en
+     * FNutrientField::GeneratePatchyBase (y que cualquier campo nuevo volveria a
+     * copiar). Aqui vive una sola vez, con la MISMA particion por filas: cada
+     * fila escribe celdas disjuntas y Gen debe ser pura, asi que el resultado no
+     * depende del numero de hilos -> determinista, como exige la Fase 0.
+     *
+     * Es plantilla (no TFunctionRef) a proposito: Gen se inlinea dentro del
+     * bucle, que es lo que se quiere en un bake de cientos de miles de celdas.
+     */
+    template <typename FGen>
+    void GenerateNormalized(FGen&& Gen, float OutputMax)
+    {
+        if (!IsValid())
+        {
+            return;
+        }
+
+        const int32 W = Width;
+        TArray<float> Raw;
+        Raw.SetNumUninitialized(W * Height);
+
+        ParallelFor(Height, [&Raw, &Gen, W](int32 y)
+            {
+                for (int32 x = 0; x < W; ++x)
+                {
+                    Raw[y * W + x] = Gen(x, y);
+                }
+            });
+
+        FillNormalizedFrom(Raw, OutputMax);
+    }
 };

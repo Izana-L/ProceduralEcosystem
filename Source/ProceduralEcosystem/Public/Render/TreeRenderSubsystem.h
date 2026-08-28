@@ -178,6 +178,11 @@ private:
     void ReleaseHero(uint32 StableId);
     void EvictOldHeroes();
 
+    /** Destruye los actores hero cacheados y vacia HeroActors/HeroQueue/HeroInfo.
+        Lo comparten RebuildAll y ReleaseEverything (antes cada uno tenia su copia
+        del bucle, con el riesgo de que una olvidase alguno de los Reset). */
+    void DestroyAllHeroActors();
+
     /** Fase 5 (bosque vivo): acerca cada frame la escala de los hero trees a su
         FHeroSlot::TargetScale con un suavizado exponencial (barato: son decenas). */
     void UpdateHeroInterpolation(float DeltaTime);
