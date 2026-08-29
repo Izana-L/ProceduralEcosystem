@@ -15,6 +15,15 @@ void FResourcePool::RegenerateTowardBase(const FField2D& Base, float RechargeRat
     // un array del mismo tamano es un memcpy sin tocar el heap.
     Snapshot = Next.Data;
 
+    // RECORTAR A CERO **ANTES** DE DIFUNDIR. Next puede traer celdas negativas si
+    // el consumo de un arbol supero lo que habia; el recorte final de mas abajo las
+    // arregla, pero para entonces esa deuda ya se ha propagado por el Laplaciano a
+    // las celdas vecinas, bajandoles recurso REAL. O sea: una demanda excesiva se
+    // convertia en una externalidad que perjudicaba a los vecinos sin coste para
+    // quien la ejercia, y ademas la masa del campo dejaba de conservarse.
+    // (El tope de extraccion del tick evita que aparezcan; esto es el cinturon.)
+    for (float& V : Snapshot) { V = FMath::Max(V, 0.f); }
+
     const float* RESTRICT Src = Snapshot.GetData();
     const float* RESTRICT BaseData = Base.Data.GetData();
     float* RESTRICT Dst = Next.Data.GetData();

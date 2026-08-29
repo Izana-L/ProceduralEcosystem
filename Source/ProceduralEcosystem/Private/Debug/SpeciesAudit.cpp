@@ -3,6 +3,7 @@
 #include "Config/EcosystemSettings.h"
 #include "Species/SpeciesData.h"
 #include "Ecology/Vigor.h"
+#include "Ecology/EcologyRules.h"
 #include "Core/GridMath.h"
 
 #include "HAL/IConsoleManager.h"
@@ -44,6 +45,24 @@ namespace
         { TEXT("SeedDispersalRadius"), true,  [](const USpeciesData& S) { return S.SeedDispersalRadius; } },
         { TEXT("SeedRateScale"),       true,  [](const USpeciesData& S) { return S.SeedRateScale; } },
         { TEXT("GerminationRateScale"),true,  [](const USpeciesData& S) { return S.GerminationRateScale; } },
+        { TEXT("RootRadius"),          true,  [](const USpeciesData& S) { return S.RootRadius; } },
+
+        // ANCHURA DE CAMPANA COMO EJE MONOTONO. Es contraintuitivo pero se demuestra
+        // en una linea: d/dW exp(-((R-Opt)/W)^2) > 0 para todo R distinto del optimo,
+        // luego ensanchar la campana SUBE la respuesta en todas las celdas menos en
+        // una. Una anchura mayor es ventaja gratuita, y el bloque 5 -que las mira
+        // como "separacion de nichos"- no la ve como tal.
+        { TEXT("WaterTolerance"),      true,  [](const USpeciesData& S) { return S.WaterTolerance; } },
+        { TEXT("NutrientTolerance"),   true,  [](const USpeciesData& S) { return S.NutrientTolerance; } },
+
+        // Un declive que llega mas tarde, frena menos, mata menos y semilla mas es
+        // mejor en todos los casos.
+        { TEXT("SenescenceAgeFrac"),   true,  [](const USpeciesData& S) { return S.SenescenceAgeFraction; } },
+        { TEXT("SenescentGrowth"),     true,  [](const USpeciesData& S) { return S.SenescentGrowthScale; } },
+        { TEXT("SenescentSeed"),       true,  [](const USpeciesData& S) { return S.SenescentSeedScale; } },
+        { TEXT("SenescMortalidad"),    false, [](const USpeciesData& S) { return S.SenescentMortalityMultiplier; } },
+        { TEXT("MortSuprimido"),       false, [](const USpeciesData& S) { return S.SuppressedMortalityPerYear; } },
+
         { TEXT("WaterDemand"),         false, [](const USpeciesData& S) { return S.WaterDemand; } },
         { TEXT("NutrientDemand"),      false, [](const USpeciesData& S) { return S.NutrientDemand; } },
         { TEXT("MaturityAge"),         false, [](const USpeciesData& S) { return S.MaturityAge; } },
@@ -58,13 +77,32 @@ namespace
         return Axis.bHigherIsBetter ? Raw : -Raw;
     }
 
-    /** Celdas del campo de recursos que toca el disco radicular de un adulto.
-        Misma cuenta que EcologyRules::KernelCellCount, aqui sin necesitar el campo. */
-    int32 RootCellCount(float RootRadiusM, float CellSizeCm)
+    /**
+     * Celdas del campo de recursos que RECIBEN algo del disco radicular de un adulto.
+     *
+     * Antes esto devolvia (2*ceil(R/celda)+1)^2, o sea el area de la CAJA recorrida,
+     * y con ella el bloque 2 declaraba nueve celdas donde el kernel escribe una: el
+     * peso lineal 1-d/R vale exactamente 0 en los cuatro vecinos ortogonales cuando
+     * el radio no supera el tamano de celda. La comprobacion de sostenibilidad del
+     * pozo salia asi nueve veces optimista y daba luz verde a demandas que vacian la
+     * celda. Ahora se cuentan las celdas con peso > 0, replicando el mismo peso que
+     * usa EcologyRules.
+     */
+    int32 RootCellsWithWeight(float RootRadiusCm, float CellSizeCm)
     {
-        if (RootRadiusM <= 0.f || CellSizeCm <= 0.f) { return 1; }
-        const int32 R = FMath::CeilToInt(RootRadiusM * 100.f / CellSizeCm);
-        return (2 * R + 1) * (2 * R + 1);
+        if (RootRadiusCm <= 0.f || CellSizeCm <= 0.f) { return 1; }
+
+        const int32 R = FMath::CeilToInt(RootRadiusCm / CellSizeCm);
+        int32 Count = 0;
+        for (int32 dy = -R; dy <= R; ++dy)
+        {
+            for (int32 dx = -R; dx <= R; ++dx)
+            {
+                const float DistCm = FMath::Sqrt(float(dx * dx + dy * dy)) * CellSizeCm;
+                if (1.f - DistCm / RootRadiusCm > 0.f) { ++Count; }
+            }
+        }
+        return FMath::Max(Count, 1);
     }
 }
 
@@ -112,12 +150,24 @@ void EcoSpeciesAudit::RunAndLog()
         TEXT("especie"), TEXT("ShadeTol"), TEXT("fL sol"), TEXT("fL sombra"), TEXT("veredicto"));
 
     bool bAnyCondemned = false;
+    // Rango de f_L a pleno sol ENTRE especies, y su recorrido dentro de una misma
+    // especie entre pleno sol y penumbra. La comparacion entre ambos es la que dice
+    // si la luz puede repartir territorio o solo produce un ranking global.
+    float MinSunAcrossSpecies = TNumericLimits<float>::Max();
+    float MaxSunAcrossSpecies = 0.f;
+    float MaxSpatialSwing = 0.f;
+
     for (const USpeciesData* Species : Sp)
     {
-        const float fLSun = EcoVigor::LightFactor(FullSun, Species->ShadeTolerance, KlMax);
-        const float fLShade = EcoVigor::LightFactor(kDeepShadeQ * FullSun, Species->ShadeTolerance, KlMax);
+        const EcoVigor::FLightResponse LightResp = EcoVigor::MakeLightResponse(*Species, *S);
+        const float fLSun = EcoVigor::LightFactor(FullSun, LightResp);
+        const float fLShade = EcoVigor::LightFactor(kDeepShadeQ * FullSun, LightResp);
         const bool bCondemned = (fLSun < StressThreshold);
         bAnyCondemned |= bCondemned;
+
+        MinSunAcrossSpecies = FMath::Min(MinSunAcrossSpecies, fLSun);
+        MaxSunAcrossSpecies = FMath::Max(MaxSunAcrossSpecies, fLSun);
+        MaxSpatialSwing = FMath::Max(MaxSpatialSwing, fLSun - fLShade);
 
         UE_LOG(LogEcoAudit, Log, TEXT("   %-18s %8.3f %8.3f %8.3f   %s"),
             *Species->SpeciesName.ToString(), Species->ShadeTolerance, fLSun, fLShade,
@@ -125,6 +175,24 @@ void EcoSpeciesAudit::RunAndLog()
             ? TEXT("*** CONDENADA: se estresa a pleno sol y sin vecinos")
             : (fLSun < StressThreshold * 1.3f ? TEXT("margen escaso") : TEXT("ok")));
     }
+    // EL AVISO QUE HABRIA CAZADO SOLO EL PROBLEMA DE FONDO. Si la diferencia de f_L
+    // ENTRE especies supera al recorrido de f_L a lo largo del gradiente de luz, el
+    // eje de luz no puede invertir el orden en ninguna celda: deja de ser un reparto
+    // espacial y se convierte en un ranking global, y como es el que suele imponer
+    // el minimo de Liebig, arrastra con el a los otros dos.
+    const float SpeciesSpread = MaxSunAcrossSpecies - MinSunAcrossSpecies;
+    UE_LOG(LogEcoAudit, Log,
+        TEXT("   recorrido de fL con la luz (sol -> sombra): %.3f | diferencia ENTRE especies a pleno sol: %.3f"),
+        MaxSpatialSwing, SpeciesSpread);
+    if (SpeciesSpread > MaxSpatialSwing)
+    {
+        UE_LOG(LogEcoAudit, Warning,
+            TEXT("   *** La ventaja de RASGO en luz (%.3f) supera a toda la variacion que puede producir la SOMBRA "
+                "(%.3f): la especie mas tolerante gana en todas las celdas a la vez. Baja LightHalfSaturationMax, "
+                "sube ShadeToleranceAssimilationCost, o comprueba que el dosel genera sombra util (Eco.Luz.Perfil)."),
+            SpeciesSpread, MaxSpatialSwing);
+    }
+
     if (bAnyCondemned)
     {
         // Kl < Q*(1-U)/U con Q = FullSunlight es la condicion para que fL supere
@@ -154,7 +222,18 @@ void EcoSpeciesAudit::RunAndLog()
 
     for (const USpeciesData* Species : Sp)
     {
-        const int32 Cells = RootCellCount(Species->RootRadius, S->HeightfieldCellSizeCm);
+        // Radio EFECTIVO de un adulto, con el minimo en celdas que aplica el tick.
+        const float AdultRadiusCm = EcologyRules::EffectiveRootRadiusCm(
+            Species->RootRadius, 1.f, 1.f, S->MinRootRadiusCells * S->HeightfieldCellSizeCm);
+        const int32 Cells = RootCellsWithWeight(AdultRadiusCm, S->HeightfieldCellSizeCm);
+        if (Cells <= 1)
+        {
+            UE_LOG(LogEcoAudit, Warning,
+                TEXT("   *** %s: el kernel radicular de un adulto escribe UNA sola celda (radio efectivo %.0f cm, "
+                    "celda %.0f cm). No compite por suelo con nadie: son pozos privados, no un bien comun. "
+                    "Sube RootRadius o MinRootRadiusCells."),
+                *Species->SpeciesName.ToString(), AdultRadiusCm, S->HeightfieldCellSizeCm);
+        }
 
         // BASE LOCAL REPRESENTATIVA, no el maximo del campo.
         //
@@ -204,7 +283,8 @@ void EcoSpeciesAudit::RunAndLog()
     UE_LOG(LogEcoAudit, Log, TEXT("3) GEOMETRIA  (la raiz deberia competir en un radio comparable al de la copa)"));
     for (const USpeciesData* Species : Sp)
     {
-        const float RootCm = Species->RootRadius * 100.f;
+        const float RootCm = EcologyRules::EffectiveRootRadiusCm(
+            Species->RootRadius, 1.f, 1.f, S->MinRootRadiusCells * S->HeightfieldCellSizeCm);
         const float CrownCm = S->CanopyRadiusFraction * Species->MaxHeightCm;
         UE_LOG(LogEcoAudit, Log, TEXT("   %-18s raiz %6.0f cm | copa %6.0f cm | raiz/copa %.2f  %s"),
             *Species->SpeciesName.ToString(), RootCm, CrownCm,
@@ -227,17 +307,23 @@ void EcoSpeciesAudit::RunAndLog()
         {
             if (a == b) { continue; }
 
-            bool bNeverWorse = true;
-            bool bStrictlyBetterSomewhere = false;
+            // SIN break: hay que contar los ejes, no salir al primero perdido.
+            //
+            // La prueba de todo-o-nada solo cazaba la dominancia PERFECTA, asi que
+            // imprimia "ninguna especie domina a otra" sobre un conjunto donde una
+            // gana en once de doce ejes -que en la practica es lo mismo-. Contando,
+            // la dominancia casi-total tambien salta.
+            int32 Wins = 0, Ties = 0, Losses = 0;
             for (int32 k = 0; k < kNumAxes; ++k)
             {
                 const float ScoreA = AxisScore(kAxes[k], *Sp[a]);
                 const float ScoreB = AxisScore(kAxes[k], *Sp[b]);
-                if (ScoreA < ScoreB) { bNeverWorse = false; break; }
-                if (ScoreA > ScoreB) { bStrictlyBetterSomewhere = true; }
+                if (ScoreA > ScoreB) { ++Wins; }
+                else if (ScoreA < ScoreB) { ++Losses; }
+                else { ++Ties; }
             }
 
-            if (bNeverWorse && bStrictlyBetterSomewhere)
+            if (Losses == 0 && Wins > 0)
             {
                 bAnyDominance = true;
                 UE_LOG(LogEcoAudit, Warning,
@@ -245,6 +331,15 @@ void EcoSpeciesAudit::RunAndLog()
                         "%s se extinguira haga lo que haga el mapa."),
                     *Sp[a]->SpeciesName.ToString(), *Sp[b]->SpeciesName.ToString(),
                     kNumAxes, *Sp[b]->SpeciesName.ToString());
+            }
+            else if (Losses <= FMath::Max(1, kNumAxes / 10))
+            {
+                bAnyDominance = true;
+                UE_LOG(LogEcoAudit, Warning,
+                    TEXT("   *** %s domina CASI del todo a %s (%d ganados, %d empates, %d perdidos de %d ejes): "
+                        "revisa si lo que pierde le compensa de verdad."),
+                    *Sp[a]->SpeciesName.ToString(), *Sp[b]->SpeciesName.ToString(),
+                    Wins, Ties, Losses, kNumAxes);
             }
         }
     }
@@ -282,6 +377,15 @@ void EcoSpeciesAudit::RunAndLog()
                 const float SepNutrient = Separation(Sp[a]->NutrientOptimum, Sp[a]->NutrientTolerance,
                     Sp[b]->NutrientOptimum, Sp[b]->NutrientTolerance);
                 const float Best = FMath::Max(SepWater, SepNutrient);
+
+                if (!Sp[a]->bNutrientExcessPenalty && !Sp[b]->bNutrientExcessPenalty
+                    && S->NicheExcessWidthScale <= 0.f)
+                {
+                    UE_LOG(LogEcoAudit, Warning,
+                        TEXT("   *** Ninguna de las dos penaliza el exceso de nutrientes y NicheExcessWidthScale=0: "
+                            "por encima del optimo fN vale 1 para las dos, la campana deja de ser unimodal y la "
+                            "separacion que sigue no significa nada en la mitad rica del mapa."));
+                }
 
                 UE_LOG(LogEcoAudit, Log, TEXT("   %-14s vs %-14s  agua %.2f | nutrientes %.2f  %s"),
                     *Sp[a]->SpeciesName.ToString(), *Sp[b]->SpeciesName.ToString(),

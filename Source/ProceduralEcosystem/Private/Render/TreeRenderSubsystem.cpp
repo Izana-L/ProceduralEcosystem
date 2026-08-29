@@ -84,6 +84,12 @@ static float DrynessOf(ETreeState State, float Stress)
     switch (State)
     {
     case ETreeState::Senescent: return FMath::Clamp(0.6f + 0.4f * Stress, 0.f, 1.f);
+
+    // Un suprimido esta apagado pero VIVO y puede recuperarse, asi que no se dibuja
+    // como un senescente: se lee del estres, con algo mas de peso que un sano. Sin
+    // este caso caeria en el default y saldria completamente seco.
+    case ETreeState::Suppressed: return FMath::Clamp(0.5f * Stress, 0.f, 1.f);
+
     case ETreeState::Sapling:
     case ETreeState::Mature:    return FMath::Clamp(0.35f * Stress, 0.f, 1.f);
     default:                    return 1.f; // Dead: no deberia dibujarse

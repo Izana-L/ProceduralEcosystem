@@ -81,11 +81,25 @@ namespace EcologyRules
     }
 
     /**
-     * Estres: sube proporcional al deficit de vigor bajo el umbral, se
-     * recupera linealmente si hay vigor de sobra. Acotado a [0,1].
+     * Estres: sube proporcional al deficit de vigor bajo el umbral, se recupera si
+     * hay vigor de sobra, y DECAE proporcionalmente a lo acumulado. Acotado a [0,1].
+     *
+     * EL TERMINO DE DECAIMIENTO (-k*S) NO ES COSMETICO. Sin el la funcion es un
+     * integrador puro con tope, y su punto fijo es un ESCALON: con vigor por encima
+     * del umbral el estres cae a 0 exacto (mortalidad por estres nula, arbol
+     * inmortal por ese canal), y con vigor por debajo sube sin freno hasta 1
+     * (mortalidad plena). No existe ningun estres de equilibrio intermedio, asi que
+     * dos sitios de calidad muy distinta -vigor 0.44 y 0.90- producen exactamente la
+     * misma demografia, y dos especies separadas por unas centesimas de vigor en el
+     * mismo punto quedan separadas por una diferencia de mortalidad infinita. Eso es
+     * exclusion competitiva fabricada por la FORMA de la funcion.
+     *
+     * Con k > 0 el punto fijo pasa a ser S* = (Umbral - vigor)*Acumulacion/k: una
+     * rampa continua entre 0 y 1 que hace que la calidad del sitio se traduzca en
+     * riesgo de forma suave y monotona, que es lo que se queria decir con "estres".
      */
     FORCEINLINE float UpdateStress(float Stress, float VigorValue, float StressThreshold,
-        float StressAccumulationRate, float StressRecoveryRate, float DtYears)
+        float StressAccumulationRate, float StressRecoveryRate, float StressDecayRate, float DtYears)
     {
         if (VigorValue < StressThreshold)
         {
@@ -95,56 +109,133 @@ namespace EcologyRules
         {
             Stress -= StressRecoveryRate * DtYears;
         }
+
+        Stress -= StressDecayRate * Stress * DtYears;
         return FMath::Clamp(Stress, 0.f, 1.f);
     }
 
     /**
-     * Probabilidad de morir este tick, combinando edad y estres como causas
-     * INDEPENDIENTES: P(sobrevivir a ambas) = (1-pAge)(1-pStress).
-     * pAge crece con la 4a potencia de Age/Longevity: casi nula la mayor
-     * parte de la vida, se dispara cerca de la longevidad de la especie.
+     * Peso efectivo del estres en la mortalidad, atenuado por la longevidad:
+     *
+     *     peso = BaseWeight * (RefLongevity / Longevity)^Exponent
+     *
+     * Los parametros de estres son GLOBALES mientras el tiempo que una especie
+     * necesita para crecer es un rasgo POR ESPECIE, asi que un impuesto de
+     * mortalidad en %/ano identico para todas penaliza linealmente a la lenta. Y la
+     * unica compensacion que el modelo le ofrecia -la longevidad- actua sobre la
+     * mortalidad por EDAD, que con una vida realizada muy por debajo de la nominal
+     * aporta una fraccion despreciable del riesgo: en la practica la longevidad no
+     * compraba nada y la estrategia K quedaba fuera del espacio de estrategias
+     * viables. Aqui la longevidad compra por fin resistencia al estres cronico, que
+     * es como se paga en un bosque real.
      */
-    FORCEINLINE float MortalityProbability(float Age, float Longevity, float Stress,
-        float StressMortalityWeight, float DtYears)
+    FORCEINLINE float EffectiveStressMortalityWeight(float BaseWeight, float Longevity,
+        float RefLongevity, float Exponent)
+    {
+        if (Exponent <= 0.f || Longevity <= 0.f) { return BaseWeight; }
+        return BaseWeight * FMath::Pow(FMath::Max(RefLongevity, 1.f) / Longevity, Exponent);
+    }
+
+    /**
+     * Riesgo de morir por EDAD en este tick. Crece con la 4a potencia de
+     * Age/Longevity: casi nulo la mayor parte de la vida, se dispara cerca de la
+     * longevidad de la especie.
+     */
+    FORCEINLINE float AgeMortalityProbability(float Age, float Longevity, float DtYears)
     {
         const float AgeRatio = Age / FMath::Max(Longevity, KINDA_SMALL_NUMBER);
         // Potencia entera con multiplicaciones: FMath::Pow(x, 4.f) usa exp/log
         // y esto se ejecuta por CADA arbol vivo en CADA tick.
         const float AgeRatio2 = AgeRatio * AgeRatio;
-        const float pAge = DtYears * AgeRatio2 * AgeRatio2;
-        const float pStress = DtYears * Stress * StressMortalityWeight;
-        return FMath::Clamp(1.f - (1.f - pAge) * (1.f - pStress), 0.f, 1.f);
+        return FMath::Clamp(DtYears * AgeRatio2 * AgeRatio2, 0.f, 1.f);
+    }
+
+    /** Riesgo de morir por ESTRES cronico en este tick. */
+    FORCEINLINE float StressMortalityProbability(float Stress, float StressMortalityWeight, float DtYears)
+    {
+        return FMath::Clamp(DtYears * Stress * StressMortalityWeight, 0.f, 1.f);
+    }
+
+    /** Dos causas INDEPENDIENTES: P(morir) = 1 - (1-a)(1-b). */
+    FORCEINLINE float CombineIndependentRisks(float A, float B)
+    {
+        return FMath::Clamp(1.f - (1.f - A) * (1.f - B), 0.f, 1.f);
     }
 
     /**
-     * Senescencia (Fase 5): el arbol ENTRA en declive si es VIEJO (rebasa una
-     * fraccion de su longevidad) o si acumula ESTRES por encima de un umbral.
-     * Devuelve true si cualquiera de las dos condiciones aplica.
-     *
-     * OJO: esta funcion decide la ENTRADA, no la permanencia. Es pura sobre el
-     * estres actual, asi que devuelve false en cuanto el arbol se recupera. La
-     * senescencia es irreversible, y esa persistencia la impone el llamante
-     * (SimulateTick) haciendo OR con el estado del tick anterior. No la uses
-     * sola para decidir si un arbol ES senescente.
+     * Probabilidad de morir este tick, combinando edad y estres como causas
+     * INDEPENDIENTES. Composicion de los tres helpers de arriba: una sola copia de
+     * cada formula, y las piezas quedan disponibles por separado para poder
+     * ATRIBUIR la muerte a un canal u otro (que es lo que dice si la longevidad
+     * esta haciendo algo) y para sustituir el canal de estres por el hazard propio
+     * de un arbol suprimido.
      */
-    FORCEINLINE bool IsSenescent(float Age, float Longevity, float SenescenceAgeFraction,
-        float Stress, float SenescenceStressThreshold)
+    FORCEINLINE float MortalityProbability(float Age, float Longevity, float Stress,
+        float StressMortalityWeight, float DtYears)
     {
-        const bool bOld = Age >= SenescenceAgeFraction * FMath::Max(Longevity, KINDA_SMALL_NUMBER);
-        const bool bStressed = Stress >= SenescenceStressThreshold;
-        return bOld || bStressed;
+        return CombineIndependentRisks(
+            AgeMortalityProbability(Age, Longevity, DtYears),
+            StressMortalityProbability(Stress, StressMortalityWeight, DtYears));
     }
 
-    /** Factor multiplicativo del crecimiento en senescencia (1 = normal, ~0 = detenido). */
-    FORCEINLINE float SenescentGrowthFactor(bool bSenescent, float SenescentGrowthScale)
+    /**
+     * Senescencia por EDAD: el arbol rebasa una fraccion de su longevidad y entra en
+     * declive. Es irreversible, y con razon: el envejecimiento no se revierte.
+     *
+     * ANTES ESTA FUNCION MEZCLABA DOS COSAS. Tambien devolvia true por estres alto, y
+     * el llamante hacia el estado pegajoso con un OR sobre el tick anterior, con lo
+     * que el declive por estres tambien resultaba irreversible: una plantula que
+     * pasara unos anos suprimida quedaba marcada de por vida -crecimiento reducido y
+     * mortalidad multiplicada- aunque despues se abriera un claro sobre ella. Eso
+     * prohibe explicitamente el banco de plantulas, que es el mecanismo por el que
+     * una especie tolerante hereda los huecos sin competir por numero de semillas.
+     * El declive por estres vive ahora en UpdateSuppression, y es reversible.
+     */
+    FORCEINLINE bool IsSenescentByAge(float Age, float Longevity, float SenescenceAgeFraction)
     {
-        return bSenescent ? FMath::Clamp(SenescentGrowthScale, 0.f, 1.f) : 1.f;
+        return Age >= SenescenceAgeFraction * FMath::Max(Longevity, KINDA_SMALL_NUMBER);
     }
 
-    /** Aplica el multiplicador de mortalidad de la senescencia a una pDeath ya calculada. */
+    /**
+     * Supresion por ESTRES, con histeresis: un arbol sano entra al superar el umbral
+     * de su especie y no sale hasta bajar de ExitFraction veces ese umbral. Los dos
+     * umbrales tienen que ser distintos o el estado parpadea tick a tick.
+     *
+     * bWasSuppressed sale del snapshot de LECTURA, que es inmutable durante todo el
+     * tick: asi la decision no depende del orden en que los hilos procesen a los
+     * arboles y sigue siendo determinista bajo paralelismo.
+     */
+    FORCEINLINE bool UpdateSuppression(bool bWasSuppressed, float Stress,
+        float SpeciesStressThreshold, float ExitFraction)
+    {
+        return bWasSuppressed
+            ? (Stress > SpeciesStressThreshold * FMath::Clamp(ExitFraction, 0.f, 1.f))
+            : (Stress >= SpeciesStressThreshold);
+    }
+
+    /** Factor multiplicativo del crecimiento (1 = normal, ~0 = detenido). Lo comparten
+        la senescencia por edad y la supresion por estres, cada una con su escala. */
+    FORCEINLINE float DeclineGrowthFactor(bool bDeclining, float GrowthScale)
+    {
+        return bDeclining ? FMath::Clamp(GrowthScale, 0.f, 1.f) : 1.f;
+    }
+
+    /** Aplica el multiplicador de mortalidad de la senescencia POR EDAD a una pDeath
+        ya calculada. La supresion por estres NO usa esto: tiene su propio hazard por
+        especie (ver USpeciesData::SuppressedMortalityPerYear), que puede ser MENOR
+        que el normal -es lo que hace viable esperar decadas bajo el dosel-. */
     FORCEINLINE float ApplySenescentMortality(float pDeath, bool bSenescent, float Multiplier)
     {
         return bSenescent ? FMath::Clamp(pDeath * FMath::Max(1.f, Multiplier), 0.f, 1.f) : pDeath;
+    }
+
+    /** Probabilidad de morir de un arbol SUPRIMIDO: hazard propio de la especie, en
+        vez del canal de estres general. Es la mitad que faltaba del compromiso r/K
+        -la climacica aguanta la penumbra, la pionera no-, y hasta ahora ningun rasgo
+        de especie podia REDUCIR el riesgo, solo amplificarlo. */
+    FORCEINLINE float SuppressedMortalityProbability(float PerYear, float DtYears)
+    {
+        return FMath::Clamp(PerYear * DtYears, 0.f, 1.f);
     }
 
     /**
@@ -166,12 +257,27 @@ namespace EcologyRules
      * otro eje.
      */
     FORCEINLINE int32 ComputeSeedCount(float SeedsPerAdultPerYear, float Biomass, float MaxBiomass,
-        float DtYears, uint32& RngState)
+        float BiomassHalfSaturation, float DtYears, uint32& RngState)
     {
         const float RelativeBiomass =
             FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
-        const float Lambda = SeedsPerAdultPerYear * RelativeBiomass * DtYears;
-        return EcoRand::PoissonInt(RngState, Lambda);
+
+        // SATURACION SOBRE LA BIOMASA RELATIVA. Con proporcionalidad lineal, la
+        // fecundidad realimenta el crecimiento: quien crece mas rapido no solo tiene
+        // mas individuos, sino que cada uno produce ademas mas semillas y cada
+        // semilla otro arbol que crece. Una ventaja de crecimiento moderada se
+        // convierte en una diferencia de lluvia de semillas de dos ordenes de
+        // magnitud. Y la misma linealidad ESTERILIZA a la especie suprimida, que
+        // asi no puede recuperarse aunque mejoren sus condiciones.
+        //
+        // Saturando, lo que enciende la reproduccion es la MADUREZ y no el tamano:
+        // un adulto al 40% y otro al 90% de su MaxBiomass se diferencian en un
+        // factor pequeno, no en uno de dos. HalfSaturation <= 0 = lineal (anterior).
+        const float Scale = (BiomassHalfSaturation > 0.f)
+            ? RelativeBiomass / (RelativeBiomass + BiomassHalfSaturation)
+            : RelativeBiomass;
+
+        return EcoRand::PoissonInt(RngState, SeedsPerAdultPerYear * Scale * DtYears);
     }
 
     /** Desplazamiento XY (cm) de una semilla respecto al arbol madre: disco
@@ -230,10 +336,40 @@ namespace EcologyRules
      * (Apendice A marca RootRadius como "tunear": ajustad el asset sabiendo
      * que ahora se interpreta asi.)
      */
-    FORCEINLINE float EffectiveRootRadiusCm(float RootRadiusM, float Biomass, float MaxBiomass)
+    FORCEINLINE float EffectiveRootRadiusCm(float RootRadiusM, float Biomass, float MaxBiomass,
+        float MinAdultRadiusCm)
     {
         const float Ratio = FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
-        return RootRadiusM * 100.f * Ratio;
+
+        // El minimo se aplica al radio del ADULTO, no al efectivo: una plantula debe
+        // seguir compitiendo en un radio minusculo. Lo que hay que impedir es que un
+        // arbol CRECIDO no llegue a sus vecinos, que es lo que pasa cuando el radio
+        // no supera el tamano de celda: el peso lineal 1-d/R vale 0 exacto en los
+        // cuatro vecinos ortogonales y el kernel escribe UNA sola celda. Con eso, el
+        // recurso del suelo deja de ser un bien comun -son pozos privados, uno por
+        // arbol- y la competencia subterranea desaparece como interaccion.
+        const float AdultRadiusCm = FMath::Max(RootRadiusM * 100.f, MinAdultRadiusCm);
+        return AdultRadiusCm * Ratio;
+    }
+
+    /**
+     * Consumo realmente extraible, topado contra lo que hay en la zona radicular.
+     *
+     * Sin tope, la demanda podia superar al recurso disponible: el kernel depositaba
+     * la diferencia como cantidad NEGATIVA, esa deuda se difundia a las celdas
+     * vecinas -bajandoles recurso de verdad- y luego se destruia al recortar a cero.
+     * O sea, competencia por interferencia no intencionada cuya intensidad crecia
+     * con la demanda sin coste para quien la ejercia, y de paso la masa del campo
+     * dejaba de conservarse (ninguna cuenta de balance cuadraba).
+     *
+     * Devuelve una cantidad POSITIVA; el llamante le pone el signo.
+     */
+    FORCEINLINE float ClampUptakeToAvailable(float Demand, float AvailablePerCell, int32 CellsInRange,
+        float MaxFraction)
+    {
+        if (MaxFraction <= 0.f) { return FMath::Max(Demand, 0.f); }
+        const float Extractable = MaxFraction * FMath::Max(AvailablePerCell, 0.f) * FMath::Max(CellsInRange, 1);
+        return FMath::Clamp(Demand, 0.f, Extractable);
     }
 
     /** Cota superior de celdas que toca el kernel para un radio dado (reserva de scratch). */
@@ -281,5 +417,6 @@ namespace EcologyRules
      */
     void ReduceScratchInto(const TArray<FTickScratch>& Contexts,
         TArray<float>& DestWater, TArray<float>& DestNutrient,
-        TArray<FPendingSeed>& OutSeeds, TArray<FPendingDeathPulse>& OutDeathPulses);
+        TArray<FPendingSeed>& OutSeeds, TArray<FPendingDeathPulse>& OutDeathPulses,
+        TArray<FEcoSpeciesFlow>& OutFlow);
 }

@@ -21,6 +21,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
+#include "UObject/UnrealType.h"   // TFieldIterator sobre las UPROPERTY(config)
 
 // Categoría de log local a este .cpp (declara y define en un solo sitio).
 // Evita meter DECLARE_LOG_CATEGORY_EXTERN en una cabecera reflejada por UHT.
@@ -153,6 +154,35 @@ static FAutoConsoleCommandWithWorld GEcoDemographics(TEXT("Eco.Demografia"),
     TEXT("Reparto por especie y estado, edades y fraccion de arboles ya crecidos."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogDemographics(); }));
 
+static FAutoConsoleCommandWithWorld GEcoSpeciesDump(TEXT("Eco.Especies.Volcado"),
+    TEXT("Vuelca los rasgos de cada especie y sus derivados (fL a pleno sol y en sombra, "
+        "anchura absoluta de campana, lluvia de semillas, radio radicular efectivo)."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogSpeciesDump(); }));
+
+static FAutoConsoleCommandWithWorld GEcoNicheMap(TEXT("Eco.Nicho.Mapa"),
+    TEXT("Que especie ganaria en cada celda (argmax de vigor potencial) y que fraccion "
+        "del mapa gana cada una. No simula: responde antes de gastar mil ticks."),
+    FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcosystemSubsystem* S = GetEco(W)) S->LogNicheWinnerMap(); }));
+
+static FAutoConsoleCommand GEcoConfigAudit(TEXT("Eco.Config.Auditar"),
+    TEXT("Compara las UPROPERTY(config) de UEcosystemSettings con las claves del .ini: "
+        "avisa de las que corren con el default de C++ y de las huerfanas."),
+    FConsoleCommandDelegate::CreateStatic(&UEcosystemSubsystem::LogConfigCoverage));
+
+static FAutoConsoleCommandWithWorldAndArgs GEcoLightProfile(TEXT("Eco.Luz.Perfil"),
+    TEXT("Perfil vertical de luz de una columna. Uso: Eco.Luz.Perfil [X] [Y] (cm; por defecto el centro)."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+        [](const TArray<FString>& Args, UWorld* World)
+        {
+            if (UEcosystemSubsystem* S = GetEco(World))
+            {
+                const FBox2D B = S->GetHeightField().GetWorldBounds();
+                const double X = Args.Num() > 0 ? FCString::Atod(*Args[0]) : 0.5 * (B.Min.X + B.Max.X);
+                const double Y = Args.Num() > 1 ? FCString::Atod(*Args[1]) : 0.5 * (B.Min.Y + B.Max.Y);
+                S->LogLightProfile(X, Y);
+            }
+        }));
+
 static FAutoConsoleCommandWithWorld GEcoFieldPercentiles(TEXT("Eco.PercentilesCampos"),
     TEXT("Percentiles de los campos base de agua y nutrientes: donde colocar los "
         "WaterOptimum / NutrientOptimum de cada especie."),
@@ -249,7 +279,7 @@ void UEcosystemSubsystem::LogFiniteCheck() const
     Scan(Agents_Read.Biomass, TEXT("Biomass")); Scan(Agents_Read.Height, TEXT("Height"));
     Scan(Agents_Read.Stress, TEXT("Stress"));
     Scan(WaterPool.Current.Data, TEXT("Water")); Scan(NutrientPool.Current.Data, TEXT("Nutrient"));
-    Scan(LightCoarse.Shadow, TEXT("LightShadow"));
+    Scan(LightCoarse.LeafArea, TEXT("LightLeafArea"));
     if (!Bad) UE_LOG(LogEco, Log, TEXT("[Eco] CheckFinite OK (0 no-finitos)."));
 }
 
@@ -420,8 +450,19 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     ResolvedSpecies.Reset();
     for (const TSoftObjectPtr<USpeciesData>& SoftSp : S->Species)
     {
-        ResolvedSpecies.Add(SoftSp.LoadSynchronous());
+        USpeciesData* Loaded = SoftSp.LoadSynchronous();
+        if (!Loaded)
+        {
+            // Una entrada que no resuelve se convertia en un HUECO SILENCIOSO: la
+            // especie simplemente no existia en la simulacion y nada lo decia. Es
+            // facil que pase con assets binarios no descargados (punteros Git LFS).
+            UE_LOG(LogEco, Error, TEXT("[Eco] La especie '%s' no se pudo cargar: no participara en la simulacion."),
+                *SoftSp.ToString());
+        }
+        ResolvedSpecies.Add(Loaded);
     }
+
+    SpeciesExtinctionTick.Init(-1, ResolvedSpecies.Num());
 
     // 5) Grid de luz grueso, RELATIVO AL TERRENO (optimizacion C2).
     //    Antes cubria todo el desnivel del relieve en Z absoluta: con
@@ -438,11 +479,15 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     }
     if (TallestSpeciesCm <= 0.f) { TallestSpeciesCm = 2000.f; } // sin especies: 20 m de cortesia
 
+    // El voxel VERTICAL es independiente del horizontal: con los dos a 400 cm, toda
+    // la banda de regeneracion (del suelo a los 4 m) cabia en una sola capa y las
+    // plantulas no existian como estrato en el campo de luz.
     const double LightSpanZ = TallestSpeciesCm + S->LightCanopyHeadroomCm + S->LightGroundClearanceCm;
-    const int32  LightLayers = FMath::Max(2, FMath::CeilToInt32(LightSpanZ / S->LightCoarseCellSizeCm));
+    const int32  LightLayers = FMath::Max(2, FMath::CeilToInt32(LightSpanZ / S->LightCoarseCellSizeZCm));
     LightCoarse.Init(LightW, LightH, LightLayers,
-        S->LightCoarseCellSizeCm, S->LightCoarseCellSizeCm, Bounds.Min,
+        S->LightCoarseCellSizeCm, S->LightCoarseCellSizeZCm, Bounds.Min,
         /*BaseZ = offset de la capa 0 bajo el suelo*/ -(double)S->LightGroundClearanceCm);
+    LightCoarse.SetExtinctionParams(S->LightExtinctionK, S->DiffuseLightFloor);
 
     // Cota de terreno del centro de cada columna: es lo que convierte la rejilla
     // en relativa al suelo. Se muestrea UNA vez (el relieve no cambia).
@@ -621,7 +666,7 @@ float UEcosystemSubsystem::GetInterpolationAlpha() const
 //  Bucle de tick (Fase 2)
 // ---------------------------------------------------------------------------
 
-// Los factores de forma de copa (CanopyRadiusFraction/CanopyShadowDensity) y la
+// Los factores de forma de copa (CanopyRadiusFraction/CanopyDepthFraction/CanopyLeafAreaIndex) y la
 // biomasa de germinacion (GerminationBiomassFraction) ya NO son constantes de
 // este .cpp: entran en el bucle de luz y en la germinacion -alteran el resultado
 // ecologico-, asi que viven en UEcosystemSettings como parte de la configuracion
@@ -687,6 +732,7 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     WaterPool.BeginTick();
     NutrientPool.BeginTick();
 
+    RefreshSpeciesResponses(*Settings);
     const int32 NumChunks = PrepareTickScratch(*Settings);
 
     // ================================================================
@@ -705,7 +751,8 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
     {
         SCOPE_CYCLE_COUNTER(STAT_EcoReduce);
         TRACE_CPUPROFILER_EVENT_SCOPE(Eco_Reduce);
-        EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data, PendingSeeds, PendingDeaths);
+        EcologyRules::ReduceScratchInto(TickContexts, WaterPool.Next.Data, NutrientPool.Next.Data,
+            PendingSeeds, PendingDeaths, SpeciesFlow);
     }
     const double AfterReduce = FPlatformTime::Seconds();
 
@@ -723,6 +770,12 @@ void UEcosystemSubsystem::SimulateTick(float DtYears)
 
     ApplyDeathPulses(DtYears, *Settings);
     RunGermination(DtYears, *Settings, CO2);
+
+    // Perturbacion DESPUES de la germinacion: un claro abierto este tick deja su
+    // hueco para el siguiente, igual que una muerte cualquiera. Va aqui y no en el
+    // paso paralelo porque necesita elegir centros de claro de forma serial y
+    // determinista, con su propio stream de RNG.
+    RunDisturbance(DtYears, *Settings);
 
     // ================================================================
     // PASO 4: compactar muertos e intercambiar buffers (agentes y campos).
@@ -780,7 +833,9 @@ int32 UEcosystemSubsystem::PrepareTickScratch(const UEcosystemSettings& Settings
     // 16,8 M sumas seriales por tick para mover ~360.000 valores reales.
     // Aqui solo se vacian los buffers (Reset conserva la capacidad) y se reserva
     // de una vez lo que se espera depositar, para que los Add() no realojen.
-    float MaxRootRadiusCm = 0.f;
+    // El radio efectivo de un adulto respeta el minimo en celdas, asi que la
+    // reserva tiene que contar con el o el primer tick realojaria los deltas.
+    float MaxRootRadiusCm = Settings.MinRootRadiusCells * (float)WaterBase.Field.CellSize;
     for (const TObjectPtr<USpeciesData>& Sp : ResolvedSpecies)
     {
         if (Sp) { MaxRootRadiusCm = FMath::Max(MaxRootRadiusCm, Sp->RootRadius * 100.f); }
@@ -788,13 +843,32 @@ int32 UEcosystemSubsystem::PrepareTickScratch(const UEcosystemSettings& Settings
     const int32 CellsPerTree = EcologyRules::KernelCellCount(WaterBase.Field, MaxRootRadiusCm);
     const int32 TreesPerChunk = FMath::DivideAndRoundUp(PopNum, FMath::Max(1, NumChunks));
 
+    const int32 NumSpecies = ResolvedSpecies.Num();
     TickContexts.SetNum(NumChunks);
     for (FTickScratch& Ctx : TickContexts)
     {
-        Ctx.ResetForNextTick();
+        Ctx.ResetForNextTick(NumSpecies);
         Ctx.ReserveForTrees(TreesPerChunk, CellsPerTree);
     }
+
+    SpeciesFlow.SetNum(NumSpecies, EAllowShrinking::No);
     return NumChunks;
+}
+
+void UEcosystemSubsystem::RefreshSpeciesResponses(const UEcosystemSettings& Settings)
+{
+    // Una vez por tick y por ESPECIE, no por arbol: las curvas son identicas para
+    // todos los individuos de una especie, asi que construirlas dentro del bucle
+    // era trabajo repetido decenas de miles de veces y ademas obligaba a leer el
+    // UObject de especie desde dentro del ParallelFor.
+    SpeciesResponses.SetNum(ResolvedSpecies.Num(), EAllowShrinking::No);
+    for (int32 i = 0; i < ResolvedSpecies.Num(); ++i)
+    {
+        if (const USpeciesData* Sp = ResolvedSpecies[i])
+        {
+            SpeciesResponses[i] = EcoVigor::MakeSpeciesResponses(*Sp, Settings);
+        }
+    }
 }
 
 void UEcosystemSubsystem::RunGrowthParallel(float DtYears, const UEcosystemSettings& Settings,
@@ -807,6 +881,13 @@ void UEcosystemSubsystem::RunGrowthParallel(float DtYears, const UEcosystemSetti
 
     const EParallelForFlags Flags = CVarForceST.GetValueOnGameThread()
         ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None;
+
+    // Radio radicular minimo de un ADULTO, en cm. Se resuelve aqui (una vez) y se
+    // captura por valor: el kernel da peso EXACTAMENTE cero a los vecinos cuando el
+    // radio no supera el tamano de celda, y con eso cada arbol se agota un pozo
+    // privado sin tocar el de nadie -la competencia subterranea deja de existir
+    // como interaccion-.
+    const float MinAdultRootRadiusCm = Settings.MinRootRadiusCells * (float)WaterBase.Field.CellSize;
 
     // Fase 6 (6.4): el ambito envuelve al ParallelFor ENTERO (el reparto y la
     // espera), no a cada tarea. Es lo que interesa medir: el tiempo de pared que
@@ -822,10 +903,14 @@ void UEcosystemSubsystem::RunGrowthParallel(float DtYears, const UEcosystemSetti
 
                 for (int32 i = Begin; i < End; ++i)
                 {
-                    if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+                    if (!IsAliveState(Agents_Read.State[i])) { continue; }
 
-                    const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
-                    if (!Sp) { continue; }
+                    const uint16 SpeciesId = Agents_Read.SpeciesId[i];
+                    const USpeciesData* Sp = ResolveSpecies(SpeciesId);
+                    if (!Sp || !SpeciesResponses.IsValidIndex(SpeciesId)) { continue; }
+
+                    const EcoVigor::FSpeciesResponses& Resp = SpeciesResponses[SpeciesId];
+                    FEcoSpeciesFlow& Flow = Ctx.SpeciesFlow[SpeciesId];
 
                     const FVector P = Agents_Read.Position[i];
                     uint32& RngState = Agents_Write.RngState[i]; // stream propio -> determinista
@@ -833,138 +918,178 @@ void UEcosystemSubsystem::RunGrowthParallel(float DtYears, const UEcosystemSetti
                     // 2a) recursos locales
                     const float W = WaterPool.SampleCurrent(P.X, P.Y);
                     const float N = NutrientPool.SampleCurrent(P.X, P.Y);
-                    const float Q = LightCoarse.SampleLightSmooth(P);
 
-                    // 2b) factores + vigor (Liebig)
-                    const float fL = EcologyRules::LightFactor(Q, Sp->ShadeTolerance, Settings.LightHalfSaturationMax);
-                    // Respuesta de nicho (optimo + anchura por especie) o Monod, segun
-                    // Settings.bUseNicheResponse. La eleccion vive en UN solo sitio
-                    // (EcoVigor::ResourceFactor) para que el tick, la germinacion y el
-                    // heatmap de idoneidad no puedan divergir.
-                    const float fW = EcoVigor::ResourceFactor(W, EcoVigor::MakeWaterResponse(*Sp, Settings));
-                    const float fN = EcoVigor::ResourceFactor(N, EcoVigor::MakeNutrientResponse(*Sp, Settings));
-
-                    // FASE 6 (doc. 6.3): CO2 como multiplicador analitico del vigor.
-                    // Coste: dos clamps y una multiplicacion, con dos valores que ya
-                    // estaban en registros (Q y la altura cacheada). Ni un campo nuevo
-                    // ni un muestreo extra, que es exactamente lo que pide el
-                    // documento ("mismo sabor, coste ~0").
+                    // LA LUZ SE LEE EN EL TECHO DE LA COPA, no en el pie del arbol.
                     //
-                    // La altura se toma del SNAPSHOT DE LECTURA (la del principio del
-                    // tick), no de la que se acaba de calcular: el vigor decide cuanto
-                    // crece el arbol, asi que no puede depender de lo que ha crecido.
-                    // Ademas mantiene la regla de la Fase 2 de leer solo del snapshot.
-                    const float CO2Factor = EcoCarbon::CO2Factor(Q, Agents_Read.Height[i], CO2);
+                    // Position.Z es la cota del terreno y no cambia nunca, asi que
+                    // antes un dominante de 20 m y la plantula que tenia debajo leian
+                    // EL MISMO Q: la altura entraba en el modelo solo como emisor de
+                    // sombra, jamas como receptor de luz. Con eso la competencia por
+                    // luz -que en un bosque real es asimetrica, el que llega arriba
+                    // intercepta y el de abajo paga- quedaba plana, y con ella
+                    // desaparecian la estratificacion vertical, el heredar el hueco y
+                    // la sucesion entera. Leyendo en el apice, altura -> luz ->
+                    // crecimiento -> altura se cierra como bucle y es lo que crea el
+                    // dosel. La autoexclusion sale gratis: el LAI acumulado por
+                    // ENCIMA del techo de la copa propia no contiene follaje propio.
+                    //
+                    // Se usa la altura del SNAPSHOT DE LECTURA (la del principio del
+                    // tick): el vigor decide cuanto crece el arbol, asi que no puede
+                    // depender de lo que ha crecido este mismo tick.
+                    const float ReadHeight = Agents_Read.Height[i];
+                    const float Q = LightCoarse.SampleLightSmooth(P + FVector(0.f, 0.f, ReadHeight));
 
-                    // CombineWithLimiter devuelve EXACTAMENTE el mismo minimo de Liebig
-                    // que EcoVigor::Combine y ademas dice CUAL de los tres factores lo
-                    // impone. El argmin ya se estaba calculando y se tiraba; guardarlo
-                    // es lo que permite responder "por que se muere esta especie" en vez
-                    // de solo "se muere". Coste: una comparacion que ya se hacia.
+                    // 2b) vigor. Copia UNICA de la formula (EcoVigor::EvaluateVigor):
+                    //     tick, germinacion y heatmap evaluan literalmente lo mismo.
+                    //     Guardar el argmin cuesta una comparacion que ya se hacia y
+                    //     es lo que permite responder "por que se muere esta especie"
+                    //     en vez de solo "se muere".
                     EEcoLimiter LimiterHere = EEcoLimiter::Light;
                     const float VigorValue =
-                        EcoVigor::CombineWithLimiter(fL, fW, fN, LimiterHere) * CO2Factor;
+                        EcoVigor::EvaluateVigor(Q, W, N, Resp, Settings.VigorCombineMode, LimiterHere)
+                        * EcoCarbon::CO2Factor(Q, ReadHeight, CO2);
 
-                    // Instrumentacion: el chunk escribe SOLO en su porcion de
-                    // Agents_Write, igual que el resto del paso paralelo.
                     Agents_Write.Vigor[i] = VigorValue;
                     Agents_Write.Limiter[i] = static_cast<uint8>(LimiterHere);
 
-                    // 2c) crecimiento + altura + edad + estado (Sapling/Mature/Senescent, Fase 5 Paso 1)
-                    const float NewAge = Agents_Read.Age[i] + DtYears;
+                    // 2c) estres. Va ANTES de decidir los estados porque la supresion
+                    //     se decide con el estres de ESTE tick.
+                    const float NewStress = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
+                        Settings.StressVigorThreshold, Settings.StressAccumulationRate,
+                        Settings.StressRecoveryRate, Settings.StressDecayRate, DtYears);
+                    Agents_Write.Stress[i] = NewStress;
 
-                    // Senescencia: se decide con el estres del tick ANTERIOR
-                    // (Agents_Read.Stress) para no depender del estres que aun no se
-                    // ha calculado este tick -> el orden sigue siendo determinista.
+                    // 2d) los DOS declives, que antes eran uno solo.
                     //
-                    // Y es una puerta de UN SOLO SENTIDO: IsSenescent es funcion pura del
-                    // estres ACTUAL, asi que por si sola haria que un arbol que se recupera
-                    // volviese de Senescent a Mature, cosa que biologicamente no ocurre
-                    // (el declive no se revierte). Se hace "pegajosa" leyendo el estado del
-                    // snapshot de lectura, que es inmutable durante todo el tick: sigue
-                    // siendo determinista bajo paralelismo.
-                    const bool bSenescent =
-                        (Agents_Read.State[i] == ETreeState::Senescent) ||
-                        EcologyRules::IsSenescent(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction,
-                            Agents_Read.Stress[i], Sp->SenescenceStressThreshold);
+                    // Senescencia por EDAD: irreversible, y con razon. La puerta se
+                    // hace pegajosa leyendo el estado del snapshot, que es inmutable
+                    // durante todo el tick -> determinista bajo paralelismo.
+                    //
+                    // Supresion por ESTRES: REVERSIBLE, con histeresis. Antes las dos
+                    // compartian estado, asi que el declive por estres heredaba la
+                    // irreversibilidad: unos pocos anos de mala racha marcaban de por
+                    // vida a una plantula -crecimiento x0.1 y mortalidad x2- aunque
+                    // despues se abriera un claro justo encima. Eso prohibe el banco
+                    // de plantulas suprimidas, que es el mecanismo por el que una
+                    // especie tolerante hereda los huecos sin competir por semilla.
+                    const float NewAge = Agents_Read.Age[i] + DtYears;
+                    const ETreeState PrevState = Agents_Read.State[i];
 
-                    // En declive el arbol casi deja de crecer.
-                    const float EffGrowthRate = Sp->GrowthRate *
-                        EcologyRules::SenescentGrowthFactor(bSenescent, Sp->SenescentGrowthScale);
+                    const bool bSenescent = (PrevState == ETreeState::Senescent)
+                        || EcologyRules::IsSenescentByAge(NewAge, Sp->Longevity, Sp->SenescenceAgeFraction);
+
+                    const bool bSuppressed = !bSenescent && EcologyRules::UpdateSuppression(
+                        PrevState == ETreeState::Suppressed, NewStress,
+                        Sp->SenescenceStressThreshold, Settings.SuppressionExitStressFraction);
+
+                    // 2e) crecimiento + altura + estado
+                    const float EffGrowthRate = Sp->GrowthRate
+                        * EcologyRules::DeclineGrowthFactor(bSenescent, Sp->SenescentGrowthScale)
+                        * EcologyRules::DeclineGrowthFactor(bSuppressed, Sp->SuppressedGrowthScale);
+
                     const float NewBiomass = EcologyRules::GrowBiomassLogistic(
                         Agents_Read.Biomass[i], VigorValue, EffGrowthRate, Sp->MaxBiomass, DtYears);
 
                     Agents_Write.Biomass[i] = NewBiomass;
                     Agents_Write.Height[i] = EcologyRules::HeightFromBiomass(NewBiomass, Sp->MaxBiomass, Sp->MaxHeightCm);
                     Agents_Write.Age[i] = NewAge;
-                    Agents_Write.State[i] = bSenescent ? ETreeState::Senescent
-                        : (NewAge >= Sp->MaturityAge ? ETreeState::Mature : ETreeState::Sapling);
+                    Agents_Write.State[i] = bSenescent  ? ETreeState::Senescent
+                        : bSuppressed                   ? ETreeState::Suppressed
+                        : (NewAge >= Sp->MaturityAge)   ? ETreeState::Mature
+                                                        : ETreeState::Sapling;
 
-                    // 2d) estres
-                    Agents_Write.Stress[i] = EcologyRules::UpdateStress(Agents_Read.Stress[i], VigorValue,
-                        Settings.StressVigorThreshold, Settings.StressAccumulationRate,
-                        Settings.StressRecoveryRate, DtYears);
+                    // 2f) consumo -> SOLO al scratch de este chunk, en forma DISPERSA.
+                    //     Topado contra lo disponible: sin tope, la parte de la demanda
+                    //     que no existia se depositaba como cantidad NEGATIVA, se
+                    //     difundia a los vecinos bajandoles recurso de verdad y luego
+                    //     se destruia al recortar a cero -competencia por interferencia
+                    //     gratis, y masa no conservada-.
+                    const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(
+                        Sp->RootRadius, NewBiomass, Sp->MaxBiomass, MinAdultRootRadiusCm);
+                    const int32 CellsInRange = EcologyRules::KernelCellCount(WaterBase.Field, RootRadiusCm);
 
-                    // 2e) consumo -> SOLO al scratch de este chunk, en forma DISPERSA
-                    //     (lista de (celda, cantidad), ver C1 en FCellDelta).
-                    const float RootRadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, NewBiomass, Sp->MaxBiomass);
-                    EcologyRules::DepositKernelSparse(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm,
-                        -NewBiomass * Sp->WaterDemand * DtYears);
-                    EcologyRules::DepositKernelSparse(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm,
-                        -NewBiomass * Sp->NutrientDemand * DtYears);
+                    const float WaterDraw = EcologyRules::ClampUptakeToAvailable(
+                        NewBiomass * Sp->WaterDemand * DtYears, W, CellsInRange, Settings.MaxResourceUptakeFraction);
+                    const float NutrientDraw = EcologyRules::ClampUptakeToAvailable(
+                        NewBiomass * Sp->NutrientDemand * DtYears, N, CellsInRange, Settings.MaxResourceUptakeFraction);
 
-                    // 2f) mortalidad (probabilistica, con el RNG propio del arbol).
-                    //     La senescencia multiplica la probabilidad de morir (Fase 5 Paso 1).
-                    float pDeath = EcologyRules::MortalityProbability(Agents_Write.Age[i], Sp->Longevity,
-                        Agents_Write.Stress[i], Settings.StressMortalityWeight, DtYears);
+                    EcologyRules::DepositKernelSparse(WaterBase.Field, Ctx.WaterDeltas, P, RootRadiusCm, -WaterDraw);
+                    EcologyRules::DepositKernelSparse(NutrientBase.Field, Ctx.NutrientDeltas, P, RootRadiusCm, -NutrientDraw);
+
+                    // 2g) mortalidad. Los dos canales se calculan por separado para
+                    //     poder ATRIBUIR la muerte: si el de edad no aparece nunca, la
+                    //     longevidad no esta comprando nada y la estrategia lenta y
+                    //     longeva es inviable haga lo que haga el resto del modelo.
+                    const float pAge = EcologyRules::AgeMortalityProbability(NewAge, Sp->Longevity, DtYears);
+
+                    // Un arbol SUPRIMIDO no muere por el canal de estres general sino
+                    // por el hazard propio de su especie, que puede ser MENOR. Es la
+                    // mitad que faltaba del compromiso r/K: hasta ahora ningun rasgo
+                    // de especie podia reducir el riesgo, solo amplificarlo.
+                    const float pCondition = bSuppressed
+                        ? EcologyRules::SuppressedMortalityProbability(Sp->SuppressedMortalityPerYear, DtYears)
+                        : EcologyRules::StressMortalityProbability(NewStress,
+                            EcologyRules::EffectiveStressMortalityWeight(Settings.StressMortalityWeight,
+                                Sp->Longevity, Settings.LongevityStressRefYears, Settings.LongevityStressExponent),
+                            DtYears);
+
+                    float pDeath = EcologyRules::CombineIndependentRisks(pAge, pCondition);
                     pDeath = EcologyRules::ApplySenescentMortality(pDeath, bSenescent, Sp->SenescentMortalityMultiplier);
 
                     if (EcoRand::NextUnit(RngState) < pDeath)
                     {
                         Agents_Write.State[i] = ETreeState::Dead;
+                        (pAge >= pCondition ? Flow.DeathsByAge : Flow.DeathsByCondition) += 1;
 
                         FPendingDeathPulse Pulse;
                         Pulse.Position = P;
                         Pulse.RadiusCm = RootRadiusCm;
                         Pulse.Amount = EcologyRules::DeathNutrientPulse(NewBiomass, Settings.NutrientDecompositionFactor);
                         // Fase 5: datos para la caida/tocon/hojarasca del render.
-                        Pulse.SpeciesId = Agents_Read.SpeciesId[i];
+                        Pulse.SpeciesId = SpeciesId;
                         Pulse.StableId = Agents_Read.StableId[i];
                         Pulse.Biomass = NewBiomass;
                         Pulse.HeightCm = Agents_Write.Height[i];
                         Ctx.DeathPulses.Add(Pulse);
                     }
-                    else if (NewAge >= Sp->MaturityAge &&
-                        (Agents_Write.State[i] == ETreeState::Mature ||
-                            Agents_Write.State[i] == ETreeState::Senescent))
+                    else if (NewAge >= Sp->MaturityAge && IsReproductiveState(Agents_Write.State[i]))
                     {
-                        // 2g) semillas (solo si sigue vivo y ha alcanzado la madurez).
-                        //     El senescente SIGUE reproduciendose, con menos fuerza: cortarlo
-                        //     a cero eliminaba la ventana de maxima fecundidad y cambiaba en
-                        //     silencio el balance de sucesion que ajusto la Fase 2.
-                        //     La comprobacion explicita de MaturityAge hace falta ahora porque
-                        //     un SAPLING muy estresado tambien entra en Senescent, y una
-                        //     plantula no se reproduce.
+                        // 2h) semillas (solo si sigue vivo y ha alcanzado la madurez).
+                        //     El senescente SIGUE reproduciendose, con menos fuerza, y
+                        //     el suprimido tambien: cortarlos a cero eliminaria la
+                        //     ventana de maxima fecundidad y, en el caso del suprimido,
+                        //     la unica via por la que una tolerante compensa su
+                        //     lentitud. La comprobacion explicita de MaturityAge hace
+                        //     falta porque una PLANTULA muy estresada tambien entra en
+                        //     Suppressed, y una plantula no se reproduce.
                         const float SeedScale = (Agents_Write.State[i] == ETreeState::Senescent)
                             ? FMath::Clamp(Sp->SenescentSeedScale, 0.f, 1.f)
                             : 1.f;
-                        // La fecundidad es ahora un RASGO de la especie (SeedRateScale)
-                        // sobre una tasa global que significa "semillas al año de un
-                        // adulto crecido", y escala con la biomasa RELATIVA: MaxBiomass
-                        // deja de ser un multiplicador de fecundidad encubierto.
+
+                        // La fecundidad SATURA con la biomasa relativa en vez de ser
+                        // proporcional a ella: con proporcionalidad lineal, crecer mas
+                        // rapido daba a la vez mas individuos Y mas semillas por
+                        // individuo, un bucle de realimentacion que convierte una
+                        // ventaja de crecimiento moderada en una diferencia de lluvia
+                        // de semillas de dos ordenes de magnitud -y que de paso
+                        // esteriliza al arbol suprimido, impidiendole recuperarse-.
                         const int32 NumSeeds = EcologyRules::ComputeSeedCount(
                             Settings.SeedsPerAdultPerYear * SeedScale * Sp->SeedRateScale,
-                            NewBiomass, Sp->MaxBiomass, DtYears, RngState);
-                        const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
+                            NewBiomass, Sp->MaxBiomass, Settings.SeedBiomassHalfSaturation, DtYears, RngState);
+                        Flow.SeedsEmitted += NumSeeds;
 
-                        for (int32 s = 0; s < NumSeeds; ++s)
+                        const float DispersalRadiusCm = Sp->SeedDispersalRadius * 100.f;
+                        const uint32 ParentStableId = Agents_Read.StableId[i];
+
+                        for (int32 seed = 0; seed < NumSeeds; ++seed)
                         {
                             const FVector2D Offset = EcologyRules::SampleSeedOffsetCm(DispersalRadiusCm, RngState);
 
                             FPendingSeed Seed;
                             Seed.Position = P + FVector(Offset.X, Offset.Y, 0.f);
-                            Seed.SpeciesId = Agents_Read.SpeciesId[i];
-                            Seed.RngSeed = EcoRand::SeedForIndex(RngState, s);
+                            Seed.SpeciesId = SpeciesId;
+                            Seed.RngSeed = EcoRand::SeedForIndex(RngState, seed);
+                            Seed.ParentStableId = ParentStableId;
                             Ctx.Seeds.Add(Seed);
                         }
                     }
@@ -1001,7 +1126,7 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
     const EcoCarbon::FCO2Params& CO2)
 {
     // Reserva una sola vez: PendingSeeds.Num() es la cota superior de germinaciones.
-    // Evita realojos de los 8 arrays SoA durante los Add() de abajo.
+    // Evita realojos de los arrays SoA durante los Add() de abajo.
     Agents_Write.Reserve(Agents_Write.Num() + PendingSeeds.Num());
 
     const FBox2D WorldBounds = HeightField.GetWorldBounds();
@@ -1027,7 +1152,8 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
     for (const FPendingSeed& Seed : PendingSeeds)
     {
         const USpeciesData* Sp = ResolveSpecies(Seed.SpeciesId);
-        if (!Sp) { continue; }
+        if (!Sp || !SpeciesResponses.IsValidIndex(Seed.SpeciesId)) { continue; }
+        FEcoSpeciesFlow& Flow = SpeciesFlow[Seed.SpeciesId];
 
         // Semilla dispersada fuera del terreno simulado: se descarta en vez de
         // germinar en el borde (SampleHeight/SampleLight harian clamp y
@@ -1035,6 +1161,7 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
         if (Seed.Position.X < WorldBounds.Min.X || Seed.Position.X > WorldBounds.Max.X ||
             Seed.Position.Y < WorldBounds.Min.Y || Seed.Position.Y > WorldBounds.Max.Y)
         {
+            ++Flow.RejectedOffMap;
             continue;
         }
 
@@ -1051,7 +1178,7 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
             [&](int32 NeighborIdx)
             {
                 if (bTooClose) { return; }
-                if (Agents_Write.State[NeighborIdx] == ETreeState::Dead) { return; }
+                if (!IsAliveState(Agents_Write.State[NeighborIdx])) { return; }
 
                 // El radio que impone CADA vecino depende de su tamano: un arbol de
                 // dosel aparta a 5 m, una plantula a ~1 m. Con el radio fijo, unos
@@ -1077,8 +1204,6 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
         // germinado en este mismo bucle, asi que hay que comprobarlas aparte o dos
         // semillas del mismo tick germinan pegadas. El bucle es serial y de orden
         // fijo, asi que el resultado sigue siendo determinista.
-        // (Escaneo lineal: son unas pocas decenas-cientos por tick; si algun dia
-        //  crece, mete estas posiciones en un mini-hash.)
         if (!bTooClose)
         {
             for (const FVector& NP : NewbornPositions)
@@ -1087,29 +1212,32 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
                 if (IsTooClose(NP, GerminationPos, NewbornRadiusCm)) { bTooClose = true; break; }
             }
         }
-        if (bTooClose) { continue; }
+        if (bTooClose) { ++Flow.RejectedSpacing; continue; }
 
+        // La semilla lee la luz A RAS DE SUELO, que es la cota que le corresponde
+        // (a diferencia del arbol ya establecido, que la lee en el techo de su copa).
         const float LightHere = LightCoarse.SampleLightSmooth(GerminationPos);
         if (!EcologyRules::IsSafeGerminationSite(LightHere, Sp->MinLightForGermination))
         {
-            // Umbral POR ESPECIE (antes era global). Es lo que hace del sotobosque
-            // un territorio donde la pionera no puede germinar en absoluto, por
-            // muchas semillas que mande, y donde la tolerante acumula el banco de
-            // plantulas que heredara el hueco cuando el arbol de dosel muera.
+            // Umbral POR ESPECIE: es lo que hace del sotobosque un territorio donde
+            // la pionera no puede germinar en absoluto, por muchas semillas que
+            // mande, y donde la tolerante acumula el banco de plantulas que heredara
+            // el hueco cuando el arbol de dosel muera. OJO: este filtro solo puede
+            // funcionar si existe de verdad un gradiente de luz de suelo; con el
+            // dosel transparente que producia el deposito de sombra anterior no
+            // rechazaba ni un sitio (comprobalo con Eco.PercentilesCampos).
+            ++Flow.RejectedLight;
             continue;
         }
 
         const float WHere = WaterPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
         const float NHere = NutrientPool.Next.SampleBilinear(GerminationPos.X, GerminationPos.Y);
-        const float fL = EcologyRules::LightFactor(LightHere, Sp->ShadeTolerance, Settings.LightHalfSaturationMax);
-        const float fW = EcoVigor::ResourceFactor(WHere, EcoVigor::MakeWaterResponse(*Sp, Settings));
-        const float fN = EcoVigor::ResourceFactor(NHere, EcoVigor::MakeNutrientResponse(*Sp, Settings));
+
         // Fase 6: la semilla cae al SUELO, o sea altura de copa 0: es donde el
         // termino de CO2 pesa mas (aire poco mezclado bajo un dosel cerrado).
-        // Aplicarlo tambien aqui es lo que hace que el efecto tenga consecuencias
-        // ecologicas -menos reclutamiento bajo dosel denso- y no sea solo un
-        // adorno sobre el crecimiento.
-        const float VigorHere = EcologyRules::Vigor(fL, fW, fN)
+        EEcoLimiter SeedLimiter = EEcoLimiter::Light;
+        const float VigorHere = EcoVigor::EvaluateVigor(LightHere, WHere, NHere,
+            SpeciesResponses[Seed.SpeciesId], Settings.VigorCombineMode, SeedLimiter)
             * EcoCarbon::CO2Factor(LightHere, /*CanopyHeightCm*/ 0.f, CO2);
 
         // Janzen-Connell: cuenta los adultos de LA MISMA especie alrededor. Los
@@ -1120,7 +1248,7 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
         // lo que le corresponderia por numero.
         //
         // Solo cuentan los REPRODUCTIVOS: es la presencia del hospedador adulto la
-        // que mantiene la carga de enemigos, no un plantón vecino.
+        // que mantiene la carga de enemigos, no un planton vecino.
         int32 Conspecifics = 0;
         if (Settings.ConspecificHalfCount > 0.f && Settings.ConspecificInhibitionRadiusCm > 0.f)
         {
@@ -1129,8 +1257,19 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
                 [&](int32 NeighborIdx)
                 {
                     if (Agents_Read.SpeciesId[NeighborIdx] != Seed.SpeciesId) { return; }
-                    const ETreeState NState = Agents_Write.State[NeighborIdx];
-                    if (NState != ETreeState::Mature && NState != ETreeState::Senescent) { return; }
+                    if (!IsReproductiveState(Agents_Write.State[NeighborIdx])) { return; }
+
+                    // La MADRE no cuenta. Cuando el radio de dispersion no supera al
+                    // de inhibicion, toda semilla cae dentro del circulo de su propia
+                    // madre, asi que hasta el ultimo adulto de una especie al borde de
+                    // la extincion pagaria la penalizacion por verse a si mismo: el
+                    // rescate de la especie rara quedaba topado justo donde el
+                    // mecanismo tiene que ser mas fuerte.
+                    if (Settings.bExcludeMotherFromInhibition &&
+                        Agents_Read.StableId[NeighborIdx] == Seed.ParentStableId)
+                    {
+                        return;
+                    }
 
                     const FVector& NP = Agents_Read.Position[NeighborIdx];
                     const double dx = NP.X - GerminationPos.X;
@@ -1140,6 +1279,8 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
         }
         const float JanzenConnell =
             EcologyRules::ConspecificInhibitionFactor(Conspecifics, Settings.ConspecificHalfCount);
+        Flow.JanzenConnellSum += JanzenConnell;
+        ++Flow.JanzenConnellCount;
 
         uint32 SeedRng = Seed.RngSeed;
         // La otra mitad del compromiso r/K: la semilla grande sale poco (SeedRateScale
@@ -1148,31 +1289,149 @@ void UEcosystemSubsystem::RunGermination(float DtYears, const UEcosystemSettings
             VigorHere, Settings.GerminationRate * Sp->GerminationRateScale) * JanzenConnell;
         if (EcoRand::NextUnit(SeedRng) < pGerm)
         {
-            Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f, /*Biomass*/ Sp->MaxBiomass * Settings.GerminationBiomassFraction);
+            Agents_Write.Add(GerminationPos, Seed.SpeciesId, SeedRng, /*Age*/ 0.f,
+                /*Biomass*/ Sp->MaxBiomass * Settings.GerminationBiomassFraction);
             NewbornPositions.Add(GerminationPos);
+            ++Flow.Germinated;
         }
     }
+}
 
+void UEcosystemSubsystem::RunDisturbance(float DtYears, const UEcosystemSettings& Settings)
+{
+    if (Settings.DisturbanceRatePerYear <= 0.f || !HeightField.IsValid()) { return; }
+
+    const FBox2D B = HeightField.GetWorldBounds();
+    const double MapAreaM2 = ((B.Max.X - B.Min.X) * (B.Max.Y - B.Min.Y)) / 10000.0; // cm2 -> m2
+    if (MapAreaM2 <= 0.0) { return; }
+
+    // Area a perturbar este tick, convertida a un NUMERO de claros con el area
+    // media de la distribucion. La media de una ley potencia de exponente a sobre
+    // [min,max] se integra analiticamente; con a=2 degenera en un logaritmo, asi
+    // que se resuelve el caso aparte en vez de dividir por cero.
+    const float MinA = FMath::Max(Settings.DisturbanceMinAreaM2, 1.f);
+    const float MaxA = FMath::Max(Settings.DisturbanceMaxAreaM2, MinA);
+    const float Alpha = FMath::Max(Settings.DisturbanceAreaExponent, 1.f);
+
+    double MeanAreaM2;
+    if (FMath::IsNearlyEqual(Alpha, 2.f, 1e-3f))
+    {
+        MeanAreaM2 = (FMath::Loge(MaxA) - FMath::Loge(MinA)) / (1.0 / MinA - 1.0 / MaxA);
+    }
+    else
+    {
+        const double A1 = 1.0 - Alpha, A2 = 2.0 - Alpha;
+        MeanAreaM2 = (A1 / A2) * (FMath::Pow((double)MaxA, A2) - FMath::Pow((double)MinA, A2))
+                              / (FMath::Pow((double)MaxA, A1) - FMath::Pow((double)MinA, A1));
+    }
+    if (!(MeanAreaM2 > 0.0)) { return; }
+
+    const float Lambda = static_cast<float>(
+        Settings.DisturbanceRatePerYear * DtYears * MapAreaM2 / MeanAreaM2);
+
+    // Stream propio: activar la perturbacion NO desplaza los streams de
+    // colonizacion, dispersion ni mortalidad, asi que se puede comparar una corrida
+    // con claros y otra sin ellos partiendo del mismo bosque.
+    uint32& Stream = Rng.State[static_cast<int32>(EEcoRngStream::Disturbance)];
+    const int32 NumGaps = EcoRand::PoissonInt(Stream, Lambda);
+
+    int32 Felled = 0;
+    for (int32 g = 0; g < NumGaps; ++g)
+    {
+        // Tamano por ley potencia con muestreo por inversa.
+        const float U = EcoRand::NextUnit(Stream);
+        const double A1 = 1.0 - Alpha;
+        const double AreaM2 = FMath::Pow(
+            FMath::Pow((double)MinA, A1) + U * (FMath::Pow((double)MaxA, A1) - FMath::Pow((double)MinA, A1)),
+            1.0 / A1);
+        const double RadiusCm = FMath::Sqrt(AreaM2 / PI) * 100.0;
+
+        const double Cx = FMath::Lerp(B.Min.X, B.Max.X, (double)EcoRand::NextUnit(Stream));
+        const double Cy = FMath::Lerp(B.Min.Y, B.Max.Y, (double)EcoRand::NextUnit(Stream));
+        const FVector Center(Cx, Cy, HeightField.SampleHeight(Cx, Cy));
+
+        // El hash indexa Agents_Read, y los arboles que ya existian al empezar el
+        // tick ocupan el MISMO indice en Agents_Write (que es una copia con las
+        // plantulas nuevas anadidas al final). Se consulta y se marca sobre
+        // Agents_Write, que es el buffer que sobrevive al swap; las plantulas
+        // germinadas en este mismo tick no estan en el hash y por tanto no las
+        // alcanza el claro, lo cual es razonable: aun no habian salido.
+        const double RadiusSq = RadiusCm * RadiusCm;
+        Hash.ForEachNeighbor(Center, (float)RadiusCm, [&](int32 Idx)
+            {
+                if (!Agents_Write.State.IsValidIndex(Idx)) { return; }
+                if (!IsAliveState(Agents_Write.State[Idx])) { return; }
+
+                const FVector& P = Agents_Read.Position[Idx];
+                const double dx = P.X - Center.X, dy = P.Y - Center.Y;
+                if (dx * dx + dy * dy > RadiusSq) { return; }
+
+                // Mortalidad < 1 deja arboles residuales en pie, que es lo que hace
+                // un temporal real y lo que da al claro su estructura irregular.
+                if (EcoRand::NextUnit(Stream) >= Settings.DisturbanceMortality) { return; }
+
+                const USpeciesData* Sp = ResolveSpecies(Agents_Write.SpeciesId[Idx]);
+                if (!Sp) { return; }
+
+                Agents_Write.State[Idx] = ETreeState::Dead;
+                ++Felled;
+
+                const float Biomass = Agents_Write.Biomass[Idx];
+
+                FPendingDeathPulse Pulse;
+                Pulse.Position = P;
+                Pulse.RadiusCm = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, Biomass, Sp->MaxBiomass,
+                    Settings.MinRootRadiusCells * (float)WaterBase.Field.CellSize);
+                Pulse.Amount = EcologyRules::DeathNutrientPulse(Biomass, Settings.NutrientDecompositionFactor);
+                Pulse.SpeciesId = Agents_Write.SpeciesId[Idx];
+                Pulse.StableId = Agents_Write.StableId[Idx];
+                Pulse.Biomass = Biomass;
+                Pulse.HeightCm = Agents_Write.Height[Idx];
+
+                EcologyRules::DepositKernel(NutrientBase.Field, NutrientPool.Next.Data,
+                    Pulse.Position, Pulse.RadiusCm, Pulse.Amount);
+                RecordDeathEvent(Pulse);
+            });
+    }
+
+    if (Felled > 0)
+    {
+        UE_LOG(LogEco, Verbose, TEXT("[Eco] Perturbacion | tick %lld | %d claros | %d arboles caidos"),
+            TickCount, NumGaps, Felled);
+    }
 }
 
 void UEcosystemSubsystem::RebuildCoarseLight()
 {
     const UEcosystemSettings* S = UEcosystemSettings::Get();
 
+    LightCoarse.SetExtinctionParams(S->LightExtinctionK, S->DiffuseLightFloor);
     LightCoarse.ClearShadow();
+
     for (int32 i = 0; i < Agents_Read.Num(); ++i)
     {
-        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+        if (!IsAliveState(Agents_Read.State[i])) { continue; }
         const USpeciesData* Sp = ResolveSpecies(Agents_Read.SpeciesId[i]);
         if (!Sp) { continue; }
 
+        // La copa ocupa la parte ALTA del arbol (CanopyDepthFraction), no su altura
+        // entera. Pasarle la altura completa como profundidad de copa era el origen
+        // del bug que dejaba el sotobosque a plena luz: la sombra se repartia por
+        // todo el fuste y, con el decaimiento vertical de entonces, se desvanecia
+        // justo a ras de suelo. Ahora la copa deposita area foliar en su propio
+        // volumen y lo que oscurece el suelo es la extincion acumulada.
         const float H = Agents_Read.Height[i];
         const FVector Apex = Agents_Read.Position[i] + FVector(0.f, 0.f, H);
-        // Radio/profundidad de copa: aproximacion hasta que la Fase 3 aporte
-        // geometria real. Config (no literales): altera el resultado ecologico.
-        LightCoarse.DepositCanopyShadow(Apex, H * S->CanopyRadiusFraction, H, S->CanopyShadowDensity);
+        LightCoarse.DepositCanopyLeafArea(Apex, H * S->CanopyRadiusFraction,
+            H * S->CanopyDepthFraction, S->CanopyLeafAreaIndex);
     }
+
+    // Convierte densidad depositada en LAI acumulado por encima de cada voxel.
+    // Sin esta pasada los Sample* devolverian la densidad local en vez de la
+    // atenuacion, o sea justo el perfil invertido que habia antes.
+    LightCoarse.AccumulateExtinction();
 }
+
 const USpeciesData* UEcosystemSubsystem::ResolveSpecies(uint16 SpeciesId) const
 {
     return ResolvedSpecies.IsValidIndex(SpeciesId) ? ResolvedSpecies[SpeciesId] : nullptr;
@@ -1344,15 +1603,16 @@ void UEcosystemSubsystem::LogPopulationStats() const
 
 void UEcosystemSubsystem::LogDemographics() const
 {
-    if (Agents_Read.Num() == 0)
+    const int32 NumSpecies = ResolvedSpecies.Num();
+    if (NumSpecies == 0)
     {
-        UE_LOG(LogEco, Log, TEXT("[Eco] Demografia | tick %lld: no hay arboles."), TickCount);
+        UE_LOG(LogEco, Warning, TEXT("[Eco] Demografia: no hay especies configuradas."));
         return;
     }
 
     struct FSpeciesDemo
     {
-        int32 Saplings = 0, Mature = 0, Senescent = 0;
+        int32 Saplings = 0, Mature = 0, Suppressed = 0, Senescent = 0;
         int32 Grown = 0;      // >= 70% de MaxBiomass: los que "llenan" el bosque
         double AgeSum = 0.0;
         float  AgeMax = 0.f;
@@ -1362,28 +1622,31 @@ void UEcosystemSubsystem::LogDemographics() const
         double VigorSum = 0.0;
         double StressSum = 0.0;
         int32  Lim[3] = { 0, 0, 0 }; // luz / agua / nutrientes (indices de EEcoLimiter)
+
+        int32 Live() const { return Saplings + Mature + Suppressed + Senescent; }
     };
 
     TArray<FSpeciesDemo> BySpecies;
-    BySpecies.SetNum(ResolvedSpecies.Num());
+    BySpecies.SetNum(NumSpecies);
 
     int32 Counted = 0;
     for (int32 i = 0; i < Agents_Read.Num(); ++i)
     {
-        if (Agents_Read.State[i] == ETreeState::Dead) { continue; }
+        if (!IsAliveState(Agents_Read.State[i])) { continue; }
 
-        const int32 s = Agents_Read.SpeciesId[i];
-        if (!BySpecies.IsValidIndex(s)) { continue; }
+        const int32 sp = Agents_Read.SpeciesId[i];
+        if (!BySpecies.IsValidIndex(sp)) { continue; }
 
-        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(s));
+        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(sp));
         if (!Sp) { continue; }
 
-        FSpeciesDemo& D = BySpecies[s];
+        FSpeciesDemo& D = BySpecies[sp];
         switch (Agents_Read.State[i])
         {
-        case ETreeState::Sapling:   ++D.Saplings;  break;
-        case ETreeState::Mature:    ++D.Mature;    break;
-        case ETreeState::Senescent: ++D.Senescent; break;
+        case ETreeState::Sapling:    ++D.Saplings;   break;
+        case ETreeState::Mature:     ++D.Mature;     break;
+        case ETreeState::Suppressed: ++D.Suppressed; break;
+        case ETreeState::Senescent:  ++D.Senescent;  break;
         default: break;
         }
 
@@ -1400,44 +1663,107 @@ void UEcosystemSubsystem::LogDemographics() const
     UE_LOG(LogEco, Log, TEXT("[Eco] Demografia | tick %lld | %d arboles vivos | %lld muertes acumuladas"),
         TickCount, Counted, DeathEventCounter);
 
-    for (int32 s = 0; s < BySpecies.Num(); ++s)
+    for (int32 sp = 0; sp < NumSpecies; ++sp)
     {
-        const FSpeciesDemo& D = BySpecies[s];
-        const int32 Live = D.Saplings + D.Mature + D.Senescent;
-        if (Live == 0) { continue; }
+        const FSpeciesDemo& D = BySpecies[sp];
+        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(sp));
+        const FString Name = Sp ? Sp->SpeciesName.ToString() : FString(TEXT("?"));
+        const int32 Live = D.Live();
 
-        const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(s));
+        // UNA ESPECIE EXTINTA TIENE QUE SALIR EN EL LOG. Antes se saltaba con un
+        // continue, asi que desaparecia del informe sin dejar rastro y la senal mas
+        // importante de todo el experimento -que una especie ha cruzado el cero, y
+        // cuando- no quedaba registrada en ninguna parte.
+        if (Live == 0)
+        {
+            const int64 Ext = SpeciesExtinctionTick.IsValidIndex(sp) ? SpeciesExtinctionTick[sp] : -1;
+            if (Ext >= 0)
+            {
+                UE_LOG(LogEco, Warning, TEXT("  %-22s n=   0 | *** EXTINTA (detectada en el tick %lld)"), *Name, Ext);
+            }
+            else
+            {
+                UE_LOG(LogEco, Warning, TEXT("  %-22s n=   0 | *** SIN INDIVIDUOS (nunca sembrada, o asset no cargado)"), *Name);
+            }
+            continue;
+        }
+
         const float InvLive = 1.f / static_cast<float>(Live);
+        const float MeanAge = static_cast<float>(D.AgeSum) * InvLive;
 
-        // "Mediana teorica" = 1.282*L^0.8, la edad a la que la mortalidad por edad
-        // se lleva a la mitad de una cohorte (ver USpeciesData::Longevity). Se
-        // imprime al lado de la edad maxima observada porque juntas dicen de un
-        // vistazo si el bosque esta llegando donde deberia.
-        const float MedianTarget = Sp ? 1.282f * FMath::Pow(FMath::Max(Sp->Longevity, 1.f), 0.8f) : 0.f;
+        // DOS medianas, y la comparacion entre ellas es el diagnostico.
+        //   - NOMINAL: 1.282*L^0.8, la edad a la que la mortalidad POR EDAD se lleva
+        //     a la mitad de una cohorte. Es lo que la especie deberia vivir.
+        //   - REALIZADA: ln2/h con h = muertes del tick / vivos, o sea lo que de
+        //     verdad vive con TODOS los canales de mortalidad actuando.
+        //
+        // EL HAZARD SALE DE LOS FLUJOS, NO DE LA EDAD MEDIA. Derivarlo de la edad
+        // media supone una poblacion en estado estacionario, y una especie que esta
+        // reclutando a lo bestia tiene la piramide de edades llena de plantulas
+        // recien nacidas: su edad media se hunde por el reclutamiento, no por la
+        // mortalidad, y la cifra sale hasta dos veces mas pesimista de lo real. El
+        // cociente muertes/vivos mide el riesgo directamente y no depende de como
+        // este repartida la poblacion por edades.
+        const float MedianNominal = Sp ? 1.282f * FMath::Pow(FMath::Max(Sp->Longevity, 1.f), 0.8f) : 0.f;
+
+        float Hazard = 0.f;
+        if (SpeciesFlow.IsValidIndex(sp) && YearsPerTick > KINDA_SMALL_NUMBER)
+        {
+            const int32 Deaths = SpeciesFlow[sp].DeathsByAge + SpeciesFlow[sp].DeathsByCondition;
+            Hazard = static_cast<float>(Deaths) / (static_cast<float>(Live) * YearsPerTick);
+        }
+        const float MedianRealized = (Hazard > KINDA_SMALL_NUMBER) ? 0.6931472f / Hazard : 0.f;
 
         UE_LOG(LogEco, Log,
-            TEXT("  %-16s n=%4d | plantula %4.1f%% adulto %4.1f%% senescente %4.1f%% | crecidos %4.1f%% | edad media %6.1f max %6.1f (mediana esperada %6.1f)"),
-            Sp ? *Sp->SpeciesName.ToString() : TEXT("?"),
-            Live,
-            100.f * D.Saplings * InvLive,
-            100.f * D.Mature * InvLive,
-            100.f * D.Senescent * InvLive,
-            100.f * D.Grown * InvLive,
-            static_cast<float>(D.AgeSum) * InvLive,
-            D.AgeMax,
-            MedianTarget);
+            TEXT("  %-22s n=%5d | plantula %4.1f%% adulto %4.1f%% suprimido %4.1f%% senescente %4.1f%% | crecidos %4.1f%%"),
+            *Name, Live,
+            100.f * D.Saplings * InvLive, 100.f * D.Mature * InvLive,
+            100.f * D.Suppressed * InvLive, 100.f * D.Senescent * InvLive,
+            100.f * D.Grown * InvLive);
 
-        // Segunda linea: el diagnostico. Un limitante al 95-100% en las tres
-        // especies significa que solo hay UN eje de competencia y que el modelo
-        // no puede repartir nicho, pase lo que pase con el resto de parametros.
         UE_LOG(LogEco, Log,
-            TEXT("  %-16s vigor medio %.3f | estres medio %.3f | limita: luz %4.1f%% agua %4.1f%% nutrientes %4.1f%%"),
+            TEXT("  %-22s edad media %6.1f max %6.1f | riesgo %5.2f%%/ano | mediana nominal %6.1f vs realizada %6.1f  (%s)"),
+            TEXT(""), MeanAge, D.AgeMax, 100.f * Hazard, MedianNominal, MedianRealized,
+            (MedianNominal > 0.f && MedianRealized > 0.f && MedianRealized < 0.5f * MedianNominal)
+            ? TEXT("*** no llega ni a la mitad de su vida nominal")
+            : TEXT("ok"));
+
+        // Un limitante al 95-100% en todas las especies significa que solo hay UN
+        // eje de competencia y que el modelo no puede repartir nicho, pase lo que
+        // pase con el resto de parametros.
+        UE_LOG(LogEco, Log,
+            TEXT("  %-22s vigor medio %.3f | estres medio %.3f | limita: luz %4.1f%% agua %4.1f%% nutrientes %4.1f%%"),
             TEXT(""),
             static_cast<float>(D.VigorSum) * InvLive,
             static_cast<float>(D.StressSum) * InvLive,
-            100.f * D.Lim[0] * InvLive,
-            100.f * D.Lim[1] * InvLive,
-            100.f * D.Lim[2] * InvLive);
+            100.f * D.Lim[0] * InvLive, 100.f * D.Lim[1] * InvLive, 100.f * D.Lim[2] * InvLive);
+
+        // EL EMBUDO DE RECLUTAMIENTO del ultimo tick. Sin este desglose, los cuatro
+        // filtros son una caja negra: no se puede distinguir "no produce semillas"
+        // de "las produce y las rechaza el espaciado" de "germinan y se mueren".
+        if (SpeciesFlow.IsValidIndex(sp))
+        {
+            const FEcoSpeciesFlow& F = SpeciesFlow[sp];
+            const float MeanJC = (F.JanzenConnellCount > 0)
+                ? F.JanzenConnellSum / static_cast<float>(F.JanzenConnellCount) : 1.f;
+
+            UE_LOG(LogEco, Log,
+                TEXT("  %-22s embudo: %5d sem -> fuera %4d | espaciado %5d | luz %5d | JC medio %.3f -> %4d germinan"),
+                TEXT(""), F.SeedsEmitted, F.RejectedOffMap, F.RejectedSpacing, F.RejectedLight, MeanJC, F.Germinated);
+
+            const int32 Deaths = F.DeathsByAge + F.DeathsByCondition;
+            UE_LOG(LogEco, Log,
+                TEXT("  %-22s muertes del tick: %4d (edad %4.1f%% / condicion %4.1f%%)  %s"),
+                TEXT(""), Deaths,
+                Deaths > 0 ? 100.f * F.DeathsByAge / Deaths : 0.f,
+                Deaths > 0 ? 100.f * F.DeathsByCondition / Deaths : 0.f,
+                // El aviso solo tiene sentido si la poblacion ha tenido TIEMPO de
+                // envejecer: en un bosque joven es normal que nadie muera de viejo,
+                // y decir "la longevidad no compra nada" ahi seria ruido.
+                (Deaths > 20 && F.DeathsByAge * 5 < Deaths && D.AgeMax > 0.5f * MedianNominal)
+                ? TEXT("<- el canal de edad casi no participa: la longevidad no compra nada")
+                : TEXT(""));
+        }
     }
 }
 
@@ -1480,18 +1806,38 @@ void UEcosystemSubsystem::LogFieldPercentiles() const
                 TEXT("          p5 %.2f | p25 %.2f | p50 %.2f | p75 %.2f | p95 %.2f   <- FRACCIONES: usa p25/p50/p75 como los tres optimos"),
                 P(0.05f) * Inv, P(0.25f) * Inv, P(0.50f) * Inv, P(0.75f) * Inv, P(0.95f) * Inv);
 
-            // Anchura sugerida: media distancia entre p25 y p75 deja las tres
-            // campanas separadas ~1 anchura, que es el umbral que pide la
-            // auditoria (bloque 5) para que cada especie tenga zona propia.
-            const float SuggestedWidth = 0.5f * (P(0.75f) - P(0.25f)) * Inv;
+            // ANCHURA SUGERIDA = el HUECO MINIMO entre optimos consecutivos, no la
+            // semidistancia intercuartilica.
+            //
+            // La media (p75-p25)/2 solo vale si el campo es SIMETRICO. El TWI del
+            // agua no lo es ni de lejos -su mediana cae en torno al 17% del rango y
+            // su p95 por encima del 60%-, asi que con esa formula el par p25-p50
+            // queda separado menos de una anchura y la propia auditoria lo etiqueta
+            // como "solape alto": las dos especies mas secas responden casi igual en
+            // todas las celdas y el eje deja de repartir territorio.
+            //
+            // Con el hueco minimo, las tres campanas quedan separadas >= 1 anchura
+            // tambien en un campo sesgado, que es la condicion que pide el bloque 5
+            // de Eco.AuditarEspecies para que cada especie tenga zona propia.
+            const float GapLow = (P(0.50f) - P(0.25f)) * Inv;
+            const float GapHigh = (P(0.75f) - P(0.50f)) * Inv;
+            const float SuggestedWidth = FMath::Min(GapLow, GapHigh);
             UE_LOG(LogEco, Log,
-                TEXT("          anchura sugerida (Tolerance): %.2f"),
-                FMath::Max(SuggestedWidth, 0.05f));
+                TEXT("          anchura sugerida (Tolerance): %.3f   [huecos p25-p50 %.3f | p50-p75 %.3f]"),
+                FMath::Max(SuggestedWidth, 0.01f), GapLow, GapHigh);
         };
 
     UE_LOG(LogEco, Log, TEXT("========================================================================"));
-    LogOne(TEXT("AGUA (TWI)"), WaterBase.Field.Data, S->WaterOutputMax);
-    LogOne(TEXT("NUTRIENTES"), NutrientBase.Field.Data, S->NutrientOutputMax);
+    LogOne(TEXT("AGUA (TWI) base"), WaterBase.Field.Data, S->WaterOutputMax);
+    LogOne(TEXT("NUTRIENTES base"), NutrientBase.Field.Data, S->NutrientOutputMax);
+
+    // Y AHORA LOS PERCENTILES DEL POOL, que es lo que los arboles leen de verdad.
+    // El campo base es el potencial del terreno, congelado; el tick muestrea el
+    // POOL, que se agota con el consumo y solo se recarga poco a poco hacia el base.
+    // Colocar los optimos sobre los percentiles del base los deja sistematicamente
+    // por encima del recurso realmente disponible.
+    LogOne(TEXT("AGUA pool (lo que leen los arboles)"), WaterPool.Current.Data, S->WaterOutputMax);
+    LogOne(TEXT("NUTRIENTES pool (lo que leen los arboles)"), NutrientPool.Current.Data, S->NutrientOutputMax);
 
     // LUZ A RAS DE SUELO: dice si existe un SOTOBOSQUE. Es lo que hay que mirar
     // para colocar los MinLightForGermination de cada especie: si el p25 de la luz
@@ -1521,6 +1867,330 @@ void UEcosystemSubsystem::LogFieldPercentiles() const
     {
         UE_LOG(LogEco, Warning,
             TEXT("[Campos] LUZ: la rejilla aun no esta lista (corre unos ticks antes)."));
+    }
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+}
+
+// ---------------------------------------------------------------------------
+//  Instrumentacion de diagnostico (Fase 0 del plan de coexistencia)
+// ---------------------------------------------------------------------------
+//
+// Los cuatro comandos de esta seccion existen para poder responder con NUMEROS a
+// "que le pasa a esta especie". Sin ellos la calibracion es a ciegas: los assets
+// de especie son binarios y sus valores no aparecen en ningun log, el embudo de
+// reclutamiento es una caja negra, y una especie extinta desaparecia del informe
+// sin dejar rastro. Ninguno toca el estado de la simulacion ni consume RNG de los
+// streams de la simulacion, asi que llamarlos no altera el fingerprint.
+
+void UEcosystemSubsystem::LogSpeciesDump() const
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    if (!S || ResolvedSpecies.Num() == 0)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Especies] No hay especies configuradas."));
+        return;
+    }
+
+    // Luz de referencia para leer la DIFERENCIACION en sombra, que es donde la
+    // tolerancia deberia decidir algo. Valor de lectura: no entra en la simulacion.
+    constexpr float kDeepShadeQ = 0.15f;
+    const float FullSun = FLightFieldCoarse::FullSunlight;
+    const float CellSizeCm = (float)WaterBase.Field.CellSize;
+
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+    UE_LOG(LogEco, Log, TEXT("[Especies] %d especies | modo de vigor %d | KlMax %.3f | umbral de estres %.2f"),
+        ResolvedSpecies.Num(), (int32)S->VigorCombineMode, S->LightHalfSaturationMax, S->StressVigorThreshold);
+
+    for (int32 i = 0; i < ResolvedSpecies.Num(); ++i)
+    {
+        const USpeciesData* Sp = ResolvedSpecies[i];
+        if (!Sp)
+        {
+            UE_LOG(LogEco, Error, TEXT("  [%d] *** ASSET NO CARGADO: esta especie no existe en la simulacion."), i);
+            continue;
+        }
+
+        const EcoVigor::FSpeciesResponses R = EcoVigor::MakeSpeciesResponses(*Sp, *S);
+        const float fLSun = EcoVigor::LightFactor(FullSun, R.Light);
+        const float fLShade = EcoVigor::LightFactor(kDeepShadeQ * FullSun, R.Light);
+
+        UE_LOG(LogEco, Log, TEXT("------------------------------------------------------------------------"));
+        UE_LOG(LogEco, Log, TEXT("  [%d] %s"), i, *Sp->SpeciesName.ToString());
+        UE_LOG(LogEco, Log,
+            TEXT("      vida: GrowthRate %.3f | MaxBiomass %.0f | Longevity %.0f | MaturityAge %.0f | MaxHeight %.0f cm"),
+            Sp->GrowthRate, Sp->MaxBiomass, Sp->Longevity, Sp->MaturityAge, Sp->MaxHeightCm);
+
+        // Tiempo hasta el 70% de MaxBiomass frente a la esperanza de vida: el
+        // criterio duro de si una especie puede COMPLETAR su ciclo. La solucion
+        // logistica desde la biomasa de plantula, con vigor 1 (cota optimista).
+        const float B0 = FMath::Max(S->GerminationBiomassFraction, KINDA_SMALL_NUMBER);
+        const float T70 = (Sp->GrowthRate > KINDA_SMALL_NUMBER)
+            ? FMath::Loge((0.7f / 0.3f) / (B0 / (1.f - B0))) / Sp->GrowthRate : -1.f;
+        UE_LOG(LogEco, Log,
+            TEXT("      t70 (anos hasta el 70%% de biomasa, vigor=1): %.1f   %s"),
+            T70, (T70 > 0.f && T70 > 0.5f * Sp->Longevity)
+            ? TEXT("*** tarda mas de media vida en crecer: dificilmente cerrara su ciclo") : TEXT(""));
+
+        UE_LOG(LogEco, Log,
+            TEXT("      luz: ShadeTolerance %.2f -> Amax %.3f | fL pleno sol %.3f | fL sombra(Q=%.2f) %.3f  %s"),
+            Sp->ShadeTolerance, R.Light.MaxAssimilation, fLSun, kDeepShadeQ, fLShade,
+            (fLSun < S->StressVigorThreshold)
+            ? TEXT("*** CONDENADA: se estresa a pleno sol y sin vecinos") : TEXT(""));
+
+        // Anchuras ABSOLUTAS: es lo que hay que comparar con el rango real del
+        // campo (Eco.PercentilesCampos), no la fraccion que guarda el asset.
+        UE_LOG(LogEco, Log,
+            TEXT("      agua:  optimo %.2f (=%.2f abs) | anchura %.3f (=%.2f abs) | exceso %.2f abs | encharca %s"),
+            Sp->WaterOptimum, R.Water.OptimumAbs, Sp->WaterTolerance, R.Water.WidthAbs,
+            R.Water.ExcessWidthAbs, Sp->bWaterloggingPenalty ? TEXT("si") : TEXT("no"));
+        UE_LOG(LogEco, Log,
+            TEXT("      nutr:  optimo %.2f (=%.2f abs) | anchura %.3f (=%.2f abs) | exceso %.2f abs | penaliza %s"),
+            Sp->NutrientOptimum, R.Nutrient.OptimumAbs, Sp->NutrientTolerance, R.Nutrient.WidthAbs,
+            R.Nutrient.ExcessWidthAbs, Sp->bNutrientExcessPenalty ? TEXT("si") : TEXT("no"));
+
+        // Lluvia de semillas de un adulto YA CRECIDO: el numero que de verdad
+        // compara la fecundidad entre especies, y que no se imprimia en ningun sitio.
+        const float RelAdult = 1.f;
+        const float SeedScale = (S->SeedBiomassHalfSaturation > 0.f)
+            ? RelAdult / (RelAdult + S->SeedBiomassHalfSaturation) : RelAdult;
+        UE_LOG(LogEco, Log,
+            TEXT("      semilla: %.2f/ano de un adulto crecido | germinacion x%.2f | dispersion %.0f m | luz minima %.2f"),
+            S->SeedsPerAdultPerYear * Sp->SeedRateScale * SeedScale,
+            Sp->GerminationRateScale, Sp->SeedDispersalRadius, Sp->MinLightForGermination);
+
+        if (Sp->SeedDispersalRadius * 100.f < S->ConspecificInhibitionRadiusCm)
+        {
+            UE_LOG(LogEco, Warning,
+                TEXT("      -> dispersion (%.0f m) menor que el radio de Janzen-Connell (%.0f m): ninguna semilla escapa "
+                    "del circulo de su madre y el rescate de la especie rara queda topado."),
+                Sp->SeedDispersalRadius, S->ConspecificInhibitionRadiusCm / 100.f);
+        }
+
+        // Radio radicular efectivo: dice si el kernel de consumo llega o no a los
+        // vecinos, que es lo que decide si existe competencia subterranea.
+        const float MinAdult = S->MinRootRadiusCells * CellSizeCm;
+        const float R30 = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, 0.3f, 1.f, MinAdult);
+        const float R100 = EcologyRules::EffectiveRootRadiusCm(Sp->RootRadius, 1.f, 1.f, MinAdult);
+        UE_LOG(LogEco, Log,
+            TEXT("      raiz: nominal %.1f m | efectivo a 30%% biomasa %.0f cm | a 100%% %.0f cm | celda %.0f cm  %s"),
+            Sp->RootRadius, R30, R100, CellSizeCm,
+            (R100 <= CellSizeCm) ? TEXT("*** no alcanza ni a la celda vecina") : TEXT(""));
+
+        UE_LOG(LogEco, Log,
+            TEXT("      declive: senescencia a %.0f anos (%.2f x longevidad) | suprimido: mortalidad %.3f/ano, crecimiento x%.2f"),
+            Sp->SenescenceAgeFraction * Sp->Longevity, Sp->SenescenceAgeFraction,
+            Sp->SuppressedMortalityPerYear, Sp->SuppressedGrowthScale);
+    }
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+}
+
+void UEcosystemSubsystem::LogNicheWinnerMap()
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    if (!S || !HeightField.IsValid()) { return; }
+
+    const int32 NumSpecies = ResolvedSpecies.Num();
+    if (NumSpecies == 0) { return; }
+
+    const EcoCarbon::FCO2Params CO2 = GetCO2Params();
+    const int32 NumCells = HeightField.Field.Data.Num();
+
+    TArray<float> BestVigor;   BestVigor.Init(-1.f, NumCells);
+    TArray<int32> BestSpecies; BestSpecies.Init(INDEX_NONE, NumCells);
+
+    FField2D Suit;
+    for (int32 i = 0; i < NumSpecies; ++i)
+    {
+        const USpeciesData* Sp = ResolvedSpecies[i];
+        if (!Sp) { continue; }
+
+        EcoVigor::BakeSuitabilityField(HeightField, SuitabilityWaterField(), SuitabilityNutrientField(),
+            LightCoarse, EcoVigor::MakeSpeciesResponses(*Sp, *S), S->VigorCombineMode, Suit, nullptr, &CO2);
+
+        if (Suit.Data.Num() != NumCells) { continue; }
+        for (int32 c = 0; c < NumCells; ++c)
+        {
+            if (Suit.Data[c] > BestVigor[c]) { BestVigor[c] = Suit.Data[c]; BestSpecies[c] = i; }
+        }
+    }
+
+    TArray<int32> Wins; Wins.SetNumZeroed(NumSpecies);
+    for (int32 c = 0; c < NumCells; ++c)
+    {
+        if (BestSpecies[c] != INDEX_NONE) { ++Wins[BestSpecies[c]]; }
+    }
+
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+    UE_LOG(LogEco, Log, TEXT("[Nicho] Fraccion del mapa donde cada especie tendria MAS vigor (%d celdas)"), NumCells);
+    UE_LOG(LogEco, Log, TEXT("[Nicho] Muestreado sobre %s"),
+        WaterPool.Current.IsValid() ? TEXT("el POOL (lo que los arboles leen de verdad)")
+                                    : TEXT("el campo BASE (la simulacion aun no ha corrido)"));
+
+    float MaxShare = 0.f;
+    float MinShare = 1.f;
+    for (int32 i = 0; i < NumSpecies; ++i)
+    {
+        const float Share = (NumCells > 0) ? (float)Wins[i] / (float)NumCells : 0.f;
+        MaxShare = FMath::Max(MaxShare, Share);
+        MinShare = FMath::Min(MinShare, Share);
+        UE_LOG(LogEco, Log, TEXT("   %-22s gana el %5.1f%% del mapa"),
+            ResolvedSpecies[i] ? *ResolvedSpecies[i]->SpeciesName.ToString() : TEXT("?"), 100.f * Share);
+    }
+
+    // Es la prueba DIRECTA, y se calcula sin simular un solo tick: si una especie
+    // es la mejor en practicamente todo el mapa, la exclusion competitiva ya esta
+    // escrita en la forma de las curvas y no hace falta gastar mil ticks para verla.
+    if (MaxShare > 0.70f)
+    {
+        UE_LOG(LogEco, Warning,
+            TEXT("   *** Una especie gana en el %.0f%% del mapa: no hay reparto de nicho posible. "
+                "Separa los optimos, estrecha las campanas o revisa los ejes monotonos (Eco.AuditarEspecies)."),
+            100.f * MaxShare);
+    }
+    else if (MinShare < 0.10f)
+    {
+        UE_LOG(LogEco, Warning,
+            TEXT("   *** Alguna especie gana en menos del 10%% del mapa: tiene refugio, pero muy pequeno."));
+    }
+    else
+    {
+        UE_LOG(LogEco, Log, TEXT("   Cada especie tiene una zona propia apreciable. Bien."));
+    }
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+
+    // Y se pinta, para poder VER donde esta la frontera entre nichos.
+    TArray<float> Paint;
+    Paint.SetNumUninitialized(NumCells);
+    for (int32 c = 0; c < NumCells; ++c)
+    {
+        Paint[c] = (BestSpecies[c] == INDEX_NONE) ? 0.f
+            : (float)(BestSpecies[c] + 1) / (float)NumSpecies;
+    }
+    PaintField(Paint, TEXT("Nicho ganador"), /*bAutoRange*/ false, 0.f, 1.f);
+}
+
+void UEcosystemSubsystem::LogLightProfile(double Xcm, double Ycm) const
+{
+    if (!LightCoarse.IsValid() || !HeightField.IsValid())
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Luz] La rejilla aun no esta lista (corre un tick antes)."));
+        return;
+    }
+
+    const double GroundZ = HeightField.SampleHeight(Xcm, Ycm);
+
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+    UE_LOG(LogEco, Log, TEXT("[Luz] Perfil en (%.0f, %.0f), suelo a Z=%.0f | k=%.2f, piso difuso=%.3f"),
+        Xcm, Ycm, GroundZ, LightCoarse.ExtinctionK, LightCoarse.DiffuseFloor);
+    UE_LOG(LogEco, Log, TEXT("      altura sobre el suelo (cm) ->  Q"));
+
+    // De arriba abajo: en un dosel real Q tiene que DECRECER hacia el suelo. Si el
+    // perfil sale al reves -claro abajo y oscuro arriba- el deposito de copa esta
+    // invirtiendo la sombra, que es el bug que dejaba el sotobosque a plena luz.
+    const int32 TopLayer = LightCoarse.Layers - 1;
+    for (int32 iz = TopLayer; iz >= LightCoarse.GroundLayerIndex(); --iz)
+    {
+        const double HeightAboveGround = (iz + 0.5) * LightCoarse.CellSizeZ + LightCoarse.BaseZ;
+        const float Q = LightCoarse.SampleLight(FVector(Xcm, Ycm, GroundZ + HeightAboveGround));
+        UE_LOG(LogEco, Log, TEXT("      %8.0f  ->  %.4f"), HeightAboveGround, Q);
+    }
+
+    const float QGround = LightCoarse.SampleLightSmooth(FVector(Xcm, Ycm, GroundZ));
+    UE_LOG(LogEco, Log, TEXT("      a ras de suelo (interpolado): Q = %.4f  %s"),
+        QGround, (QGround > 0.85f)
+        ? TEXT("<- practicamente pleno sol: NO hay sotobosque en este punto")
+        : TEXT(""));
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+}
+
+void UEcosystemSubsystem::LogConfigCoverage()
+{
+    const UEcosystemSettings* S = UEcosystemSettings::Get();
+    if (!S) { return; }
+
+    const UClass* Cls = S->GetClass();
+    const FString SectionHeader = FString::Printf(TEXT("[%s]"), *Cls->GetPathName());
+    const FString IniPath = S->GetDefaultConfigFilename();
+
+    // Se lee el .ini como TEXTO en vez de consultar FConfigCacheIni: aqui interesa
+    // que claves hay ESCRITAS en el fichero del proyecto, no el valor efectivo tras
+    // fusionar la cadena de .ini del motor -que es justo lo que enmascara que una
+    // propiedad no este fijada-.
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *IniPath))
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Config] No se pudo leer %s"), *IniPath);
+        return;
+    }
+
+    TArray<FString> Lines;
+    Text.ParseIntoArrayLines(Lines);
+
+    TSet<FName> InIni;
+    bool bInSection = false;
+    for (const FString& Raw : Lines)
+    {
+        const FString Line = Raw.TrimStartAndEnd();
+        if (Line.StartsWith(TEXT("[")))
+        {
+            bInSection = Line.Equals(SectionHeader, ESearchCase::IgnoreCase);
+            continue;
+        }
+        if (!bInSection || Line.IsEmpty() || Line.StartsWith(TEXT(";"))) { continue; }
+
+        FString Key, Value;
+        if (Line.Split(TEXT("="), &Key, &Value))
+        {
+            // '+Clave' / '-Clave' son la sintaxis de array de UE.
+            Key = Key.TrimStartAndEnd();
+            if (Key.StartsWith(TEXT("+")) || Key.StartsWith(TEXT("-"))) { Key.RightChopInline(1); }
+            InIni.Add(FName(*Key));
+        }
+    }
+
+    TArray<FString> Missing;
+    TSet<FName> Declared;
+    for (TFieldIterator<FProperty> It(Cls); It; ++It)
+    {
+        const FProperty* Prop = *It;
+        if (!Prop->HasAnyPropertyFlags(CPF_Config)) { continue; }
+
+        Declared.Add(Prop->GetFName());
+        if (!InIni.Contains(Prop->GetFName())) { Missing.Add(Prop->GetName()); }
+    }
+
+    TArray<FString> Orphan;
+    for (const FName& Key : InIni)
+    {
+        if (!Declared.Contains(Key)) { Orphan.Add(Key.ToString()); }
+    }
+
+    Missing.Sort();
+    Orphan.Sort();
+
+    UE_LOG(LogEco, Log, TEXT("========================================================================"));
+    UE_LOG(LogEco, Log, TEXT("[Config] %s"), *IniPath);
+    UE_LOG(LogEco, Log, TEXT("[Config] %d propiedades config declaradas | %d claves escritas en el .ini"),
+        Declared.Num(), InIni.Num());
+
+    // Una propiedad sin clave no es un detalle de higiene: significa que el .ini ha
+    // dejado de ser el registro reproducible de la corrida -un cambio de default en
+    // C++ altera la ecologia sin que nada visible cambie- y es como se acaba con una
+    // calibracion hibrida, con valores ajustados a mano para un modelo conviviendo
+    // con defaults de otro.
+    if (Missing.Num() > 0)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Config] %d propiedades NO estan en el .ini (corren con el default de C++):"), Missing.Num());
+        for (const FString& Name : Missing) { UE_LOG(LogEco, Warning, TEXT("           %s"), *Name); }
+    }
+    if (Orphan.Num() > 0)
+    {
+        UE_LOG(LogEco, Warning, TEXT("[Config] %d claves HUERFANAS en el .ini (ya no mapean a ninguna propiedad):"), Orphan.Num());
+        for (const FString& Name : Orphan) { UE_LOG(LogEco, Warning, TEXT("           %s"), *Name); }
+    }
+    if (Missing.Num() == 0 && Orphan.Num() == 0)
+    {
+        UE_LOG(LogEco, Log, TEXT("[Config] El .ini fija todas las propiedades y no tiene huerfanas. Bien."));
     }
     UE_LOG(LogEco, Log, TEXT("========================================================================"));
 }
@@ -1556,6 +2226,14 @@ void UEcosystemSubsystem::RecordDemographySample()
 
         ++Row[s].Count;
 
+        switch (Agents_Read.State[i])
+        {
+        case ETreeState::Sapling:    ++Row[s].Saplings;   break;
+        case ETreeState::Suppressed: ++Row[s].Suppressed; break;
+        case ETreeState::Senescent:  ++Row[s].Senescent;  break;
+        default: break;
+        }
+
         // Biomasa RELATIVA a la maxima de su especie: en absoluto no se pueden
         // comparar un til de 150 y un brezo de 40.
         BiomassFracSum[s] += Agents_Read.Biomass[i] / FMath::Max(Sp->MaxBiomass, KINDA_SMALL_NUMBER);
@@ -1581,6 +2259,22 @@ void UEcosystemSubsystem::RecordDemographySample()
         Row[s].MeanVigor = static_cast<float>(VigorSum[s] * Inv);
         Row[s].MeanStress = static_cast<float>(StressSum[s] * Inv);
 
+        // Los flujos del ultimo tick: son lo que convierte una serie de recuentos en
+        // una tabla de vida. Con nacimientos y muertes por especie, R0 sale de una
+        // division; sin ellos, dn/dt es observable pero no se puede descomponer en
+        // reclutamiento menos mortalidad, que es justo lo que decide donde tocar.
+        if (SpeciesFlow.IsValidIndex(s)) { Row[s].Flow = SpeciesFlow[s]; }
+
+        // Primer tick en que se observa a cero. Sin esto una extincion solo se
+        // detecta por ausencia y su momento -el dato mas informativo de todo el
+        // experimento- no queda registrado en ninguna parte.
+        if (SpeciesExtinctionTick.IsValidIndex(s) && Row[s].Count == 0 && SpeciesExtinctionTick[s] < 0)
+        {
+            SpeciesExtinctionTick[s] = TickCount;
+            UE_LOG(LogEco, Warning, TEXT("[Eco] *** La especie '%s' se ha EXTINGUIDO (tick %lld)."),
+                ResolvedSpecies[s] ? *ResolvedSpecies[s]->SpeciesName.ToString() : TEXT("?"), TickCount);
+        }
+
         // Se guarda la fila AUNQUE Count sea 0: una especie extinguida tiene que
         // aparecer como una linea que baja a cero en la grafica, no desaparecer
         // del CSV (que se leeria como "no habia datos").
@@ -1599,18 +2293,30 @@ void UEcosystemSubsystem::SaveDemographyCsv(const FString& FullPath) const
 
     // Separador ';' y punto decimal: es lo que abre directamente un Excel en
     // español sin pasar por el asistente de importacion.
-    FString Csv = TEXT("tick;especie;n;biomasa_rel;vigor;estres;lim_luz;lim_agua;lim_nutrientes\n");
-    Csv.Reserve(Csv.Len() + DemoHistory.Num() * 64);
+    // Los FLUJOS (nacimientos, muertes por canal y el embudo de rechazos) son lo
+    // que convierte una serie de recuentos en una tabla de vida: con ellos R0 por
+    // especie sale de una division en la hoja de calculo, y se puede distinguir
+    // "recluta poco" de "se le mueren las plantulas" de "no llega a madurez".
+    FString Csv = TEXT("tick;especie;n;plantulas;suprimidos;senescentes;biomasa_rel;vigor;estres;"
+        "lim_luz;lim_agua;lim_nutrientes;"
+        "semillas;rech_fuera;rech_espaciado;rech_luz;jc_medio;nacimientos;muertes_edad;muertes_condicion\n");
+    Csv.Reserve(Csv.Len() + DemoHistory.Num() * 128);
 
     for (const FEcoDemoSample& Sample : DemoHistory)
     {
         const USpeciesData* Sp = ResolveSpecies(static_cast<uint16>(Sample.SpeciesIndex));
-        Csv += FString::Printf(TEXT("%lld;%s;%d;%.4f;%.4f;%.4f;%d;%d;%d\n"),
+        const FEcoSpeciesFlow& F = Sample.Flow;
+        const float MeanJC = (F.JanzenConnellCount > 0)
+            ? F.JanzenConnellSum / static_cast<float>(F.JanzenConnellCount) : 1.f;
+
+        Csv += FString::Printf(TEXT("%lld;%s;%d;%d;%d;%d;%.4f;%.4f;%.4f;%d;%d;%d;%d;%d;%d;%d;%.4f;%d;%d;%d\n"),
             Sample.Tick,
             Sp ? *Sp->SpeciesName.ToString() : TEXT("?"),
-            Sample.Count,
+            Sample.Count, Sample.Saplings, Sample.Suppressed, Sample.Senescent,
             Sample.MeanBiomass, Sample.MeanVigor, Sample.MeanStress,
-            Sample.LimitedByLight, Sample.LimitedByWater, Sample.LimitedByNutrient);
+            Sample.LimitedByLight, Sample.LimitedByWater, Sample.LimitedByNutrient,
+            F.SeedsEmitted, F.RejectedOffMap, F.RejectedSpacing, F.RejectedLight, MeanJC,
+            F.Germinated, F.DeathsByAge, F.DeathsByCondition);
     }
 
     if (FFileHelper::SaveStringToFile(Csv, *FullPath))
@@ -1700,7 +2406,13 @@ static constexpr uint32 kEcoBakeMagic = 0x4F434501u;
 // v2: el SoA lleva dos arrays mas (Vigor y Limiter, instrumentacion). El bake
 // enumera los campos con FTreePopulation::ForEachArray, asi que el formato cambia
 // solo: un .ecobake v1 ya no se puede leer y LoadState lo rechaza limpiamente.
-static constexpr int32  kEcoBakeVersion = 2;
+//
+// v3: DOS cambios incompatibles a la vez. (a) ETreeState gana el estado Suppressed
+// ANTES de Dead, asi que los valores serializados de v2 significan otra cosa.
+// (b) FEcosystemRng gana un stream (Disturbance) y se serializa como bloque plano,
+// asi que su sizeof cambia. Un bake v2 leido como v3 daria arboles muertos
+// resucitados y streams desplazados; la version lo rechaza limpiamente.
+static constexpr int32  kEcoBakeVersion = 3;
 
 /** Todo lo que vive en un bake. Ver SerializeState. */
 struct FEcoBakePayload
@@ -2083,25 +2795,38 @@ void UEcosystemSubsystem::PaintNutrientField()
     PaintField(NutrientPool.Current.Data, TEXT("nutrientes (pool actual)"));
 }
 
+const FField2D& UEcosystemSubsystem::SuitabilityWaterField() const
+{
+    // El POOL si la simulacion ya ha corrido, el potencial del terreno si no.
+    // Lo que los arboles leen es el pool, y puede estar bastante por debajo del
+    // base: horneando la idoneidad sobre el base, el mapa de nicho declara un
+    // reparto que en el recurso realmente disponible ya no existe.
+    return WaterPool.Current.IsValid() ? WaterPool.Current : WaterBase.Field;
+}
+
+const FField2D& UEcosystemSubsystem::SuitabilityNutrientField() const
+{
+    return NutrientPool.Current.IsValid() ? NutrientPool.Current : NutrientBase.Field;
+}
+
 void UEcosystemSubsystem::PaintVigorField()
 {
     const UEcosystemSettings* S = UEcosystemSettings::Get();
-    const USpeciesData* Sp = ResolveSpecies((uint16)FMath::Max(0, S->HeatmapSpeciesIndex));
+    const int32 Index = FMath::Max(0, S->HeatmapSpeciesIndex);
+    const USpeciesData* Sp = ResolveSpecies((uint16)Index);
     if (!Sp || !HeightField.IsValid()) { return; }
 
     FField2D Suit;
-    // Fase 6: se le pasan los MISMOS parametros de CO2 que usa el tick, para que
-    // el mapa de idoneidad siga representando exactamente la funcion que hace
-    // crecer al bosque (ver GetCO2Params).
+    // Se le pasan las MISMAS respuestas, el MISMO modo de combinacion y los MISMOS
+    // parametros de CO2 que usa el tick: si el mapa de idoneidad y el crecimiento
+    // real evaluaran modelos distintos, el heatmap dejaria de servir para explicar
+    // por que el bosque crece donde crece.
     const EcoCarbon::FCO2Params CO2 = GetCO2Params();
-    EcoVigor::BakeSuitabilityField(HeightField, WaterBase, NutrientBase, LightCoarse,
-        *Sp, S->LightHalfSaturationMax /* el mismo Kl que el tick */,
-        EcoVigor::MakeWaterResponse(*Sp, *S),
-        EcoVigor::MakeNutrientResponse(*Sp, *S),
-        Suit, /*OutLimiter*/ nullptr, &CO2);
+    EcoVigor::BakeSuitabilityField(HeightField, SuitabilityWaterField(), SuitabilityNutrientField(),
+        LightCoarse, EcoVigor::MakeSpeciesResponses(*Sp, *S), S->VigorCombineMode, Suit, nullptr, &CO2);
 
-    PaintField(Suit.Data, *FString::Printf(TEXT("vigor de %s%s"),
-        *Sp->SpeciesName.ToString(), CO2.bEnabled ? TEXT(" (con CO2)") : TEXT(" (sin CO2)")));
+    PaintField(Suit.Data, *FString::Printf(TEXT("Vigor (%s)"), *Sp->SpeciesName.ToString()),
+        /*bAutoRange*/ false, 0.f, 1.f);
 }
 
 void UEcosystemSubsystem::PaintLightField()

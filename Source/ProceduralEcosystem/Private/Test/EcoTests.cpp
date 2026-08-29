@@ -122,27 +122,38 @@ bool FEcoLodRemap::RunTest(const FString&) {
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSenescence, "Eco.Fase5.Senescencia", EcoTestFlags)
 bool FEcoSenescence::RunTest(const FString&) {
-    const float Longevity = 200.f, AgeFrac = 0.75f, StressThr = 0.85f;
+    const float Longevity = 200.f, AgeFrac = 0.75f, StressThr = 0.85f, ExitFrac = 0.4f;
 
-    // Entrada por VEJEZ: 0.75*200 = 150 anios.
-    TestFalse(TEXT("joven y sin estres: no senescente"),
-        EcologyRules::IsSenescent(100.f, Longevity, AgeFrac, 0.f, StressThr));
+    // --- Senescencia por EDAD: irreversible, y SOLO por edad ---------------
+    TestFalse(TEXT("joven: no senescente"),
+        EcologyRules::IsSenescentByAge(100.f, Longevity, AgeFrac));
     TestTrue(TEXT("pasada la fraccion de longevidad: senescente"),
-        EcologyRules::IsSenescent(150.f, Longevity, AgeFrac, 0.f, StressThr));
+        EcologyRules::IsSenescentByAge(150.f, Longevity, AgeFrac));
 
-    // Entrada por ESTRES, aunque sea joven.
-    TestTrue(TEXT("estres por encima del umbral: senescente"),
-        EcologyRules::IsSenescent(10.f, Longevity, AgeFrac, 0.9f, StressThr));
+    // El estres ya NO entra aqui: tiene su propio estado, reversible. Si volviera
+    // a mezclarse, una plantula suprimida unos anos quedaria marcada de por vida y
+    // el banco de plantulas -el mecanismo de coexistencia de un bosque climacico-
+    // seria imposible.
+    TestFalse(TEXT("estres alto NO produce senescencia por edad"),
+        EcologyRules::IsSenescentByAge(10.f, Longevity, AgeFrac));
 
-    // IsSenescent es pura sobre el estres ACTUAL: por si sola NO recuerda. La
-    // irreversibilidad la impone SimulateTick con un OR contra el estado previo;
-    // este test documenta el contrato para que nadie la use suelta.
-    TestFalse(TEXT("IsSenescent no recuerda: al recuperarse devuelve false"),
-        EcologyRules::IsSenescent(10.f, Longevity, AgeFrac, 0.1f, StressThr));
+    // --- Supresion por ESTRES: reversible, con histeresis ------------------
+    TestTrue(TEXT("sano que cruza el umbral: entra en supresion"),
+        EcologyRules::UpdateSuppression(false, 0.9f, StressThr, ExitFrac));
+    TestFalse(TEXT("sano por debajo del umbral: no entra"),
+        EcologyRules::UpdateSuppression(false, 0.5f, StressThr, ExitFrac));
+
+    // HISTERESIS: con un solo umbral el estado parpadearia tick a tick. Un
+    // suprimido a 0.5 sigue suprimido (0.5 > 0.85*0.4 = 0.34) aunque a 0.5 no
+    // habria entrado.
+    TestTrue(TEXT("suprimido a estres medio: NO sale todavia"),
+        EcologyRules::UpdateSuppression(true, 0.5f, StressThr, ExitFrac));
+    TestFalse(TEXT("suprimido que se recupera del todo: sale"),
+        EcologyRules::UpdateSuppression(true, 0.2f, StressThr, ExitFrac));
 
     // El crecimiento se frena y la mortalidad se multiplica, ambos acotados.
-    TestEqual(TEXT("sano: crecimiento x1"), EcologyRules::SenescentGrowthFactor(false, 0.1f), 1.f);
-    TestEqual(TEXT("senescente: crecimiento x escala"), EcologyRules::SenescentGrowthFactor(true, 0.1f), 0.1f);
+    TestEqual(TEXT("sano: crecimiento x1"), EcologyRules::DeclineGrowthFactor(false, 0.1f), 1.f);
+    TestEqual(TEXT("en declive: crecimiento x escala"), EcologyRules::DeclineGrowthFactor(true, 0.1f), 0.1f);
     TestEqual(TEXT("sano: pDeath intacta"), EcologyRules::ApplySenescentMortality(0.2f, false, 3.f), 0.2f);
     TestTrue(TEXT("senescente: pDeath x3"),
         FMath::IsNearlyEqual(EcologyRules::ApplySenescentMortality(0.2f, true, 3.f), 0.6f, 1e-5f));
@@ -277,9 +288,13 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
         Light.SampleLight(FVector(600.0, 600.0, 300.0)), FLightFieldCoarse::FullSunlight);
 
     // Dos copas identicas, una en cada altiplano, a la MISMA altura sobre el suelo.
-    const float CanopyR = 500.f, CanopyDepth = 1200.f;
-    Light.DepositCanopyShadow(FVector(600.0, 600.0, 0.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
-    Light.DepositCanopyShadow(FVector(2200.0, 600.0, 10000.0 + 1500.0), CanopyR, CanopyDepth, 0.8f);
+    // Copa ANCHA a proposito: con un radio menor que el voxel el area foliar se
+    // reparte sobre una huella mucho mayor que la copa y la sombra sale debil, que
+    // es justamente lo que debe pasar.
+    const float CanopyR = 1200.f, CanopyDepth = 1200.f, CanopyLai = 4.f;
+    Light.DepositCanopyLeafArea(FVector(600.0, 600.0, 0.0 + 2000.0), CanopyR, CanopyDepth, CanopyLai);
+    Light.DepositCanopyLeafArea(FVector(2200.0, 600.0, 10000.0 + 2000.0), CanopyR, CanopyDepth, CanopyLai);
+    Light.AccumulateExtinction();
 
     // A ras de suelo, bajo cada copa, la luz debe ser la MISMA pese a los 100 m
     // de diferencia de cota.
@@ -287,7 +302,20 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
     const float RidgeQ = Light.SampleLight(FVector(2200.0, 600.0, 10000.0 + 50.0));
     TestTrue(TEXT("misma altura sobre el suelo -> misma luz"),
         FMath::IsNearlyEqual(ValleyQ, RidgeQ, 1e-4f));
-    TestTrue(TEXT("bajo la copa hay sombra"), ValleyQ < FLightFieldCoarse::FullSunlight);
+
+    // UMBRAL ECOLOGICO, no "< luz plena". La asercion anterior pasaba con una
+    // sombra de tres centesimas, que es exactamente el bug que dejaba el
+    // sotobosque a plena luz sin que ningun test se enterara.
+    TestTrue(TEXT("bajo una copa adulta el suelo esta claramente sombreado"), ValleyQ < 0.6f);
+
+    // Y la sombra tiene que CRECER hacia abajo: es la firma de un dosel real, y
+    // la de la version anterior era la contraria (oscuro arriba, claro abajo).
+    const float CanopyQ = Light.SampleLight(FVector(600.0, 600.0, 0.0 + 1800.0));
+    TestTrue(TEXT("perfil correcto: mas oscuro abajo que en la copa"), ValleyQ < CanopyQ);
+
+    // El piso difuso impide el cero absoluto, que igualaria a todas las especies
+    // justo donde la tolerancia debe decidir.
+    TestTrue(TEXT("nunca se llega a oscuridad total"), ValleyQ >= Light.DiffuseFloor);
 
     // Y una copa NO puede sombrear la otra columna (estan lejos en XY).
     const float FarQ = Light.SampleLight(FVector(3400.0, 2600.0, 10000.0 + 50.0));
@@ -295,6 +323,114 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
 
     // La rejilla es pequena: es el objetivo de la optimizacion.
     TestTrue(TEXT("la rejilla cabe en pocas capas"), Light.Layers <= 16);
+    return true;
+}
+
+/**
+ * ESTRATIFICACION VERTICAL: el arbol alto tiene que recibir MAS luz que el bajo
+ * que tiene debajo. Es la propiedad que convierte la competencia por luz en
+ * asimetrica -el que llega arriba intercepta y el de abajo paga- y sin ella no
+ * existen ni el dosel, ni el banco de plantulas, ni la sucesion. Antes fallaba por
+ * construccion: todos los arboles muestreaban la luz en la cota del suelo.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLightStratification, "Eco.Luz.EstratificacionVertical", EcoTestFlags)
+bool FEcoLightStratification::RunTest(const FString&) {
+    FLightFieldCoarse Light;
+    const double Cell = 400.0;
+    Light.Init(8, 8, 12, Cell, Cell, FVector2D::ZeroVector, /*BaseZ*/ -400.0);
+    Light.SetExtinctionParams(0.5f, 0.04f);
+
+    // Un dominante de 20 m con copa en su tercio superior.
+    const double ApexZ = 2000.0;
+    Light.DepositCanopyLeafArea(FVector(600.0, 600.0, ApexZ), 1200.f, 600.f, 4.f);
+    Light.AccumulateExtinction();
+
+    const float QCanopy = Light.SampleLightSmooth(FVector(600.0, 600.0, ApexZ));
+    const float QMid = Light.SampleLightSmooth(FVector(600.0, 600.0, 1000.0));
+    const float QGround = Light.SampleLightSmooth(FVector(600.0, 600.0, 0.0));
+
+    TestTrue(TEXT("la luz decrece de forma monotona hacia el suelo"),
+        QCanopy > QMid && QMid > QGround);
+    TestTrue(TEXT("el techo de la copa esta casi a pleno sol (autoexclusion)"), QCanopy > 0.8f);
+    TestTrue(TEXT("el suelo esta en penumbra"), QGround < 0.5f);
+    return true;
+}
+
+/**
+ * COSTE DE LA TOLERANCIA A LA SOMBRA: las curvas de la pionera y de la tolerante
+ * tienen que CRUZARSE. Sin cruce, ShadeTolerance es una ventaja monotona gratuita
+ * -mejor a pleno sol Y bajo el dosel- y la especie mas tolerante gana en todas las
+ * celdas a la vez, que es exclusion competitiva por construccion.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoShadeToleranceTradeoff, "Eco.Luz.CosteDeLaTolerancia", EcoTestFlags)
+bool FEcoShadeToleranceTradeoff::RunTest(const FString&) {
+    const float KlMax = 0.12f, Cost = 0.40f;
+
+    auto MakeResp = [KlMax, Cost](float ShadeTol)
+        {
+            EcoVigor::FLightResponse R;
+            R.KlMax = KlMax;
+            R.ShadeTolerance = ShadeTol;
+            R.MaxAssimilation = 1.f - Cost * ShadeTol;
+            return R;
+        };
+
+    const EcoVigor::FLightResponse Pioneer = MakeResp(0.05f);
+    const EcoVigor::FLightResponse Climax = MakeResp(0.65f);
+
+    const float SunPioneer = EcoVigor::LightFactor(1.f, Pioneer);
+    const float SunClimax = EcoVigor::LightFactor(1.f, Climax);
+    const float ShadePioneer = EcoVigor::LightFactor(0.10f, Pioneer);
+    const float ShadeClimax = EcoVigor::LightFactor(0.10f, Climax);
+
+    TestTrue(TEXT("a pleno sol gana la pionera"), SunPioneer > SunClimax);
+    TestTrue(TEXT("bajo el dosel gana la tolerante"), ShadeClimax > ShadePioneer);
+
+    // Sin coste el cruce desaparece: la tolerante ganaria tambien a pleno sol.
+    const EcoVigor::FLightResponse FreeClimax = [KlMax]()
+        {
+            EcoVigor::FLightResponse R; R.KlMax = KlMax; R.ShadeTolerance = 0.65f; R.MaxAssimilation = 1.f; return R;
+        }();
+    TestTrue(TEXT("sin coste, la tolerante domina tambien a pleno sol"),
+        EcoVigor::LightFactor(1.f, FreeClimax) > SunPioneer);
+    return true;
+}
+
+/**
+ * EL ESTRES TIENE QUE SER UNA RAMPA, NO UN ESCALON. Sin termino de decaimiento el
+ * punto fijo es binario -0 exacto por encima del umbral, 1 por debajo-, con lo que
+ * dos sitios de calidad muy distinta dan la misma demografia y dos especies
+ * separadas por centesimas de vigor quedan separadas por una diferencia de
+ * mortalidad infinita.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoStressRamp, "Eco.Estres.RampaContinua", EcoTestFlags)
+bool FEcoStressRamp::RunTest(const FString&) {
+    const float Thr = 0.45f, Acc = 1.f, Rec = 0.5f, Decay = 0.2f, Dt = 1.f;
+
+    // Punto fijo por iteracion, para dos vigores por debajo del umbral.
+    auto FixedPoint = [&](float Vigor)
+        {
+            float S = 0.f;
+            for (int32 i = 0; i < 500; ++i) { S = EcologyRules::UpdateStress(S, Vigor, Thr, Acc, Rec, Decay, Dt); }
+            return S;
+        };
+
+    const float SBad = FixedPoint(0.05f);
+    const float SMid = FixedPoint(0.35f);
+
+    TestTrue(TEXT("peor sitio -> mas estres"), SBad > SMid);
+    TestTrue(TEXT("el sitio intermedio NO satura en 1"), SMid < 0.95f);
+    TestTrue(TEXT("el sitio intermedio tampoco queda en 0"), SMid > 0.01f);
+    TestTrue(TEXT("por encima del umbral el estres se va a cero"),
+        FixedPoint(0.9f) < KINDA_SMALL_NUMBER);
+
+    // Y la longevidad tiene que comprar resistencia, o la estrategia lenta no
+    // puede existir: paga el mismo impuesto anual durante muchos mas anos.
+    const float WLong = EcologyRules::EffectiveStressMortalityWeight(0.2f, 600.f, 300.f, 0.5f);
+    const float WShort = EcologyRules::EffectiveStressMortalityWeight(0.2f, 150.f, 300.f, 0.5f);
+    TestTrue(TEXT("la especie longeva resiste mejor el estres cronico"), WLong < WShort);
+    TestEqual(TEXT("exponente 0 desactiva el acoplamiento"),
+        EcologyRules::EffectiveStressMortalityWeight(0.2f, 600.f, 300.f, 0.f), 0.2f);
     return true;
 }
 

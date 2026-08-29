@@ -13,6 +13,7 @@
 #include "Ecology/TickScratch.h"
 #include "Ecology/TreeDeathEvent.h"
 #include "Ecology/CarbonModel.h"   // Fase 6 (6.3): multiplicador de CO2
+#include "Ecology/Vigor.h"         // EcoVigor::FSpeciesResponses (cache por tick)
 #include "EcosystemSubsystem.generated.h"
 
 class UFieldVisualizer;
@@ -84,6 +85,19 @@ struct FEcoDemoSample
     int32 LimitedByLight = 0; // reparto del argmin de Liebig
     int32 LimitedByWater = 0;
     int32 LimitedByNutrient = 0;
+
+    // --- Flujos del tick (embudo de reclutamiento y muertes por canal) ------
+    // Un recuento de poblacion dice que una especie se esta yendo; solo los FLUJOS
+    // dicen si es porque recluta poco, porque se le mueren las plantulas o porque
+    // no llega a madurez -que son tres arreglos distintos-. Con nacimientos y
+    // muertes por especie, R0 sale de una division en la hoja de calculo.
+    FEcoSpeciesFlow Flow;
+
+    // Estructura de tamanos: distingue un bosque maduro de un vivero, que es lo
+    // unico que no puede distinguir el recuento.
+    int32 Saplings = 0;
+    int32 Suppressed = 0;
+    int32 Senescent = 0;
 };
 
 /**
@@ -160,6 +174,40 @@ public:
     void LogDemographics() const;
 
     /**
+     * Vuelca los rasgos de cada USpeciesData resuelto, MAS los derivados que no se
+     * ven en ninguna parte: anchura absoluta de cada campana, f_L a pleno sol y en
+     * penumbra, lluvia de semillas de un adulto crecido, radio radicular efectivo a
+     * varias fracciones de biomasa y edad de senescencia frente a la mediana
+     * esperada (consola: Eco.Especies.Volcado).
+     *
+     * Sin esto la calibracion es a ciegas: los .uasset son binarios y sus valores no
+     * aparecen en ningun log, asi que no hay forma de auditar por que una especie
+     * pierde. Es el primer comando que hay que correr al diagnosticar.
+     */
+    void LogSpeciesDump() const;
+
+    /**
+     * Para cada celda del terreno, que especie tendria MAS vigor si estuviera alli,
+     * y que fraccion del mapa gana cada una (consola: Eco.Nicho.Mapa).
+     *
+     * Es la prueba DIRECTA de si el modelo puede sostener coexistencia, y se calcula
+     * sin simular un solo tick: si una especie es la mejor en practicamente todo el
+     * mapa, la exclusion competitiva ya esta escrita en la forma de las curvas y no
+     * hace falta gastar mil ticks para verla. Pinta ademas el argmax como heatmap.
+     */
+    void LogNicheWinnerMap();
+
+    /**
+     * Perfil vertical de luz de UNA columna: LAI acumulado y Q por capa, mas lo que
+     * devuelve el muestreador a ras de suelo, a media altura y en el apice
+     * (consola: Eco.Luz.Perfil X Y).
+     *
+     * Confirma o refuta en cinco segundos la pregunta que decide todo el modelo de
+     * sucesion: si existe de verdad un gradiente de luz entre el dosel y el suelo.
+     */
+    void LogLightProfile(double Xcm, double Ycm) const;
+
+    /**
      * Vuelca el historico demografico acumulado a un CSV (consola:
      * Eco.Demografia.CSV [nombre]).
      *
@@ -207,6 +255,21 @@ public:
      * imprime este comando, no en fracciones elegidas a ojo.
      */
     void LogFieldPercentiles() const;
+
+    /**
+     * Compara las UPROPERTY(config) de UEcosystemSettings con las claves realmente
+     * escritas en DefaultGame.ini (consola: Eco.Config.Auditar).
+     *
+     * Avisa de (a) propiedades que NO estan en el .ini y por tanto corren con el
+     * valor por defecto de C++, y (b) claves del .ini que ya no mapean a ninguna
+     * propiedad (huerfanas de un renombrado).
+     *
+     * No es higiene cosmetica: un .ini que solo fija parte de los parametros deja de
+     * ser el registro reproducible de la corrida -un cambio de default en C++ altera
+     * la ecologia sin que nada visible cambie- y produce calibraciones hibridas,
+     * con valores ajustados a mano para un modelo conviviendo con defaults de otro.
+     */
+    static void LogConfigCoverage();
 
     // --- Heatmaps ---
     void PaintTestField();
@@ -276,6 +339,25 @@ private:
         recien nacidas), sitio seguro y probabilidad por vigor local. */
     void RunGermination(float DtYears, const UEcosystemSettings& Settings,
         const EcoCarbon::FCO2Params& CO2);
+
+    /**
+     * Perturbacion: abre CLAROS matando a los arboles de un disco.
+     *
+     * Sin esto cada arbol muere por su cuenta y su hueco es de un arbol: no hay
+     * claros, y sin claros no existe la fase de alta luz en la que una pionera es la
+     * mejor, o sea que falta la dimension TEMPORAL del nicho. Serial y con stream
+     * de RNG propio, para que activarla no desplace los streams de la simulacion.
+     */
+    void RunDisturbance(float DtYears, const UEcosystemSettings& Settings);
+
+    /** Rehace SpeciesResponses (una entrada por especie) al principio del tick. */
+    void RefreshSpeciesResponses(const UEcosystemSettings& Settings);
+
+    /** Campos que deben alimentar cualquier horneado de idoneidad: el POOL si la
+        simulacion ya ha corrido, el potencial del terreno si no. Ver la nota de
+        EcoVigor::BakeSuitabilityField sobre por que la distincion importa. */
+    const FField2D& SuitabilityWaterField() const;
+    const FField2D& SuitabilityNutrientField() const;
 
     /** Rehace el grid de luz grueso con la poblacion actual (ClearShadow + deposito
         de todas las copas). Lo llama SimulateTick al principio del tick, y LoadState
@@ -372,6 +454,22 @@ private:
         sobrevive al tick y la germinacion masiva no vuelve a pedir heap (C5). */
     TArray<FPendingSeed> PendingSeeds;
     TArray<FPendingDeathPulse> PendingDeaths;
+
+    /** Embudo de este tick, reducido desde los scratch por chunk (indice = SpeciesId). */
+    TArray<FEcoSpeciesFlow> SpeciesFlow;
+
+    /**
+     * Curvas de respuesta resueltas, UNA por especie y por tick. Se construyen fuera
+     * del ParallelFor: son identicas para todos los individuos de una especie, asi
+     * que rehacerlas por arbol era trabajo repetido, y ademas obligaba a leer el
+     * UObject de especie desde dentro del bucle paralelo.
+     */
+    TArray<EcoVigor::FSpeciesResponses> SpeciesResponses;
+
+    /** Tick en que cada especie llego a cero vivos (-1 = nunca). Instrumentacion:
+        sin esto una extincion solo se detecta por ausencia, y su momento exacto -que
+        es el dato mas informativo del experimento- no queda registrado. */
+    TArray<int64> SpeciesExtinctionTick;
 
     /** Instrumentacion del tick (Eco.Profile). Ver FEcoTickProfile. */
     FEcoTickProfile Profile;

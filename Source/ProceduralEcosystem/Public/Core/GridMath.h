@@ -60,10 +60,47 @@ namespace EcoGrid
         }
     }
 
-    /** Luz disponible tras la sombra acumulada: Q = clamp(FullSun - Sombra, 0). */
+    /**
+     * Luz disponible tras la sombra acumulada: Q = clamp(FullSun - Sombra, 0).
+     *
+     * Resta LINEAL con tope duro. La sigue usando el grid FINO (local a un hero
+     * tree), donde "sombra" es una oclusion geometrica acotada por construccion y
+     * lo que se busca es un gradiente barato para el fototropismo.
+     *
+     * NO la uses para el dosel a escala de paisaje: ver LightFromExtinction.
+     */
     FORCEINLINE float LightFromShadow(float Shadow, float FullSun)
     {
         return FMath::Max(FullSun - Shadow, 0.f);
+    }
+
+    /**
+     * Ley de Beer-Lambert: Q = DiffuseFloor + (FullSun - DiffuseFloor) * exp(-k * LAI).
+     *
+     * POR QUE NO VALE LA RESTA LINEAL PARA EL DOSEL. Con Q = max(FullSun - S, 0),
+     * en cuanto la sombra acumulada supera FullSun la luz se clava en CERO exacto
+     * y se queda ahi. Y con Q = 0 el factor de luz de todas las especies vale
+     * tambien 0 (f_L = 0/(0+Kl)), o sea que la tolerante a la sombra pierde su
+     * ventaja PRECISAMENTE en la sombra profunda, que es el unico sitio donde
+     * deberia ganar. El unico eje de sucesion del modelo se apaga justo donde
+     * tiene que actuar.
+     *
+     * La exponencial es asintotica: nunca llega a 0, asi que el ORDEN entre
+     * especies se conserva a cualquier densidad de dosel. Ademas es la ley fisica
+     * real de atenuacion a traves de un medio absorbente, con LAI (indice de area
+     * foliar acumulado por encima del punto) como espesor optico y k como
+     * coeficiente de extincion (~0.5 en hoja ancha).
+     *
+     * DiffuseFloor es la luz difusa del cielo que llega al sotobosque incluso bajo
+     * dosel cerrado (medida real: 1-5% de la luz de fuera). Sin ese suelo, un
+     * dosel muy denso volveria a producir el cero absoluto que la exponencial
+     * venia a evitar.
+     */
+    FORCEINLINE float LightFromExtinction(float LeafAreaAbove, float FullSun, float ExtinctionK, float DiffuseFloor)
+    {
+        const float Floor = FMath::Clamp(DiffuseFloor, 0.f, FullSun);
+        const float Transmitted = FMath::Exp(-FMath::Max(ExtinctionK, 0.f) * FMath::Max(LeafAreaAbove, 0.f));
+        return Floor + (FullSun - Floor) * Transmitted;
     }
 
     /**

@@ -45,15 +45,21 @@ namespace
         const int32 X0 = FMath::Max(Cx - CellRadius, 0), X1 = FMath::Min(Cx + CellRadius, Geometry.Width - 1);
         const int32 Y0 = FMath::Max(Cy - CellRadius, 0), Y1 = FMath::Min(Cy + CellRadius, Geometry.Height - 1);
 
+        // Las distancias se miden desde la posicion FRACCIONAL del arbol (Gx,Gy)
+        // hasta cada nodo, no desde el nodo que lo contiene. El campo guarda su
+        // valor EN el nodo y se muestrea con bilineal sobre los cuatro vecinos, asi
+        // que anclar el kernel en el nodo contenedor desplazaba el deposito hasta
+        // media celda respecto de donde el arbol lee: consumia de un sitio y media
+        // en otro. Cuesta lo mismo y quita el sesgo.
         auto ForEachCellInDisc = [&](auto&& CellFn)
             {
                 for (int32 Iy = Y0; Iy <= Y1; ++Iy)
                 {
-                    const int32 dy = Iy - Cy;
+                    const double dy = (double)Iy - Gy;
                     const int32 RowBase = Iy * Geometry.Width;
                     for (int32 Ix = X0; Ix <= X1; ++Ix)
                     {
-                        CellFn(Ix - Cx, dy, RowBase + Ix);
+                        CellFn((double)Ix - Gx, dy, RowBase + Ix);
                     }
                 }
             };
@@ -65,9 +71,9 @@ namespace
 
         // --- Pasada 1: peso crudo de cada celda dentro del radio (cacheado) ---
         float WeightSum = 0.f;
-        ForEachCellInDisc([&](int32 dx, int32 dy, int32 /*Cell*/)
+        ForEachCellInDisc([&](double dx, double dy, int32 /*Cell*/)
             {
-                const double CellDistCm = FVector2D(dx, dy).Size() * Geometry.CellSize;
+                const double CellDistCm = FMath::Sqrt(dx * dx + dy * dy) * Geometry.CellSize;
                 const float W = FMath::Max(0.f, 1.f - static_cast<float>(CellDistCm / RadiusCm));
                 Weights.Add(W);
                 WeightSum += W;
@@ -89,7 +95,7 @@ namespace
         // determinismo de la reduccion), sin recomputar ninguna distancia.
         const float InvWeightSum = 1.f / WeightSum;
         int32 WeightIdx = 0;
-        ForEachCellInDisc([&](int32 /*dx*/, int32 /*dy*/, int32 Cell)
+        ForEachCellInDisc([&](double /*dx*/, double /*dy*/, int32 Cell)
             {
                 const float W = Weights[WeightIdx++];
                 if (W <= 0.f) { return; }
@@ -121,10 +127,12 @@ void EcologyRules::DepositKernelSparse(const FField2D& Geometry, TArray<FCellDel
 
 void EcologyRules::ReduceScratchInto(const TArray<FTickScratch>& Contexts,
     TArray<float>& DestWater, TArray<float>& DestNutrient,
-    TArray<FPendingSeed>& OutSeeds, TArray<FPendingDeathPulse>& OutDeathPulses)
+    TArray<FPendingSeed>& OutSeeds, TArray<FPendingDeathPulse>& OutDeathPulses,
+    TArray<FEcoSpeciesFlow>& OutFlow)
 {
     OutSeeds.Reset();
     OutDeathPulses.Reset();
+    for (FEcoSpeciesFlow& F : OutFlow) { F.Reset(); }
 
     // Orden de indice creciente: FIJO, no depende de que hilo fisico ejecuto
     // cada tarea ni de cuantos nucleos tiene la maquina. Y dentro de cada tarea,
@@ -145,5 +153,11 @@ void EcologyRules::ReduceScratchInto(const TArray<FTickScratch>& Contexts,
 
         OutSeeds.Append(Ctx.Seeds);
         OutDeathPulses.Append(Ctx.DeathPulses);
+
+        // El embudo se reduce aqui por el mismo motivo que los deltas: es el punto
+        // donde el scratch privado de cada tarea converge en un unico estado, y
+        // hacerlo con atomicas dentro del ParallelFor romperia la reproducibilidad.
+        const int32 Num = FMath::Min(OutFlow.Num(), Ctx.SpeciesFlow.Num());
+        for (int32 i = 0; i < Num; ++i) { OutFlow[i] += Ctx.SpeciesFlow[i]; }
     }
 }

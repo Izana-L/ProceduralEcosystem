@@ -12,13 +12,32 @@
 
 namespace EcoVigor
 {
+    namespace
+    {
+        /**
+         * Anchura de la rama de EXCESO a partir de la de deficit y del flag de la
+         * especie. Copia unica: agua y nutrientes tienen que decidirlo igual, y
+         * hasta ahora cada Make*Response se limitaba a copiar su booleano.
+         *
+         * Con penalizacion: campana simetrica. Sin ella: rama derecha ANCHA en vez
+         * de recortada, para que la respuesta siga siendo unimodal (ver
+         * UEcosystemSettings::NicheExcessWidthScale). Escala 0 = saturar en 1, el
+         * comportamiento anterior.
+         */
+        float ResolveExcessWidth(float DeficitWidthAbs, bool bPenalizeExcess, float ExcessScale)
+        {
+            if (bPenalizeExcess) { return DeficitWidthAbs; }
+            return (ExcessScale > 0.f) ? DeficitWidthAbs * ExcessScale : 0.f;
+        }
+    }
+
     FResourceResponse MakeWaterResponse(const USpeciesData& Species, const UEcosystemSettings& Settings)
     {
         FResourceResponse R;
         R.Demand = Species.WaterDemand;
         R.OptimumAbs = Species.WaterOptimum * Settings.WaterOutputMax;
         R.WidthAbs = Species.WaterTolerance * Settings.WaterOutputMax;
-        R.bPenalizeExcess = Species.bWaterloggingPenalty;
+        R.ExcessWidthAbs = ResolveExcessWidth(R.WidthAbs, Species.bWaterloggingPenalty, Settings.NicheExcessWidthScale);
         R.bUseNiche = Settings.bUseNicheResponse;
         return R;
     }
@@ -29,20 +48,37 @@ namespace EcoVigor
         R.Demand = Species.NutrientDemand;
         R.OptimumAbs = Species.NutrientOptimum * Settings.NutrientOutputMax;
         R.WidthAbs = Species.NutrientTolerance * Settings.NutrientOutputMax;
-        R.bPenalizeExcess = Species.bNutrientExcessPenalty;
+        R.ExcessWidthAbs = ResolveExcessWidth(R.WidthAbs, Species.bNutrientExcessPenalty, Settings.NicheExcessWidthScale);
         R.bUseNiche = Settings.bUseNicheResponse;
+        return R;
+    }
+
+    FLightResponse MakeLightResponse(const USpeciesData& Species, const UEcosystemSettings& Settings)
+    {
+        FLightResponse R;
+        R.KlMax = Settings.LightHalfSaturationMax;
+        R.ShadeTolerance = Species.ShadeTolerance;
+        R.MaxAssimilation = FMath::Max(
+            1.f - Settings.ShadeToleranceAssimilationCost * Species.ShadeTolerance, KINDA_SMALL_NUMBER);
+        return R;
+    }
+
+    FSpeciesResponses MakeSpeciesResponses(const USpeciesData& Species, const UEcosystemSettings& Settings)
+    {
+        FSpeciesResponses R;
+        R.Light = MakeLightResponse(Species, Settings);
+        R.Water = MakeWaterResponse(Species, Settings);
+        R.Nutrient = MakeNutrientResponse(Species, Settings);
         return R;
     }
 
     void BakeSuitabilityField(
         const FHeightField& Height,
-        const FWaterField& Water,
-        const FNutrientField& Nutrient,
+        const FField2D& Water,
+        const FField2D& Nutrient,
         const FLightFieldCoarse& Light,
-        const USpeciesData& Species,
-        float KlMax,
-        const FResourceResponse& WaterResponse,
-        const FResourceResponse& NutrientResponse,
+        const FSpeciesResponses& Responses,
+        EEcoVigorCombine CombineMode,
         FField2D& OutSuitability,
         TArray<uint8>* OutLimiter,
         const EcoCarbon::FCO2Params* CO2)
@@ -66,14 +102,10 @@ namespace EcoVigor
         const int32 W = Ref.Width;
         const int32 H = Ref.Height;
 
-        // Copia de valores por especie fuera del bucle (evita tocar el UObject
-        // dentro de ParallelFor y ahorra indirecciones).
-        const float ShadeTol = Species.ShadeTolerance;
         // Las respuestas llegan ya construidas (POD por valor): ni una lectura del
         // UObject dentro del ParallelFor, y ademas garantiza que el heatmap evalua
         // literalmente la misma curva que el tick.
-        const FResourceResponse WaterResp = WaterResponse;
-        const FResourceResponse NutrientResp = NutrientResponse;
+        const FSpeciesResponses Resp = Responses;
 
         // Fase 6: copia local de los parametros de CO2 (o desactivado). Se saca
         // del puntero fuera del ParallelFor por el mismo motivo.
@@ -94,18 +126,14 @@ namespace EcoVigor
                     const double Ycm = Ref.NodeWorldY(y);
                     const double Zcm = Height.SampleHeight(Xcm, Ycm); // luz a ras de suelo
 
-                    const float Wv = Water.SampleWater(Xcm, Ycm);
-                    const float Nv = Nutrient.SampleNutrient(Xcm, Ycm);
+                    const float Wv = Water.SampleBilinear(Xcm, Ycm);
+                    const float Nv = Nutrient.SampleBilinear(Xcm, Ycm);
                     const float Q = Light.IsValid()
                         ? Light.SampleLightSmooth(FVector(Xcm, Ycm, Zcm))
                         : FLightFieldCoarse::FullSunlight;
 
-                    const float fL = LightFactor(Q, ShadeTol, KlMax);
-                    const float fW = ResourceFactor(Wv, WaterResp);
-                    const float fN = ResourceFactor(Nv, NutrientResp);
-
                     EEcoLimiter Lim;
-                    float V = CombineWithLimiter(fL, fW, fN, Lim);
+                    float V = EvaluateVigor(Q, Wv, Nv, Resp, CombineMode, Lim);
 
                     // Fase 6: el heatmap tiene que representar EL MISMO numero que
                     // consume el tick, o dejaria de servir para explicar por que el

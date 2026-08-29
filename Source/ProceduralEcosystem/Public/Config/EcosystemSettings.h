@@ -10,6 +10,54 @@ class UStaticMesh;                  // Fase 5 (capa de suelo)
 class UMaterialParameterCollection; // Fase 5 (ciclo estacional) y Fase 6 (viento)
 
 /**
+ * Como se combinan los tres factores de recurso (luz, agua, nutrientes) en el
+ * vigor. Vive aqui, y no en Ecology/Vigor.h, porque tiene que ser un UENUM para
+ * poder configurarse; Vigor.h incluye esta cabecera solo por eso.
+ */
+UENUM(BlueprintType)
+enum class EEcoVigorCombine : uint8
+{
+    /**
+     * Ley del minimo de Liebig: vigor = min(fL, fW, fN). El recurso mas escaso
+     * manda y los otros dos NO pesan nada.
+     *
+     * Es la ley clasica y la que el proyecto usaba en exclusiva, pero tiene una
+     * consecuencia que conviene entender antes de elegirla: la derivada respecto a
+     * los ejes NO limitantes es exactamente cero. Si el factor de luz esta topado
+     * por debajo del pico de las campanas de nicho, el agua y los nutrientes dejan
+     * de intervenir en el resultado por completo, y con ellos desaparece el unico
+     * mecanismo por el que dos especies pueden repartirse el mapa. Dentro de esa
+     * meseta, estar EN el optimo hidrico no vale mas que estar a media anchura de
+     * el: el paisaje se vuelve plano.
+     */
+    Minimum,
+
+    /**
+     * Media geometrica: vigor = (fL * fW * fN)^(1/3). Los tres ejes pesan SIEMPRE,
+     * asi que una desventaja de luz de factor r se puede compensar con una ventaja
+     * de agua x nutrientes del mismo factor, y cada especie vuelve a tener sitios
+     * donde gana.
+     *
+     * Conserva la ESCALA del vigor -tres factores de 0.6 dan 0.6, no 0.216-, que es
+     * lo que permite cambiar de modo sin recalibrar StressVigorThreshold ni los
+     * GrowthRate de los assets.
+     */
+    GeometricMean,
+
+    /**
+     * Hibrido: min() entre los factores de SUMINISTRO y multiplicacion aparte de
+     * las respuestas de nicho. Es la forma defendible conceptualmente -y la de los
+     * modelos de hueco clasicos (JABOWA, FORET, SORTIE)-, porque una campana de
+     * nicho no es una disponibilidad de recurso sino una curva de TOLERANCIA, y
+     * las tolerancias se multiplican.
+     *
+     * Con bUseNicheResponse=false se comporta exactamente como Minimum (no hay
+     * respuestas de tolerancia que separar).
+     */
+    MinSupplyTimesNiche
+};
+
+/**
  * Configuración central del proyecto. Aparece en
  * Project Settings -> Game -> "Procedural Ecosystem".
  *
@@ -165,8 +213,70 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Vigor", meta = (ClampMin = "0"))
     int32 HeatmapSpeciesIndex = 0;
 
+    /**
+     * Kl_max de la curva de luz: fL = Amax * Q/(Q + KlMax*(1-ShadeTolerance)).
+     *
+     * CUIDADO AL CALIBRARLO, porque decide si la luz limita por SOMBRA o por
+     * decreto. Con Q normalizada a [0,1], un KlMax de 1.0 topa fL en 0.50 para una
+     * heliofila incluso a pleno sol y en campo abierto: la luz pasa a ser el minimo
+     * de Liebig en casi todo el mapa aunque no haya una sola copa, y como fL apenas
+     * varia en el espacio (pero si mucho entre especies), el modelo se reduce a un
+     * ranking global de tolerancia y la exclusion competitiva queda garantizada por
+     * la calibracion.
+     *
+     * El valor correcto es el que hace que fL SATURE a pleno sol -de modo que en el
+     * claro limiten agua y nutrientes, que es donde el modelo sabe repartir nicho- y
+     * caiga en picado bajo dosel, que es donde la tolerancia debe decidir. Con
+     * Q en [0,1] eso son ~0.10-0.25. Verificalo con Eco.AuditarEspecies: el bloque
+     * de luz avisa si la varianza espacial de fL es despreciable frente a la
+     * diferencia entre especies.
+     */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0.01"))
-    float LightHalfSaturationMax = 5.f;
+    float LightHalfSaturationMax = 0.12f;
+
+    /**
+     * Como se combinan los tres factores de recurso. Ver EEcoVigorCombine.
+     *
+     * POR QUE Minimum Y NO LA MEDIA GEOMETRICA, que es la opcion que parece mas
+     * atractiva. La media geometrica arregla el problema del reparto de nicho -da
+     * derivada no nula a los tres ejes- pero paga un precio que aqui es fatal:
+     * la raiz cubica DILUYE un factor catastrofico. Con KlMax=0.12 y el umbral de
+     * estres en 0.43, para que la falta de luz llegue a estresar a un arbol que
+     * esta en su optimo hidrico haria falta Q < 0.010, y el piso de luz difusa es
+     * 0.04: la luz NO PODRIA MATAR A NADIE NUNCA. Eso vacia justo el mecanismo que
+     * el arreglo del dosel venia a construir.
+     *
+     * Con la ley del minimo y el KlMax corregido se obtienen las dos cosas: la luz
+     * conserva todo su peso -la pionera entra en estres por debajo de Q=0.089 y la
+     * climacica aguanta hasta Q=0.048, o sea existe una banda de penumbra donde una
+     * sufre y la otra no-, y el reparto de nicho vuelve a estar activo porque f_L a
+     * pleno sol ya no topa por debajo del pico de las campanas: el agua pasa a
+     * limitar a solo 0.36-0.62 anchuras del optimo, frente a las 0.83 de antes.
+     *
+     * Cambia a GeometricMean solo si el limitante sigue saliendo "luz" en mas del
+     * 40% de los arboles A PLENO SOL despues de arreglar el dosel.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia")
+    EEcoVigorCombine VigorCombineMode = EEcoVigorCombine::Minimum;
+
+    /**
+     * Coste de la tolerancia a la sombra: capacidad fotosintetica maxima
+     * Amax(s) = 1 - esto * ShadeTolerance.
+     *
+     * Sin este termino, ShadeTolerance es una ventaja ESTRICTAMENTE MONOTONA y
+     * gratis: sube fL a cualquier nivel de luz -tambien a pleno sol- y no cuesta
+     * nada en ninguna otra ecuacion del proyecto. Un rasgo asi hace que la especie
+     * mas tolerante gane en todas las celdas a la vez, que es exclusion competitiva
+     * por construccion.
+     *
+     * Con el coste, la curva de la pionera y la de la climacica SE CRUZAN: la
+     * pionera rinde mas en el claro y la tolerante en la penumbra, y ninguna gana en
+     * todas partes. Esa es la primera diferencia estabilizadora real del modelo.
+     * Con 0.40 el cruce cae en Q ~ 0.25-0.30. Ponlo a 0 para el comportamiento
+     * anterior (tolerancia sin coste).
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "0.9"))
+    float ShadeToleranceAssimilationCost = 0.40f;
 
     /**
      * true  = agua y nutrientes usan la respuesta UNIMODAL de nicho (optimo y
@@ -187,6 +297,26 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia")
     bool bUseNicheResponse = true;
 
+    /**
+     * Anchura de la rama DERECHA de la campana de nicho (por encima del optimo),
+     * como multiplo de la anchura declarada por la especie, cuando esa especie NO
+     * penaliza el exceso (bWaterloggingPenalty / bNutrientExcessPenalty a false).
+     *
+     * POR QUE NO BASTA CON SATURAR EN 1. Recortando la respuesta a 1 por encima del
+     * optimo, la curva deja de ser unimodal y se vuelve MONOTONA NO DECRECIENTE: en
+     * toda la mitad rica del mapa fN vale 1.0000 exacto para cualquier especie, asi
+     * que un optimo mas bajo es mejor-o-igual en el 100% de las celdas. Es
+     * exactamente el eje monotono gratuito que la respuesta de nicho venia a
+     * eliminar, reintroducido por la puerta de atras. Y en la mitad pobre reparte al
+     * reves: gana la de campana mas ancha.
+     *
+     * Con una rama derecha ANCHA (2-3x) se conserva la idea biologica -"un suelo mas
+     * rico no hace tanto dano como uno pobre"- sin perder la unimodalidad, que es lo
+     * unico que reparte territorio. Ponlo a 0 para volver a la saturacion exacta.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "10"))
+    float NicheExcessWidthScale = 2.5f;
+
     /** S_THRESH: vigor por debajo del cual se acumula estrés. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
     float StressVigorThreshold = 0.3f;
@@ -197,9 +327,71 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float StressRecoveryRate = 0.5f;
 
+    /**
+     * Decaimiento PROPORCIONAL del estres (-k*S por ano). Es el termino que
+     * convierte el estres en una variable de estado graduada.
+     *
+     * Sin el, UpdateStress es un integrador puro con tope y su punto fijo es un
+     * ESCALON: por encima del umbral de vigor el estres cae a 0 exacto y el arbol es
+     * inmortal por ese canal; por debajo sube hasta 1 y muere al 20% anual. No hay
+     * nada en medio. Dos sitios con vigor 0.44 y 0.90 dan identica demografia, y dos
+     * especies separadas por 0.04 de vigor en el mismo pixel quedan separadas por
+     * una diferencia de mortalidad infinita: es exclusion competitiva fabricada por
+     * la forma de la funcion, no por la ecologia.
+     *
+     * Con k > 0 el punto fijo pasa a ser S* = (Umbral - vigor)*Acumulacion/k, una
+     * rampa continua entre 0 y 1, y el vigor vuelve a mapear a mortalidad de forma
+     * suave y monotona. 0 reproduce el comportamiento anterior.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float StressDecayRate = 0.2f;
+
     /** Peso del estrés acumulado en la probabilidad de morir por tick. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float StressMortalityWeight = 0.2f;
+
+    /**
+     * Cuanto REDUCE la longevidad de una especie su peso de mortalidad por estres:
+     *
+     *     peso efectivo = StressMortalityWeight * (LongevityStressRefYears / Longevity)^exponente
+     *
+     * POR QUE HACE FALTA. Los cuatro parametros de estres son GLOBALES e identicos
+     * para todas las especies, mientras que GrowthRate, MaturityAge y MaxBiomass son
+     * rasgos POR ESPECIE. Un impuesto de mortalidad en %/ano igual para todos
+     * penaliza linealmente a quien necesita mas anos para crecer, y la unica
+     * compensacion que el modelo ofrecia a la estrategia lenta -la longevidad- actua
+     * sobre un canal (la mortalidad por edad) que en la practica aporta una fraccion
+     * ridicula del riesgo total. Resultado: "lento" era sinonimo de "peor" y la
+     * estrategia K resultaba matematicamente irrepresentable.
+     *
+     * Con este acoplamiento, una especie longeva paga en velocidad y COBRA en
+     * resiliencia, que es el compromiso real. Exponente 0 lo desactiva.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "2"))
+    float LongevityStressExponent = 0.5f;
+
+    /** Longevidad de referencia del acoplamiento anterior (la especie "media"). */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
+    float LongevityStressRefYears = 300.f;
+
+    /**
+     * Histeresis de la supresion: un arbol suprimido no sale hasta que su estres
+     * baja por debajo de esta FRACCION del umbral de su especie
+     * (USpeciesData::SenescenceStressThreshold, que es el de entrada).
+     *
+     * La supresion por estres es REVERSIBLE, a diferencia de la senescencia por
+     * edad: un arbol suprimido casi deja de crecer pero se recupera si mejoran sus
+     * condiciones. Eso es lo que permite el BANCO DE PLANTULAS -plantulas tolerantes
+     * que esperan decadas en penumbra y heredan el hueco cuando cae el dominante-,
+     * que es el mecanismo de coexistencia de un bosque climacico. Antes las dos
+     * causas compartian un unico estado irreversible, asi que unos pocos anos de
+     * mala racha condenaban de por vida a la plantula y el banco no podia existir.
+     *
+     * Los umbrales de entrada y salida tienen que ser DISTINTOS: con uno solo el
+     * estado parpadearia tick a tick alrededor del corte.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SuppressionExitStressFraction = 0.4f;
 
     /**
      * Semillas que produce al año un adulto YA CRECIDO (media de la Poisson).
@@ -216,6 +408,25 @@ public:
      */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float SeedsPerAdultPerYear = 10.f;
+
+    /**
+     * Biomasa relativa (fraccion de MaxBiomass) a la que un adulto produce la MITAD
+     * de su lluvia de semillas: lambda ~ SeedsPerAdultPerYear * r/(r + esto).
+     *
+     * Con proporcionalidad LINEAL a la biomasa alcanzada -el comportamiento
+     * anterior- la fecundidad realimenta el crecimiento: quien crece algo mas rapido
+     * no solo tiene mas individuos, sino que cada uno produce ademas mas semillas, y
+     * cada semilla mas produce otro arbol que a su vez crece. Una ventaja de
+     * crecimiento moderada se convierte asi en una diferencia de lluvia de semillas
+     * de dos ordenes de magnitud. Y la misma formula ESTERILIZA a la especie
+     * suprimida: un adulto al 5% de su MaxBiomass emitia el 5% de sus semillas y ya
+     * no podia recuperarse aunque la mortalidad se relajase.
+     *
+     * Saturando, la madurez -y no el tamano- es lo que enciende la reproduccion.
+     * 0 desactiva la saturacion (proporcionalidad lineal, como antes).
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float SeedBiomassHalfSaturation = 0.2f;
 
     /** Multiplicador de germinación: prob = VigorEnDestino * GerminationRate. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
@@ -247,6 +458,23 @@ public:
      */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float ConspecificHalfCount = 2.f;
+
+    /**
+     * true = el arbol MADRE no cuenta como conespecifico al evaluar la inhibicion
+     * sobre sus propias semillas.
+     *
+     * Janzen-Connell solo estabiliza si la especie RARA recluta mejor que la comun.
+     * Cuando el radio de dispersion no supera al de inhibicion, toda semilla cae
+     * dentro del circulo de su madre, asi que hasta el ultimo adulto de una especie
+     * al borde de la extincion paga la penalizacion por verse a si mismo. Eso pone
+     * un techo al rescate de la especie rara justo donde mas falta hace.
+     *
+     * (El arreglo completo es ademas separar las dos escalas: SeedDispersalRadius
+     * deberia ser varias veces ConspecificInhibitionRadiusCm para que exista una
+     * fraccion real de semillas que escapan. Eso vive en el asset de especie.)
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia")
+    bool bExcludeMotherFromInhibition = true;
 
     /**
      * true = el radio de exclusion que impone un vecino a una plantula nueva
@@ -286,12 +514,62 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float NutrientDiffusionRate = 0.2f;
 
+    /**
+     * Radio MINIMO del kernel radicular, en celdas del campo de recursos.
+     *
+     * El kernel reparte con un peso lineal 1-d/R, que vale exactamente 0 en los
+     * cuatro vecinos ortogonales cuando el radio no supera el tamano de celda. Con
+     * el RootRadius por defecto (2 m) y celdas de 200 cm, el kernel de un adulto
+     * escribia UNA sola celda: cada arbol se agotaba su propio pozo privado y no
+     * tocaba el de nadie. La competencia subterranea -uno de los dos ejes que
+     * deberian repartir el mapa- no existia como interaccion.
+     *
+     * Con un minimo de 2 celdas el disco alcanza a los vecinos y el recurso vuelve a
+     * ser un bien comun por el que se compite. Ponlo a 0 para el comportamiento
+     * anterior. (La solucion de fondo es calibrar RootRadius contra la separacion
+     * media entre arboles, o bajar el tamano de celda del campo de recursos; esto es
+     * la red de seguridad que impide que la geometria de la rejilla apague un eje
+     * ecologico en silencio.)
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "8"))
+    float MinRootRadiusCells = 2.f;
+
+    /**
+     * Fraccion maxima del recurso presente en una celda que se puede extraer en un
+     * ano. Topa el consumo contra lo que realmente hay.
+     *
+     * Sin tope, un arbol podia "consumir" mas de lo disponible: la deuda negativa
+     * resultante se difundia a las celdas vecinas -bajandoles recurso de verdad- y
+     * despues se destruia al recortar a cero. O sea competencia por interferencia no
+     * intencionada, cuya intensidad crecia con la demanda sin coste alguno para
+     * quien la ejercia (otro eje monotono gratis), y ademas rompia la conservacion
+     * de masa del campo, con lo que ninguna cuenta de balance cuadraba.
+     *
+     * 1.0 permite vaciar la celda entera en un ano; 0 desactiva el tope.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
+    float MaxResourceUptakeFraction = 0.5f;
+
     // --- Ecología (Fase 2): grid de luz grueso (FLightFieldCoarse) ---
     /** Lado del voxel de luz, horizontal y vertical (cm). El nº de capas NO se
         configura: se deriva de la especie mas alta + LightCanopyHeadroomCm +
         LightGroundClearanceCm, porque la rejilla es relativa al terreno. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "50"))
     float LightCoarseCellSizeCm = 400.f;
+
+    /**
+     * Lado VERTICAL del voxel de luz (cm), independiente del horizontal.
+     *
+     * La rejilla siempre tuvo los dos tamanos separados, pero se le pasaba el mismo
+     * valor a ambos. Con 400 cm en vertical, TODA la banda donde ocurre la
+     * competencia de regeneracion -del suelo a los 4 m- cabe en una sola capa: las
+     * plantulas y los arbolillos, que son la mayor parte de la poblacion, no existen
+     * como estratos distintos en el campo de luz. 100-200 cm los devuelve al mapa
+     * sin multiplicar el coste, porque la rejilla es relativa al terreno y solo
+     * cubre la altura del arbol mas alto.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "25"))
+    float LightCoarseCellSizeZCm = 200.f;
 
     /**
      * Cada cuantos ticks se reconstruye el grid de luz grueso (optimizacion C6).
@@ -316,9 +594,43 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
     float CanopyRadiusFraction = 0.30f;
 
-    /** Opacidad de la copa al depositar sombra en el grid de luz [0,1]. */
-    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
-    float CanopyShadowDensity = 0.80f;
+    // LIMPIEZA: aqui vivia CanopyShadowDensity ("opacidad de la copa"), que
+    // alimentaba el deposito de sombra lineal. La sustituye CanopyLeafAreaIndex:
+    // el grid de luz ya no acumula opacidad sino AREA FOLIAR, y la luz sale de
+    // Beer-Lambert (ver FLightFieldCoarse). Si tu DefaultGame.ini conserva la clave
+    // vieja, queda huerfana y no hace nada.
+
+    /**
+     * Espesor vertical de la copa como fraccion de la altura del arbol.
+     *
+     * ANTES ERA 1.0 IMPLICITO -el deposito de sombra recibia la altura entera del
+     * arbol como profundidad de copa- y ese es el origen del bug que dejaba el
+     * sotobosque a plena luz: la sombra se repartia por todo el fuste y se
+     * desvanecia justo en la cota del suelo. Una copa real ocupa el tercio superior.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0.05", ClampMax = "1"))
+    float CanopyDepthFraction = 0.30f;
+
+    /** Indice de area foliar (LAI) de la copa de un adulto, medido en su eje.
+        4.0 es un valor tipico de dosel cerrado de hoja ancha. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float CanopyLeafAreaIndex = 4.f;
+
+    /** k de Beer-Lambert del dosel: Q = piso + (1-piso)*exp(-k*LAI). ~0.5 en hoja ancha. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float LightExtinctionK = 0.5f;
+
+    /**
+     * Luz difusa del cielo que llega al sotobosque aunque el dosel este cerrado
+     * (medida real: 1-5% de la luz exterior).
+     *
+     * No es un detalle cosmetico: sin un suelo, bajo un dosel muy denso la luz
+     * tenderia a 0 y con ella el factor de luz de TODAS las especies por igual, con
+     * lo que la tolerante perderia su ventaja precisamente en la sombra profunda,
+     * que es el unico sitio donde debe ganar.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "0.5"))
+    float DiffuseLightFloor = 0.04f;
 
     /** Biomasa inicial de una plantula, como fraccion de MaxBiomass de su especie. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
@@ -337,6 +649,42 @@ public:
      */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "1"))
     int32 TickChunkGrainSize = 512;
+
+    // --- Perturbacion: claros (la dimension TEMPORAL del nicho) --------------
+    //
+    // Sin perturbacion cada arbol muere por su cuenta y su hueco es de un arbol:
+    // NO HAY CLAROS. Y sin claros no hay sucesion, porque no existe la fase de
+    // alta luz en la que la pionera es la mejor. El bucle que cierra la
+    // coexistencia es: claro -> luz alta -> gana la pionera -> cierra el dosel ->
+    // la pionera ya no recluta bajo su propia sombra pero la tolerante si ->
+    // banco de plantulas -> cae el dominante -> la tolerante hereda -> claro.
+    //
+    // ARRANCA DESACTIVADO (tasa 0) a proposito: es el parametro mas sensible de
+    // todo el modelo -demasiado frecuente y gana siempre la pionera, demasiado
+    // raro y gana siempre la climacica-, asi que hay que activarlo y barrerlo
+    // DESPUES de validar que el banco de plantulas funciona. Un claro sin banco
+    // de plantulas solo beneficia a quien tiene mas semillas: amplifica la
+    // exclusion en vez de corregirla.
+
+    /** Fraccion del area del mapa perturbada al ano. 0.007 ~ rotacion de 140 anos. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia|Perturbacion", meta = (ClampMin = "0", ClampMax = "0.2"))
+    float DisturbanceRatePerYear = 0.f;
+
+    /** Area minima de un claro (m2): la caida de un solo dominante. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia|Perturbacion", meta = (ClampMin = "1"))
+    float DisturbanceMinAreaM2 = 50.f;
+
+    /** Area maxima de un claro (m2): el temporal raro de la cola de la distribucion. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia|Perturbacion", meta = (ClampMin = "1"))
+    float DisturbanceMaxAreaM2 = 5000.f;
+
+    /** Exponente de la ley potencia de tamanos. Mas alto = mas claros pequenos. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia|Perturbacion", meta = (ClampMin = "1", ClampMax = "5"))
+    float DisturbanceAreaExponent = 2.f;
+
+    /** Probabilidad de que un arbol dentro del claro caiga. <1 deja arboles residuales. */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia|Perturbacion", meta = (ClampMin = "0", ClampMax = "1"))
+    float DisturbanceMortality = 0.9f;
 
     // ================================================================
     // --- Render y LOD (Fase 4): el puente de escala ---

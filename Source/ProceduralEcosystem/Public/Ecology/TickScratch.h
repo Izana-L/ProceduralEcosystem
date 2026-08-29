@@ -8,6 +8,66 @@ struct FPendingSeed
     FVector Position = FVector::ZeroVector; // mundo, cm
     uint16  SpeciesId = 0;
     uint32  RngSeed = 1; // stream del hijo, ya derivado
+
+    /**
+     * StableId del arbol MADRE, para poder excluirlo del conteo de Janzen-Connell.
+     *
+     * Sin el, cuando el radio de dispersion no supera al de inhibicion toda semilla
+     * cae dentro del circulo de su propia madre, asi que hasta el ultimo adulto de
+     * una especie al borde de la extincion paga la penalizacion por verse a si
+     * mismo. Eso pone un techo al rescate de la especie rara justo donde el
+     * mecanismo tendria que ser mas fuerte.
+     */
+    uint32  ParentStableId = 0;
+};
+
+/**
+ * Contadores por especie de UN tick: el EMBUDO de reclutamiento y el reparto de
+ * causas de muerte.
+ *
+ * POR QUE HACEN FALTA. El reclutamiento pasa por cuatro filtros multiplicativos
+ * (fuera de mapa, espaciado, luz, Janzen-Connell) y cualquiera de ellos puede
+ * estar aportando un factor 0 o un factor 100 sin que ningun log lo delate: con
+ * solo el recuento de poblacion se ve QUE especie se hunde, no si es porque
+ * recluta poco, porque se le mueren las plantulas o porque no llega a madurez
+ * -que son tres arreglos distintos-. Es el equivalente para el reclutamiento de
+ * lo que Agents.Limiter hizo por el crecimiento.
+ *
+ * Se acumulan por chunk y se reducen en orden fijo, NUNCA con atomicas: si el
+ * resultado dependiera del orden de los hilos, el tick dejaria de ser
+ * reproducible y con el todo el diseno experimental.
+ */
+struct FEcoSpeciesFlow
+{
+    // Embudo de reclutamiento
+    int32 SeedsEmitted = 0;
+    int32 RejectedOffMap = 0;
+    int32 RejectedSpacing = 0;
+    int32 RejectedLight = 0;
+    int32 Germinated = 0;
+
+    /** Suma de factores Janzen-Connell evaluados, y cuantos: su cociente es la media. */
+    float JanzenConnellSum = 0.f;
+    int32 JanzenConnellCount = 0;
+
+    // Muertes, atribuidas al canal cuyo riesgo DOMINABA en el momento de morir.
+    // No es una causa en sentido estricto -los dos canales actuan a la vez- pero
+    // responde a la pregunta que importa: si el canal de edad no aparece nunca,
+    // la longevidad no esta comprando nada y la estrategia K no puede existir.
+    int32 DeathsByAge = 0;
+    int32 DeathsByCondition = 0;
+
+    void Reset() { *this = FEcoSpeciesFlow(); }
+
+    FEcoSpeciesFlow& operator+=(const FEcoSpeciesFlow& O)
+    {
+        SeedsEmitted += O.SeedsEmitted;         RejectedOffMap += O.RejectedOffMap;
+        RejectedSpacing += O.RejectedSpacing;   RejectedLight += O.RejectedLight;
+        Germinated += O.Germinated;
+        JanzenConnellSum += O.JanzenConnellSum; JanzenConnellCount += O.JanzenConnellCount;
+        DeathsByAge += O.DeathsByAge;           DeathsByCondition += O.DeathsByCondition;
+        return *this;
+    }
 };
 
 /** Pulso de nutrientes pendiente de aplicar: un arbol que ha muerto este tick. */
@@ -67,13 +127,19 @@ struct FTickScratch
     TArray<FPendingSeed> Seeds;
     TArray<FPendingDeathPulse> DeathPulses;
 
+    /** Embudo por especie de esta tarea (indice = SpeciesId). */
+    TArray<FEcoSpeciesFlow> SpeciesFlow;
+
     /** Vacia los buffers SIN liberar memoria: listo para el siguiente tick. */
-    void ResetForNextTick()
+    void ResetForNextTick(int32 NumSpecies)
     {
         WaterDeltas.Reset();
         NutrientDeltas.Reset();
         Seeds.Reset();
         DeathPulses.Reset();
+
+        SpeciesFlow.SetNum(NumSpecies, EAllowShrinking::No);
+        for (FEcoSpeciesFlow& F : SpeciesFlow) { F.Reset(); }
     }
 
     /**

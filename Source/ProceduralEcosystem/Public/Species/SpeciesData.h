@@ -682,6 +682,32 @@ public:
     // hay MUCHOS mas senescentes vivos a la vez, y a 0.4 dominarian la lluvia de
     // semillas ellos solos.
 
+    // --- Supresion por estres: la mitad que faltaba del compromiso r/K --------
+
+    /**
+     * Probabilidad ANUAL de morir de un arbol SUPRIMIDO (declive por estres), en
+     * lugar del canal de estres general.
+     *
+     * ES EL RASGO QUE HACE VIABLE LA ESTRATEGIA CLIMACICA. Hasta ahora ningun rasgo
+     * de especie podia REDUCIR el riesgo de un arbol en apuros -el unico
+     * multiplicador existente, SenescentMortalityMultiplier, solo lo amplifica-, asi
+     * que una especie lenta pagaba el mismo impuesto anual que una rapida durante
+     * muchos mas anos y no tenia con que compensarlo. Aqui una tolerante paga en
+     * velocidad y cobra en aguante: con 0.03 sobrevive ~33 anos en penumbra, tiempo
+     * de sobra para esperar a que se abra un claro; una pionera con 0.30 aguanta ~3
+     * y desaparece del sotobosque, que es exactamente lo que hace en el bosque real.
+     *
+     * Valores de referencia: pionera 0.30, intermedia 0.10, climacica 0.03.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Supresion", meta = (ClampMin = "0", ClampMax = "1"))
+    float SuppressedMortalityPerYear = 0.15f;
+
+    /** Multiplicador del crecimiento mientras el arbol esta suprimido (~0 = parado).
+        Bajo pero NO cero: un suprimido que no crece nada tampoco puede aprovechar
+        una mejora parcial de luz antes de que llegue a abrirse el claro. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Fase5|Supresion", meta = (ClampMin = "0", ClampMax = "1"))
+    float SuppressedGrowthScale = 0.1f;
+
     // ================================================================
     // --- Fase 6: viento (doc. 6.1) ---
     // ================================================================

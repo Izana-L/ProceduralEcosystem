@@ -178,6 +178,14 @@ enum class EEcoRngStream : uint8
     Mortality,
     Morphology,
     Debug,   // herramientas de depuración: NO perturba los streams de la simulación
+
+    /** Perturbacion (claros). Stream propio para que activar o desactivar el regimen
+        de claros no desplace los demas: asi una corrida con perturbacion y otra sin
+        ella parten del MISMO bosque y la comparacion mide solo el efecto buscado.
+        Va al final, despues de Debug, para no cambiar la semilla derivada de los
+        streams que ya existian. */
+    Disturbance,
+
     Count UMETA(Hidden)
 };
 

@@ -12,11 +12,41 @@ enum class ETreeState : uint8
 {
     Sapling,    // plantula: recien germinado, biomasa baja
     Mature,     // adulto: puede reproducirse (Age > SpeciesData->MaturityAge)
-    Senescent,  // declive (Fase 5): casi deja de crecer, se reproduce menos y su
-    // probabilidad de morir se multiplica. Es IRREVERSIBLE: una vez
-    // dentro no se vuelve a Mature aunque baje el estres.
+
+    /**
+     * Declive por EDAD: casi deja de crecer, se reproduce menos y su probabilidad
+     * de morir se multiplica. IRREVERSIBLE, y con razon: el envejecimiento no se
+     * revierte.
+     */
+    Senescent,
+
+    /**
+     * Declive por ESTRES: crecimiento casi detenido, pero REVERSIBLE (con
+     * histeresis) y con un hazard propio de la especie que puede ser MENOR que el
+     * normal.
+     *
+     * Es el estado que hace posible el BANCO DE PLANTULAS: plantulas de una especie
+     * tolerante que sobreviven decadas suprimidas bajo el dosel y heredan el hueco
+     * cuando cae el dominante. Antes compartia estado con la senescencia por edad y
+     * heredaba su irreversibilidad, asi que unos pocos anos de mala racha marcaban
+     * de por vida a una plantula que podia vivir siglos: el mecanismo de
+     * coexistencia de un bosque climacico estaba prohibido por construccion.
+     */
+    Suppressed,
+
     Dead        // marcado para compactar; no se dibuja ni se procesa
 };
+
+/** true si el arbol cuenta como vivo (todo menos Dead). Copia unica del criterio. */
+FORCEINLINE bool IsAliveState(ETreeState State) { return State != ETreeState::Dead; }
+
+/** true si el arbol ha alcanzado la madurez reproductiva. Un suprimido SIGUE
+    reproduciendose (con menos fuerza): cortarlo a cero le quitaria a la especie
+    tolerante la unica via por la que compensa su lentitud. */
+FORCEINLINE bool IsReproductiveState(ETreeState State)
+{
+    return State == ETreeState::Mature || State == ETreeState::Senescent || State == ETreeState::Suppressed;
+}
 
 /**
  * Poblacion de arboles en structure-of-arrays (doc. Fase 2, 2.1).
