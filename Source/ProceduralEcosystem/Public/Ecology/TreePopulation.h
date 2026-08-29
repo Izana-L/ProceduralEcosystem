@@ -50,6 +50,21 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     TArray<uint32>  RngState;   // stream RNG propio del arbol -> determinismo bajo paralelismo
     TArray<uint32>  StableId;
 
+    // --- Instrumentacion (no la consume la simulacion) ---------------------
+    // La simulacion NO lee estos dos arrays: solo los escribe el tick y los leen
+    // Eco.Demografia y Eco.Demografia.CSV. Estan aqui, dentro del SoA, y no en un
+    // mapa aparte, porque tienen que sobrevivir a CompactDead() emparejados con su
+    // arbol; cualquier estructura paralela se descuadraria en la primera muerte.
+
+    /** Vigor de Liebig del ultimo tick, [0..1]. Sin esto solo se puede ver QUE
+        especie se muere, nunca POR QUE. */
+    TArray<float>   Vigor;
+
+    /** Recurso limitante del ultimo tick (EEcoLimiter: 0=luz, 1=agua, 2=nutrientes).
+        Sale gratis: el tick ya calculaba el minimo de los tres factores y tiraba el
+        argmin, porque llamaba a EcoVigor::Combine en vez de a CombineWithLimiter. */
+    TArray<uint8>   Limiter;
+
     /** Siguiente id a repartir. Se copia en CopyFrom para que los ids de la
         germinacion sobre el buffer de escritura sean deterministas. */
     uint32 NextStableId = 1;
@@ -58,7 +73,7 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
      * =====================================================================
      *  EL UNICO SITIO DONDE SE ENUMERAN LOS ARRAYS DEL SoA
      * =====================================================================
-     * Invoca Visit(Array) sobre los NUEVE arrays paralelos, en orden fijo.
+     * Invoca Visit(Array) sobre los ONCE arrays paralelos, en orden fijo.
      *
      * POR QUE: la lista de campos estaba escrita a mano en SEIS sitios
      * distintos -Reserve, el bloque de copia de CompactDead, sus SetNum, su
@@ -77,7 +92,7 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     {
         Visit(Position);  Visit(SpeciesId); Visit(Age);   Visit(Biomass);
         Visit(Height);    Visit(Stress);    Visit(State); Visit(RngState);
-        Visit(StableId);
+        Visit(StableId);  Visit(Vigor);     Visit(Limiter);
     }
 
     template <typename FVisit>
@@ -85,7 +100,7 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
     {
         Visit(Position);  Visit(SpeciesId); Visit(Age);   Visit(Biomass);
         Visit(Height);    Visit(Stress);    Visit(State); Visit(RngState);
-        Visit(StableId);
+        Visit(StableId);  Visit(Vigor);     Visit(Limiter);
     }
 
     /** Igual, pero emparejando los arrays de DOS poblaciones (destino, origen).
@@ -97,13 +112,14 @@ struct PROCEDURALECOSYSTEM_API FTreePopulation
         Visit(Dst.Age,       Src.Age);       Visit(Dst.Biomass,   Src.Biomass);
         Visit(Dst.Height,    Src.Height);    Visit(Dst.Stress,    Src.Stress);
         Visit(Dst.State,     Src.State);     Visit(Dst.RngState,  Src.RngState);
-        Visit(Dst.StableId,  Src.StableId);
+        Visit(Dst.StableId,  Src.StableId);  Visit(Dst.Vigor,     Src.Vigor);
+        Visit(Dst.Limiter,   Src.Limiter);
     }
     /** Numero de arboles actualmente en el array (vivos + muertos sin compactar). */
     int32 Num() const { return Position.Num(); }
 
     /**
-     * true si los NUEVE arrays paralelos tienen exactamente ExpectedNum
+     * true si los ONCE arrays paralelos tienen exactamente ExpectedNum
      * elementos. Es la invariante del SoA: la comprueba CompactDead y la usa
      * LoadState para rechazar un bake descuadrado ANTES de pisar el estado vivo
      * (antes esa validacion era otra lista de campos escrita a mano).

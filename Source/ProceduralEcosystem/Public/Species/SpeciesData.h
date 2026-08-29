@@ -156,13 +156,67 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0", ClampMax = "1"))
     float ShadeTolerance = 0.5f;
 
-    /** Divisor en el factor de agua (W/WaterDemand): debe ser > 0. */
+    /**
+     * CONSUMO de agua por unidad de biomasa y año. Debe ser > 0.
+     *
+     * OJO AL CAMBIO DE SIGNIFICADO: con bUseNicheResponse activo (por defecto)
+     * este numero ya NO entra en el vigor, solo en cuanta agua retira el arbol
+     * del pozo. La idoneidad la deciden WaterOptimum/WaterTolerance.
+     *
+     * La separacion es el arreglo de un problema real: mientras el mismo valor
+     * era divisor de la respuesta Y multiplicador del consumo, bajarlo daba a la
+     * especie DOS ventajas a la vez (mejor factor de agua y menos gasto) sin
+     * ningun coste, y un eje asi hace la coexistencia imposible.
+     *
+     * Con bUseNicheResponse=false vuelve a ser el divisor Monod de siempre.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0.001"))
     float WaterDemand = 1.f;
 
-    /** Divisor en el factor de nutrientes (N/NutrientDemand): debe ser > 0. */
+    /** Consumo de nutrientes por unidad de biomasa y año. Misma nota que WaterDemand. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0.001"))
     float NutrientDemand = 1.f;
+
+    // --- Nicho de recurso: donde esta MEJOR esta especie (no cuanto consume) ---
+    // Estos cuatro valores son FRACCIONES [0..1] del maximo del campo
+    // (WaterOutputMax / NutrientOutputMax de los settings), no valores absolutos:
+    // asi, cambiar el rango de salida de un campo no invalida en silencio la
+    // calibracion de todas las especies.
+    //
+    // Son la palanca de REPARTO DE NICHO. Dos especies con optimos separados se
+    // reparten el mapa (una gana en vaguada, otra en cresta) y coexisten sin
+    // necesidad de que sus numeros esten empatados a mano.
+
+    /** Humedad OPTIMA, como fraccion de WaterOutputMax. 0.2 = ladera seca,
+        0.8 = fondo de barranco. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho", meta = (ClampMin = "0", ClampMax = "1"))
+    float WaterOptimum = 0.55f;
+
+    /** Anchura de la campana de humedad, como fraccion de WaterOutputMax. A una
+        anchura del optimo el factor cae a 0.37. Estrecho = especialista;
+        ancho = generalista (que es una ventaja: compensala en otro eje). */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho", meta = (ClampMin = "0.02", ClampMax = "2"))
+    float WaterTolerance = 0.35f;
+
+    /** true = el EXCESO de agua tambien penaliza (encharcamiento, anoxia).
+        Dejarlo activo es lo que impide que la especie de vaguada colonice
+        ademas la cresta y vuelva a barrer el mapa entero. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho")
+    bool bWaterloggingPenalty = true;
+
+    /** Fertilidad optima, como fraccion de NutrientOutputMax. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho", meta = (ClampMin = "0", ClampMax = "1"))
+    float NutrientOptimum = 0.55f;
+
+    /** Anchura de la campana de fertilidad, como fraccion de NutrientOutputMax. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho", meta = (ClampMin = "0.02", ClampMax = "2"))
+    float NutrientTolerance = 0.40f;
+
+    /** false (por defecto) = por encima del optimo la respuesta se queda en 1.
+        Un suelo mas rico de lo que la especie necesita no le hace daño, a
+        diferencia del encharcamiento. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos|Nicho")
+    bool bNutrientExcessPenalty = false;
 
     /** Radio de raíz en metros; escala con la biomasa en el consumo (Fase 2). */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Recursos", meta = (ClampMin = "0"))
@@ -171,6 +225,53 @@ public:
     // --- Dispersión (Fase 2) ---
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Dispersión", meta = (ClampMin = "0"))
     float SeedDispersalRadius = 15.f; // m
+
+    // --- Fecundidad y establecimiento: el compromiso r/K ---------------------
+    // Estos dos van EN SENTIDOS OPUESTOS a proposito. Son el tercer compromiso
+    // clasico de la dinamica forestal (tras tolerancia<->crecimiento y
+    // crecimiento<->longevidad), y el modelo lo necesita explicito porque nada
+    // mas se lo impone: una especie con SeedRateScale 3 y GerminationRateScale
+    // 1.5 a la vez es una estrategia dominante y se lleva el bosque.
+    //
+    // Pionera: mucha semilla pequeña que arraiga mal  -> 2.5 / 0.6
+    // Climax:  poca semilla grande que arraiga bien   -> 0.5 / 1.6
+
+    /** Multiplicador de fecundidad de la especie sobre SeedsPerAdultPerYear. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Dispersión", meta = (ClampMin = "0.01", ClampMax = "10"))
+    float SeedRateScale = 1.f;
+
+    /** Multiplicador de la probabilidad de germinar, sobre GerminationRate
+        global: la reserva de una semilla grande le da mas margen para arraigar. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Dispersión", meta = (ClampMin = "0.01", ClampMax = "10"))
+    float GerminationRateScale = 1.f;
+
+    /**
+     * NICHO DE REGENERACION: luz minima (fraccion de sol pleno) que necesita una
+     * semilla de esta especie para germinar. Sustituye al valor global que habia
+     * en UEcosystemSettings.
+     *
+     * Es, con diferencia, el parametro mas importante para que convivan una
+     * pionera y una climax, y por una razon que no tiene que ver con los
+     * recursos sino con la ARITMETICA de la ocupacion de huecos.
+     *
+     * Con un umbral global, todo el reclutamiento ocurre en claros, y el claro se
+     * lo lleva quien mande mas semillas. Una especie abundante manda mil veces
+     * mas semillas que una rara, asi que se queda todos los huecos y la rareza se
+     * vuelve una trampa de la que no se sale: no es competencia, es un efecto de
+     * prioridad. Ningun ajuste de vigor, de demanda ni de mortalidad lo corrige,
+     * porque todos actuan DESPUES de decidir quien ocupa el sitio.
+     *
+     * Con el umbral por especie, el sotobosque en penumbra pasa a ser territorio
+     * donde la pionera NO PUEDE germinar en absoluto: sus mil semillas valen cero
+     * alli. La tolerante acumula debajo un banco de plantulas suprimidas y, cuando
+     * el arbol de dosel muere, la que hereda el hueco es la que YA ESTABA, sin
+     * pasar por ninguna loteria de semillas. Eso es la "regeneracion avanzada"
+     * de la dinamica forestal real, y es lo que rompe el bloqueo.
+     *
+     * Pionera heliofila 0.5-0.6; intermedia 0.3-0.4; climax de sotobosque 0.05-0.15.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Dispersión", meta = (ClampMin = "0", ClampMax = "1"))
+    float MinLightForGermination = 0.5f;
     // ================================================================
     // --- Morfología SCA (Fase 3): geometría por-árbol ---
     // ================================================================

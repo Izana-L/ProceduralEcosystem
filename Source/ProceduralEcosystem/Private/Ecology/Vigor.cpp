@@ -6,11 +6,34 @@
 #include "Terrain/NutrientField.h"
 #include "Terrain/LightFieldCoarse.h"
 #include "Species/SpeciesData.h"
+#include "Config/EcosystemSettings.h"
 
 #include "Async/ParallelFor.h"
 
 namespace EcoVigor
 {
+    FResourceResponse MakeWaterResponse(const USpeciesData& Species, const UEcosystemSettings& Settings)
+    {
+        FResourceResponse R;
+        R.Demand = Species.WaterDemand;
+        R.OptimumAbs = Species.WaterOptimum * Settings.WaterOutputMax;
+        R.WidthAbs = Species.WaterTolerance * Settings.WaterOutputMax;
+        R.bPenalizeExcess = Species.bWaterloggingPenalty;
+        R.bUseNiche = Settings.bUseNicheResponse;
+        return R;
+    }
+
+    FResourceResponse MakeNutrientResponse(const USpeciesData& Species, const UEcosystemSettings& Settings)
+    {
+        FResourceResponse R;
+        R.Demand = Species.NutrientDemand;
+        R.OptimumAbs = Species.NutrientOptimum * Settings.NutrientOutputMax;
+        R.WidthAbs = Species.NutrientTolerance * Settings.NutrientOutputMax;
+        R.bPenalizeExcess = Species.bNutrientExcessPenalty;
+        R.bUseNiche = Settings.bUseNicheResponse;
+        return R;
+    }
+
     void BakeSuitabilityField(
         const FHeightField& Height,
         const FWaterField& Water,
@@ -18,6 +41,8 @@ namespace EcoVigor
         const FLightFieldCoarse& Light,
         const USpeciesData& Species,
         float KlMax,
+        const FResourceResponse& WaterResponse,
+        const FResourceResponse& NutrientResponse,
         FField2D& OutSuitability,
         TArray<uint8>* OutLimiter,
         const EcoCarbon::FCO2Params* CO2)
@@ -44,8 +69,11 @@ namespace EcoVigor
         // Copia de valores por especie fuera del bucle (evita tocar el UObject
         // dentro de ParallelFor y ahorra indirecciones).
         const float ShadeTol = Species.ShadeTolerance;
-        const float WaterDem = Species.WaterDemand;
-        const float NutriDem = Species.NutrientDemand;
+        // Las respuestas llegan ya construidas (POD por valor): ni una lectura del
+        // UObject dentro del ParallelFor, y ademas garantiza que el heatmap evalua
+        // literalmente la misma curva que el tick.
+        const FResourceResponse WaterResp = WaterResponse;
+        const FResourceResponse NutrientResp = NutrientResponse;
 
         // Fase 6: copia local de los parametros de CO2 (o desactivado). Se saca
         // del puntero fuera del ParallelFor por el mismo motivo.
@@ -73,8 +101,8 @@ namespace EcoVigor
                         : FLightFieldCoarse::FullSunlight;
 
                     const float fL = LightFactor(Q, ShadeTol, KlMax);
-                    const float fW = WaterFactor(Wv, WaterDem);
-                    const float fN = NutrientFactor(Nv, NutriDem);
+                    const float fW = ResourceFactor(Wv, WaterResp);
+                    const float fN = ResourceFactor(Nv, NutrientResp);
 
                     EEcoLimiter Lim;
                     float V = CombineWithLimiter(fL, fW, fN, Lim);

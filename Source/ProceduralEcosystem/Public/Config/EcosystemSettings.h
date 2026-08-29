@@ -168,6 +168,25 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0.01"))
     float LightHalfSaturationMax = 5.f;
 
+    /**
+     * true  = agua y nutrientes usan la respuesta UNIMODAL de nicho (optimo y
+     *         anchura por especie, ver USpeciesData::WaterOptimum).
+     * false = respuesta Monod monotona anterior (mas recurso siempre es mejor).
+     *
+     * Es un interruptor A/B deliberado: la curva Monod hace IMPOSIBLE que dos
+     * especies se repartan un gradiente de recurso -solo cambia cuanto les gusta
+     * el sitio bueno, no cual es su sitio-, asi que con ella la exclusion
+     * competitiva esta garantizada por la FORMA de la funcion y no por los
+     * numeros. Dejarlo en false reproduce bit a bit el comportamiento anterior.
+     *
+     * OJO: con true, WaterDemand y NutrientDemand dejan de intervenir en el vigor
+     * y se quedan SOLO como tasa de consumo. Esa separacion es intencionada: que
+     * el mismo numero fuera divisor de la respuesta Y multiplicador del consumo
+     * daba a la especie poco exigente una ventaja doble sin ningun coste.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia")
+    bool bUseNicheResponse = true;
+
     /** S_THRESH: vigor por debajo del cual se acumula estrés. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
     float StressVigorThreshold = 0.3f;
@@ -182,17 +201,73 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
     float StressMortalityWeight = 0.2f;
 
-    /** Semillas por unidad de biomasa y año simulado (media de la Poisson). */
+    /**
+     * Semillas que produce al año un adulto YA CRECIDO (media de la Poisson).
+     * La lluvia real de un arbol escala con su biomasa RELATIVA, asi que un
+     * arbol a media biomasa produce la mitad.
+     *
+     * SUSTITUYE a SeedRatePerBiomass, que iba con la biomasa ABSOLUTA y
+     * convertia MaxBiomass en un multiplicador de fecundidad accidental (ver
+     * EcologyRules::ComputeSeedCount). El renombre es deliberado: si tu
+     * DefaultGame.ini conserva la clave vieja, queda huerfana y esta toma su
+     * valor por defecto, que es el equivalente correcto de la calibracion
+     * anterior (0.1 semillas x 100 de biomasa = 10 al año). O sea que olvidarse
+     * de actualizar el .ini no rompe nada.
+     */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
-    float SeedRatePerBiomass = 0.1f;
+    float SeedsPerAdultPerYear = 10.f;
 
     /** Multiplicador de germinación: prob = VigorEnDestino * GerminationRate. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0", ClampMax = "1"))
     float GerminationRate = 0.5f;
 
-    /** Luz mínima en el punto de caída para considerarlo "sitio seguro". */
+    // LIMPIEZA: MinLightForGermination vivia aqui y era GLOBAL. Ahora es un campo
+    // por especie (USpeciesData::MinLightForGermination), porque siendo global
+    // obligaba a que TODO el reclutamiento pasara por claros y convertia la
+    // ocupacion de huecos en una loteria que gana quien mas semillas manda. Si tu
+    // DefaultGame.ini conserva la clave, queda huerfana y no hace nada.
+
+    /**
+     * Radio (cm) en el que una semilla cuenta los adultos de SU MISMA especie
+     * para la inhibicion de Janzen-Connell. 0 = desactivado.
+     */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
-    float MinLightForGermination = 0.5f;
+    float ConspecificInhibitionRadiusCm = 1500.f;
+
+    /**
+     * Nº de adultos conespecificos dentro de ese radio que REDUCE A LA MITAD la
+     * probabilidad de germinar (Janzen-Connell: los patogenos y herbivoros
+     * especializados se acumulan bajo los adultos de su hospedador).
+     *
+     * Mas pequeno = inhibicion mas fuerte. 0 = desactivado. Es un estabilizador:
+     * penaliza a la especie que domina LOCALMENTE, asi que empuja hacia la
+     * mezcla. Ojo: por si solo no vence a una diferencia de mil a uno en lluvia
+     * de semillas (la correccion maxima que puede dar es del orden de la razon de
+     * densidades locales); su sitio es afinar el reparto, no romper un bloqueo.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))
+    float ConspecificHalfCount = 2.f;
+
+    /**
+     * true = el radio de exclusion que impone un vecino a una plantula nueva
+     * escala con el TAMANO de ese vecino (MinGerminationSpacingCm x su fraccion
+     * de altura adulta), en vez de ser el mismo para un arbol de dosel que para
+     * un plantón.
+     *
+     * Con el radio fijo, unos pocos miles de adultos cubren el mapa entero de
+     * discos de exclusion -a 5 m y 16.000 arboles la cobertura pasa del 120%- y
+     * el sotobosque deja de existir: no se puede germinar en ningun sitio salvo
+     * en el hueco que acaba de dejar un muerto. Eso elimina el banco de plantulas
+     * suprimidas, que es justo el mecanismo por el que una especie tolerante
+     * hereda los huecos sin competir por semilla.
+     *
+     * Escalado, un adulto sigue apartando a 5 m pero una plantula del 1% de
+     * biomasa solo aparta ~1 m, asi que el sotobosque vuelve a ser habitable. La
+     * densidad la controlan entonces la luz y los recursos -que es donde debe
+     * estar-, no una regla geometrica ciega a la especie.
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Ecologia")
+    bool bSpacingScalesWithSize = true;
 
     /** Fracción de la biomasa que vuelve como pulso de nutrientes al morir. */
     UPROPERTY(EditAnywhere, config, Category = "Ecologia", meta = (ClampMin = "0"))

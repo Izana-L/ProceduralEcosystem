@@ -147,11 +147,30 @@ namespace EcologyRules
         return bSenescent ? FMath::Clamp(pDeath * FMath::Max(1.f, Multiplier), 0.f, 1.f) : pDeath;
     }
 
-    /** Numero de semillas emitidas este tick (Poisson de media SeedRate*Biomass*dt). */
-    FORCEINLINE int32 ComputeSeedCount(float SeedRatePerBiomass, float Biomass, float DtYears,
-        uint32& RngState)
+    /**
+     * Numero de semillas emitidas este tick: Poisson de media
+     * SeedsPerAdultPerYear * (Biomass/MaxBiomass) * dt.
+     *
+     * OJO A LA BIOMASA RELATIVA, que es un cambio de fondo y no una
+     * normalizacion cosmetica. Con la biomasa ABSOLUTA, MaxBiomass se
+     * convertia en un multiplicador de fecundidad accidental: una especie de
+     * MaxBiomass 150 producia 3.75 veces mas semillas que una de 40 con el
+     * mismo parametro de siembra, solo por ser mas grande. Como MaxBiomass ya
+     * daba ademas mas altura (o sea mas sombra sobre los vecinos), acababa
+     * siendo un eje monotono "mas es mejor" con tres ventajas encadenadas, y
+     * eso anula cualquier compromiso que metas entre rasgos.
+     *
+     * En relativo, el parametro significa "semillas al año de un adulto ya
+     * crecido", igual para todas las especies, y la fecundidad vuelve a ser un
+     * RASGO explicito (USpeciesData::SeedRateScale) que puedes compensar en
+     * otro eje.
+     */
+    FORCEINLINE int32 ComputeSeedCount(float SeedsPerAdultPerYear, float Biomass, float MaxBiomass,
+        float DtYears, uint32& RngState)
     {
-        const float Lambda = SeedRatePerBiomass * Biomass * DtYears;
+        const float RelativeBiomass =
+            FMath::Clamp(Biomass / FMath::Max(MaxBiomass, KINDA_SMALL_NUMBER), 0.f, 1.f);
+        const float Lambda = SeedsPerAdultPerYear * RelativeBiomass * DtYears;
         return EcoRand::PoissonInt(RngState, Lambda);
     }
 
@@ -169,7 +188,26 @@ namespace EcologyRules
         return FMath::Clamp(VigorAtSite * GerminationRate, 0.f, 1.f);
     }
 
-    /** "Sitio seguro": la luz en el punto de caida debe superar el minimo global. */
+    /**
+     * Inhibicion de Janzen-Connell: la probabilidad de arraigar se divide por dos
+     * cada HalfCount adultos conespecificos que haya alrededor.
+     *
+     *     factor = 0.5 ^ (Conspecifics / HalfCount)
+     *
+     * Decae exponencialmente y no satura, a diferencia de 1/(1+k*n): con la forma
+     * hiperbolica la correccion maxima esta acotada por la razon de densidades
+     * locales por mucho que se suba k, y eso deja corto el arreglo cuando una
+     * especie es mil veces mas abundante que otra.
+     *
+     * HalfCount <= 0 desactiva la inhibicion (devuelve 1).
+     */
+    FORCEINLINE float ConspecificInhibitionFactor(int32 Conspecifics, float HalfCount)
+    {
+        if (HalfCount <= 0.f || Conspecifics <= 0) { return 1.f; }
+        return FMath::Pow(0.5f, static_cast<float>(Conspecifics) / HalfCount);
+    }
+
+    /** "Sitio seguro": la luz en el punto de caida debe superar el minimo DE LA ESPECIE. */
     FORCEINLINE bool IsSafeGerminationSite(float LightAtSite, float MinLightForGermination)
     {
         return LightAtSite >= MinLightForGermination;

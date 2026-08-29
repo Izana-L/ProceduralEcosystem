@@ -62,6 +62,31 @@ struct FEcoTickProfile
 };
 
 /**
+ * UNA fila del historico demografico (comando Eco.Demografia.CSV).
+ *
+ * Se toma una por ESPECIE cada N ticks, no una por arbol: lo que hay que poder
+ * graficar para diagnosticar una exclusion competitiva es la trayectoria de cada
+ * especie, y en particular el VIGOR MEDIO y QUE RECURSO la limita. Un recuento
+ * de poblacion dice que una especie se esta yendo; el vigor y el limitante dicen
+ * por que, que es lo que decide donde tocar.
+ *
+ * Cabe en 40 bytes y se toma cada 20 ticks por defecto, asi que 10.000 años de
+ * simulacion con 3 especies son ~60 KB: se puede dejar puesto siempre.
+ */
+struct FEcoDemoSample
+{
+    int64 Tick = 0;
+    int32 SpeciesIndex = 0;
+    int32 Count = 0;          // vivos de esta especie
+    float MeanBiomass = 0.f;  // en fraccion de MaxBiomass (comparable entre especies)
+    float MeanVigor = 0.f;
+    float MeanStress = 0.f;
+    int32 LimitedByLight = 0; // reparto del argmin de Liebig
+    int32 LimitedByWater = 0;
+    int32 LimitedByNutrient = 0;
+};
+
+/**
  * Motor de la simulacion de ecosistema.
  *
  *  Fase 0: tick desacoplado del render, RNG determinista, relieve muestreable,
@@ -134,6 +159,20 @@ public:
      */
     void LogDemographics() const;
 
+    /**
+     * Vuelca el historico demografico acumulado a un CSV (consola:
+     * Eco.Demografia.CSV [nombre]).
+     *
+     * El historico se va tomando SOLO durante el tick, asi que refleja la
+     * partida entera y no el instante en que lo pides. Una columna por metrica
+     * y una fila por (tick, especie): entra tal cual en cualquier hoja de
+     * calculo para sacar las curvas de poblacion y de vigor.
+     */
+    void SaveDemographyCsv(const FString& FullPath) const;
+
+    /** Vacia el historico (util para separar corridas sin reiniciar el editor). */
+    void ClearDemographyHistory() { DemoHistory.Reset(); }
+
     /** Desglose del coste del tick por etapas + memoria de las estructuras
         (consola: Eco.Profile). Es el punto de partida obligatorio de la Fase 6. */
     void LogTickProfile() const;
@@ -152,6 +191,23 @@ public:
     int64 GetDeathEventCounter() const { return DeathEventCounter; }
     /** Copia en Out las muertes con indice >= InOutCursor (limitado al anillo) y avanza el cursor. */
     void  CollectNewDeathEvents(int64& InOutCursor, TArray<FTreeDeathEvent>& Out) const;
+    /**
+     * Percentiles de los campos base de agua y nutrientes (consola:
+     * Eco.PercentilesCampos).
+     *
+     * Es la herramienta que hace falta para colocar los WaterOptimum /
+     * NutrientOptimum de las especies SIN adivinar. Los campos se normalizan al
+     * rango [0, OutputMax], pero el TWI del agua sale muy sesgado hacia valores
+     * bajos: la mayor parte del mapa esta seca y solo unos pocos fondos de
+     * barranco llegan arriba. Poner el optimo de una especie en 0.70 "porque es
+     * la humeda" puede dejarla sin un solo sitio donde ganar, y entonces se
+     * extingue por una razon que no tiene nada que ver con la competencia.
+     *
+     * Coloca los optimos de tus especies en los percentiles 25 / 50 / 75 que
+     * imprime este comando, no en fracciones elegidas a ojo.
+     */
+    void LogFieldPercentiles() const;
+
     // --- Heatmaps ---
     void PaintTestField();
     void PaintWaterField();
@@ -245,6 +301,11 @@ private:
         Debug), que antes lo calculaban cada uno por su lado. */
     FVector RandomPointOnTerrain(EEcoRngStream Stream);
     void LogPopulationStats() const;
+
+    /** Añade una fila por especie al historico. La llama el tick con la misma
+        cadencia que LogPopulationStats: solo LEE la poblacion, no consume RNG y
+        por tanto no altera el fingerprint de la partida. */
+    void RecordDemographySample();
     void RecordDeathEvent(const FPendingDeathPulse& Pulse); // Fase 5 (Paso 1)
     /** Serializa/deserializa un bake completo sobre Payload. Deserializar sobre un
         objeto APARTE (y no directamente sobre los miembros vivos) es lo que permite
@@ -318,6 +379,10 @@ private:
     /** Cache de especies resueltas: evita LoadSynchronous miles de veces por tick. */
     UPROPERTY(Transient)
     TArray<TObjectPtr<USpeciesData>> ResolvedSpecies;
+
+    /** Historico demografico (Eco.Demografia.CSV). Instrumentacion pura: no
+        interviene en la simulacion. */
+    TArray<FEcoDemoSample> DemoHistory;
 
     // --- Eventos de muerte (Fase 5, Paso 1): anillo circular + cursor monotono ---
     TArray<FTreeDeathEvent> RecentDeaths;

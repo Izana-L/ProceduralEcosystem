@@ -33,6 +33,86 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
         Fail();
     }
 
+    // =====================================================================
+    //  COMPROMISOS ENTRE RASGOS
+    // =====================================================================
+    // Estos avisos no comprueban que el asset sea "correcto": comprueban que la
+    // especie PAGA por sus ventajas. El modelo no impone ningun coste por si
+    // solo -subir tolerancia, crecimiento, longevidad o fecundidad sale gratis-
+    // y sin compromisos existe una estrategia estrictamente dominante, con lo
+    // que la exclusion competitiva deja de ser un resultado y pasa a ser una
+    // certeza. Son avisos, no errores: si sabes por que lo haces, ignoralos.
+    //
+    // Para la comparacion ENTRE especies (que es la que de verdad decide si hay
+    // una dominante) usa el comando de consola Eco.AuditarEspecies: un asset no
+    // puede ver a los demas desde aqui.
+
+    if (ShadeTolerance > 0.7f && GrowthRate > 0.30f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("ShadeTolerance %.2f con GrowthRate %.2f: tolerante a la sombra Y de crecimiento rapido a la vez. Ese arbol no existe (la tolerancia se paga con madera densa y crecimiento lento) y en el modelo es una estrategia dominante: gana en el claro y ademas bajo el dosel."),
+            ShadeTolerance, GrowthRate)));
+    }
+
+    if (GrowthRate > 0.35f && Longevity > 600.f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("GrowthRate %.2f con Longevity %.0f: crecimiento de pionera y vida de arbol de dosel. El compromiso real es el contrario (crecer rapido cuesta madera barata y vida corta)."),
+            GrowthRate, Longevity)));
+    }
+
+    // El umbral de luz para germinar y la tolerancia a la sombra describen LO
+    // MISMO desde dos lados (donde puedo instalarme / donde puedo vivir). Si se
+    // contradicen, la especie germina en sitios donde luego se muere, o al reves
+    // desaprovecha el sotobosque que si podria ocupar -que es donde una climax se
+    // juega la partida-.
+    if (ShadeTolerance > 0.7f && MinLightForGermination > 0.3f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("ShadeTolerance %.2f (muy tolerante) con MinLightForGermination %.2f (exige claro): esta especie puede VIVIR en penumbra pero no puede INSTALARSE alli, asi que renuncia al banco de plantulas del sotobosque, que es como una climax hereda los huecos sin competir por numero de semillas. Prueba 0.05-0.15."),
+            ShadeTolerance, MinLightForGermination)));
+    }
+    if (ShadeTolerance < 0.35f && MinLightForGermination < 0.35f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("ShadeTolerance %.2f (heliofila) con MinLightForGermination %.2f (germina en penumbra): sembrara bajo dosel y esas plantulas se moriran. Sube el umbral a 0.5-0.6."),
+            ShadeTolerance, MinLightForGermination)));
+    }
+
+    if (SeedRateScale > 1.5f && GerminationRateScale > 1.2f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("SeedRateScale %.2f con GerminationRateScale %.2f: mucha semilla Y que ademas arraiga bien. Son las dos mitades del mismo compromiso r/K y deben ir en sentidos opuestos."),
+            SeedRateScale, GerminationRateScale)));
+    }
+
+    // --- Nicho de recurso (respuesta unimodal) ---
+    // La campana solo reparte nicho si es lo bastante ESTRECHA. Una anchura del
+    // orden del rango entero del campo deja la respuesta casi plana: la especie
+    // responde igual en todo el mapa y vuelve a competir solo por el ranking
+    // global, que es justo lo que el nicho venia a evitar.
+    if (WaterTolerance >= 1.f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("WaterTolerance (%.2f) cubre el rango entero del campo de agua: la respuesta queda casi plana y esta especie no se reparte el gradiente con nadie. Prueba 0.2-0.4."),
+            WaterTolerance)));
+    }
+    if (NutrientTolerance >= 1.f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("NutrientTolerance (%.2f) cubre el rango entero del campo de nutrientes: respuesta casi plana, sin reparto de nicho. Prueba 0.25-0.45."),
+            NutrientTolerance)));
+    }
+    if (!bWaterloggingPenalty && WaterOptimum > 0.5f)
+    {
+        // Sin penalizacion por exceso la campana satura en 1 por encima del
+        // optimo, o sea que por arriba vuelve a ser monotona: la especie es
+        // igual de buena en su optimo que en todo lo mas humedo, y la de
+        // vaguada acaba ganando tambien donde no le toca.
+        Context.AddWarning(FText::FromString(
+            TEXT("bWaterloggingPenalty desactivado con un WaterOptimum alto: por encima del optimo la respuesta al agua vuelve a ser monotona y se pierde la mitad humeda del reparto de nicho.")));
+    }
+
     if (MaturityAge >= Longevity)
     {
         Context.AddWarning(FText::FromString(

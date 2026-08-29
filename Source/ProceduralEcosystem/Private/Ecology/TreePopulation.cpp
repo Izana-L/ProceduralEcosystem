@@ -10,7 +10,7 @@ int32 FTreePopulation::Add(const FVector& InPosition, uint16 InSpeciesId, uint32
 {
     // Este SI enumera los campos: cada uno recibe un valor DISTINTO, asi que no
     // hay nada que factorizar (a diferencia de Reserve/CompactDead/CopyFrom, que
-    // hacen lo mismo con los nueve y usan el visitor ForEachArray).
+    // hacen lo mismo con los once y usan el visitor ForEachArray).
     const int32 Index = Position.Add(InPosition);
     SpeciesId.Add(InSpeciesId);
     Age.Add(InAge);
@@ -20,6 +20,8 @@ int32 FTreePopulation::Add(const FVector& InPosition, uint16 InSpeciesId, uint32
     State.Add(ETreeState::Sapling);
     RngState.Add((InRngState != 0u) ? InRngState : 1u); // 0 es absorbente para xorshift32 (ver EcoCore)
     StableId.Add(NextStableId++);
+    Vigor.Add(0.f);   // instrumentacion: el primer tick lo sobrescribe
+    Limiter.Add(0);
     return Index;
 }
 
@@ -36,7 +38,7 @@ int32 FTreePopulation::CompactDead()
         }
         if (Write != Read)
         {
-            // Antes eran nueve asignaciones escritas a mano; si se anadia un
+            // Antes eran las asignaciones escritas a mano; si se anadia un
             // campo al agente y se olvidaba esta linea, el array nuevo se
             // quedaba con los datos de OTRO arbol tras la primera muerte.
             ForEachArray([Write, Read](auto& Array) { Array[Write] = Array[Read]; });
