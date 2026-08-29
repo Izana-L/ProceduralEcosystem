@@ -1,3 +1,21 @@
+/**
+ * @file TreeFoliage.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de la colocación de hojas: tarjetas de hoja por ranura filotáctica.
+ *
+ * Recorre los internodos portadores de hoja, los que ya son madera fina, y emite un quad
+ * por cada ranura de la espiral que cae dentro del internodo. Resuelve para cada hoja el
+ * punto de inserción —separado del eje por el radio de la ramilla más el pecíolo—, el
+ * ángulo de inserción sobre la perpendicular, la orientación de la lámina interpolada
+ * entre el cielo y el gradiente de luz local, y el giro, el tamaño, el desfase de aleteo y
+ * el descarte de ranuras, todo por hash salado de la terna (semilla, rama, ranura). Antes
+ * del bucle estima la longitud portadora total para reservar los buffers de una vez.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_vogel1979
+ * @see @ref bib_ehleringer1980
+ */
+
 #include "Geometry/TreeFoliage.h"
 
 #include "Geometry/TreeMeshBuilder.h"
@@ -6,10 +24,12 @@
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
 #include "Core/EcoCore.h"
-#include "Core/EcoGeometry.h" // PerpendicularTo (copia unica, ver la cabecera)
+#include "Core/EcoGeometry.h" // PerpendicularTo: copia única compartida del helper
 
 namespace
 {
+    /** Sales del hash: una por rasgo de la hoja, para que los cuatro valores de una misma
+        ranura sean independientes entre sí sin necesidad de cuatro claves distintas. */
     enum : uint32
     {
         SaltSkip  = 0x9E3779B9u,
@@ -18,13 +38,22 @@ namespace
         SaltPhase = 0x27D4EB2Fu
     };
 
-    constexpr float MaxRollRad = 0.44f;
-    constexpr float MinSizeScale = 0.80f;
-    constexpr float MaxSizeScale = 1.25f;
-    constexpr float MinAttachRadiusCm = 0.05f;
+    constexpr float MaxRollRad = 0.44f;        ///< Giro máximo de la lámina sobre su eje.
+    constexpr float MinSizeScale = 0.80f;      ///< Escala mínima de una hoja frente a la nominal.
+    constexpr float MaxSizeScale = 1.25f;      ///< Escala máxima.
+    constexpr float MinAttachRadiusCm = 0.05f; ///< Suelo del radio de ramilla al insertar.
 
-    /** Valor estable en [0,1) para (arbol, rama, ranura de hoja): solo mezcla la
-        clave y delega en la copia unica del hash (EcoRand::HashUnit). */
+    /**
+     * Valor estable en [0,1) para la terna (árbol, rama, ranura).
+     *
+     * Los dos multiplicadores derivan de la razón áurea y dispersan índices consecutivos
+     * —ranuras contiguas, ramas contiguas— antes de mezclar; el mezclado en sí lo hace la
+     * copia única del hash del proyecto.
+     *
+     * @param BranchRoot Nodo en que arranca la rama, no el nodo concreto: así toda la rama
+     *                   comparte la misma sucesión de valores.
+     * @see @ref bib_knuthhashing
+     */
     FORCEINLINE float LeafUnit(uint32 Seed, int32 BranchRoot, int32 Slot, uint32 Salt)
     {
         return EcoRand::HashUnit(Seed
@@ -32,9 +61,9 @@ namespace
             ^ (static_cast<uint32>(Slot) * 40503u), Salt);
     }
 
-    /** Perpendicular a Along lo mas cerca posible de Pref, con dos reservas.
-        La logica es la compartida de EcoGeometry (misma que usan el SCA y el
-        mallador); aqui solo cambia el vector de ultimo recurso. */
+    /** Perpendicular a @p Along lo más cerca posible de @p Pref; si las dos son casi
+        paralelas, se cruza con @p Fallback. La lógica es la compartida del proyecto:
+        aquí solo se fija el eje que se devuelve cuando todo degenera. */
     FORCEINLINE FVector SideAxis(const FVector& Along, const FVector& Pref, const FVector& Fallback)
     {
         return EcoGeometry::PerpendicularTo(Along, Pref, Fallback, FVector::RightVector);
@@ -70,6 +99,9 @@ namespace TreeFoliage
         const float SinI = FMath::Sin(Insertion);
         const bool bHasLight = (FineLight != nullptr) && FineLight->IsValid();
 
+        // Longitud total de madera portadora de hoja. Sirve para reservar los buffers de
+        // una vez: sin esta pasada previa el follaje de un árbol grande obliga a decenas
+        // de realojos mientras crece vértice a vértice.
         float BearingLength = 0.f;
         for (int32 i = 1; i < N; ++i)
         {
@@ -100,6 +132,9 @@ namespace TreeFoliage
                 continue;
             }
 
+            // Las ranuras son globales sobre la longitud acumulada, no locales al
+            // internodo: por eso la espiral no se reinicia en cada bifurcación y no
+            // depende de en cuántos nodos haya troceado la rama la colonización.
             const int32 FirstSlot = FMath::FloorToInt32(Start / Spacing) + 1;
             const int32 LastSlot = FMath::FloorToInt32(Wind.AlongLen[i] / Spacing);
             if (LastSlot < FirstSlot)
@@ -116,10 +151,15 @@ namespace TreeFoliage
 
             const FTreeWindNode& Wn = Wind.Nodes[i];
             const int32 Root = Wind.BranchRoot[i];
+
+            // La hoja se mueve más que la ramilla que la sostiene y nunca queda del todo
+            // quieta: de ahí el suelo del 35 % antes de escalar por el aleteo de especie.
             const float Sway = FMath::Clamp((0.35f + 0.65f * Wn.SwayWeight) * Flutter, 0.f, 1.f);
 
             for (int32 Slot = FirstSlot; Slot <= LastSlot; ++Slot)
             {
+                // Aclarar el follaje se hace descartando ranuras, no acortando la espiral:
+                // las hojas que quedan siguen en el sitio exacto que les tocaba.
                 if (LeafUnit(Seed, Root, Slot, SaltSkip) > Fill)
                 {
                     continue;
@@ -129,11 +169,17 @@ namespace TreeFoliage
                 const float Phi = static_cast<float>(
                     FMath::Fmod(static_cast<double>(Slot) * Divergence, 2.0 * PI));
 
+                // El azimut se mide sobre el marco de rotación mínima del nodo, no sobre
+                // una base recalculada: si el marco girase, la espiral se retorcería.
                 const FVector Radial =
                     (FMath::Cos(Phi) * Nrm + FMath::Sin(Phi) * Bin).GetSafeNormal(SMALL_NUMBER, Nrm);
+                // La hoja no nace en el eje de la ramilla: sale de su superficie y el
+                // pecíolo la separa un poco más.
                 const FVector Attach = Anchor + Seg * T + Radial * (StemRadius + Petiole);
                 const FVector Along = (Radial * CosI + Axis * SinI).GetSafeNormal(SMALL_NUMBER, Radial);
 
+                // Orientación heliotrópica: la lámina se gira del cielo hacia la dirección
+                // en que más crece la luz, tanto como marque el rasgo de la especie.
                 FVector Pref = FVector::UpVector;
                 if (bHasLight && Helio > 0.f)
                 {
@@ -155,6 +201,8 @@ namespace TreeFoliage
                 const FVector HalfSpan = Side * (HalfWidth * Scale);
                 const FVector Blade = Along * (Length * Scale);
 
+                // Tarjeta de hoja: quad de cuatro vértices anclado en el punto de inserción y
+                // extendido a lo largo de la lámina, con la UV completa de la textura.
                 const int32 Base = OutLeaves.Vertices.Num();
                 OutLeaves.Vertices.Add(Attach - HalfSpan);
                 OutLeaves.Vertices.Add(Attach + HalfSpan);
@@ -166,6 +214,8 @@ namespace TreeFoliage
                 OutLeaves.UVs.Add(FVector2D(1.f, 1.f));
                 OutLeaves.UVs.Add(FVector2D(0.f, 1.f));
 
+                // Los cuatro vértices comparten normal, tangente y canales de viento: la
+                // hoja es plana y se mueve como una pieza.
                 const float Phase = LeafUnit(Seed, Root, Slot, SaltPhase);
                 for (int32 j = 0; j < 4; ++j)
                 {

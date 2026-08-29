@@ -1,11 +1,27 @@
+/**
+ * @file TreeLightGridFine.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de la rejilla de luz fina: dimensionado, siembra de sombra y muestreo.
+ *
+ * Contiene las operaciones de FTreeLightGridFine: el dimensionado con margen y tope
+ * defensivo de resolución, la siembra desde la rejilla gruesa global, el depósito de la
+ * columna de sombra descendente con caída lineal en radio y en profundidad, los dos
+ * muestreadores —vecino más cercano y trilineal— y el gradiente por diferencias centrales.
+ * La aritmética de rejilla (índice, dimensiones, clamp al borde y conversión de sombra a
+ * luz) es la copia única de EcoGrid, no una reimplementación local.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_palubicki2009
+ */
+
 #include "Geometry/TreeLightGridFine.h"
 #include "Terrain/LightFieldCoarse.h"
 #include "Geometry/TreeSkeleton.h"
 
 namespace
 {
-    // Tope defensivo de resolucion por eje: una copa normal cabe de sobra por
-    // debajo. Evita reservar gigas si llega una caja degenerada/enorme.
+    /** Tope de resolución por eje. Una copa cabe de sobra por debajo; el tope está para
+        que una caja degenerada o enorme no reserve gigas. */
     constexpr int32 MaxVoxelsPerAxis = 256;
 }
 
@@ -15,7 +31,7 @@ void FTreeLightGridFine::InitForBounds(const FBox& WorldBounds, float InVoxelSiz
 
     if (!WorldBounds.IsValid)
     {
-        // Sin caja no hay rejilla: dejarla vacia (IsValid() dara false).
+        // Sin caja no hay rejilla: se deja vacía y IsValid() pasa a false.
         Width = Height = Layers = 0;
         Shadow.Reset();
         OriginWorld = FVector::ZeroVector;
@@ -34,9 +50,6 @@ void FTreeLightGridFine::InitForBounds(const FBox& WorldBounds, float InVoxelSiz
 
 void FTreeLightGridFine::ClearShadow()
 {
-    // Antes era un bucle celda a celda. Ahora es el MISMO memset que usa el grid
-    // grueso (EcoGrid::ZeroFloats): esta rejilla se limpia una vez por refresco
-    // de luz del SCA, asi que es la que mas lo agradece.
     EcoGrid::ZeroFloats(Shadow);
 }
 
@@ -47,8 +60,8 @@ void FTreeLightGridFine::SeedFromCoarse(const FLightFieldCoarse& Coarse)
         return;
     }
 
-    // Cada voxel toma la sombra que proyectan los vecinos: Sombra = C - Q,
-    // con Q leida (suave) del grid grueso en el centro del voxel.
+    // Cada vóxel toma la sombra que proyectan los vecinos: Shadow = FullSunlight - Q,
+    // con Q leída de forma suave en la rejilla gruesa, en el centro del vóxel.
     for (int32 Iz = 0; Iz < Layers; ++Iz)
     {
         for (int32 Iy = 0; Iy < Height; ++Iy)
@@ -69,8 +82,8 @@ void FTreeLightGridFine::DepositDownwardShadow(const FVector& FromWorld, float R
         return;
     }
 
-    // Caja de voxels afectados: disco de radio RadiusCm en XY, columna hacia
-    // abajo entre From.Z-DepthCm y From.Z.
+    // Caja de vóxeles afectados: disco de radio RadiusCm en XY y columna hacia abajo
+    // entre FromWorld.Z - DepthCm y FromWorld.Z.
     const FVector BoxMin(FromWorld.X - RadiusCm, FromWorld.Y - RadiusCm, FromWorld.Z - DepthCm);
     const FVector BoxMax(FromWorld.X + RadiusCm, FromWorld.Y + RadiusCm, FromWorld.Z);
 
@@ -89,14 +102,14 @@ void FTreeLightGridFine::DepositDownwardShadow(const FVector& FromWorld, float R
             {
                 const FVector C = VoxelCenter(Ix, Iy, Iz);
 
-                const float Dz = FromWorld.Z - C.Z; // >=0 hacia abajo
+                const float Dz = FromWorld.Z - C.Z; // >= 0 por debajo del origen
                 if (Dz < 0.f || Dz > DepthCm) { continue; }
 
                 const float Horiz = FVector2D(C.X - FromWorld.X, C.Y - FromWorld.Y).Size();
                 if (Horiz > RadiusCm) { continue; }
 
-                // Mas intensa junto al follaje (Dz pequeno) y en el eje (Horiz
-                // pequeno); decae linealmente hacia los bordes.
+                // Máxima junto al follaje (Dz pequeño) y en el eje de la columna (Horiz
+                // pequeño); decae linealmente hasta anularse en los bordes.
                 const float RadialFalloff = 1.f - Horiz * InvRadius;
                 const float DepthFalloff = 1.f - Dz * InvDepth;
                 Shadow[IndexOf(Ix, Iy, Iz)] += Density * RadialFalloff * DepthFalloff;
@@ -134,7 +147,7 @@ float FTreeLightGridFine::SampleShadowNearest(const FVector& WorldPos) const
 
 float FTreeLightGridFine::SampleShadowTrilinear(const FVector& WorldPos) const
 {
-    // Coordenadas continuas en espacio de CENTROS de voxel (de ahi el -0.5).
+    // Coordenadas continuas en espacio de CENTROS de vóxel: de ahí el -0.5.
     const float Gx = (WorldPos.X - OriginWorld.X) / VoxelSizeCm - 0.5f;
     const float Gy = (WorldPos.Y - OriginWorld.Y) / VoxelSizeCm - 0.5f;
     const float Gz = (WorldPos.Z - OriginWorld.Z) / VoxelSizeCm - 0.5f;
@@ -188,6 +201,6 @@ FVector FTreeLightGridFine::GradientOfLight(const FVector& WorldPos) const
     const float Dy = SampleLightSmooth(WorldPos + FVector(0, H, 0)) - SampleLightSmooth(WorldPos - FVector(0, H, 0));
     const float Dz = SampleLightSmooth(WorldPos + FVector(0, 0, H)) - SampleLightSmooth(WorldPos - FVector(0, 0, H));
 
-    // Apunta hacia mas luz. Normalizado; ZeroVector si el entorno es plano.
+    // Apunta hacia más luz. Normalizado, y ZeroVector si el entorno es plano.
     return FVector(Dx, Dy, Dz).GetSafeNormal();
 }

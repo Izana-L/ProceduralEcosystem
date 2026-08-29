@@ -1,33 +1,53 @@
+/**
+ * @file TreeMeshBuilder.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del mallador: del esqueleto de ramas a los buffers de madera.
+ *
+ * Contiene la única función del namespace, BuildMesh, y con ella la secuencia completa
+ * del mallado: los atributos de viento y oclusión por nodo, los marcos de rotación
+ * mínima propagados de padre a hijo, el reparto del buffer de vértices entre anillos,
+ * ápices y tapa de base, los anillos con su deformación de sección —lóbulos angulares,
+ * relieve de corteza por ruido de gradiente y giro con la altura—, la triangulación de
+ * paredes y cierres, y el recálculo de normales que hace que la deformación se vea en la
+ * luz y no solo en la silueta. Termina delegando las hojas en el follaje. No consume
+ * ningún flujo de RNG: toda su variación sale de hashes estables de la semilla.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_marcorotacionminima
+ * @see @ref bib_max1999
+ * @see @ref bib_perlin1985
+ */
+
 #include "Geometry/TreeMeshBuilder.h"
 #include "Geometry/TreeSkeleton.h"
-#include "Geometry/TreeWindData.h"     // Fase 6: pivotes de rama, balanceo y AO
+#include "Geometry/TreeWindData.h"     // atributos de viento y oclusión por nodo
 #include "Geometry/TreeFoliage.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h"     // EcoRand::HashUnit (hashes estables, NO consumo de RNG)
-#include "Core/EcoGeometry.h" // AnyPerpendicular (copia unica, ver la cabecera)
+#include "Core/EcoCore.h"     // EcoRand::HashUnit: hashes estables, sin consumo de RNG
+#include "Core/EcoGeometry.h" // AnyPerpendicular: copia única compartida del helper
 
 namespace
 {
-    constexpr float MinBranchRadiusCm = 0.05f;
-    constexpr float UvAlongScale = 1.f / 100.f; // 1 unidad de UV.v por metro de rama
-    constexpr float TipConeLengthFrac = 0.55f;  // largo del apice como fraccion del internodo
-    constexpr float MinTipConeRadii = 2.f;      // ... con un minimo en radios de la ramilla
+    constexpr float MinBranchRadiusCm = 0.05f;  ///< Suelo del radio: evita anillos degenerados.
+    constexpr float UvAlongScale = 1.f / 100.f; ///< Una unidad de v por metro de rama.
+    constexpr float TipConeLengthFrac = 0.55f;  ///< Largo del ápice, como fracción del internodo.
+    constexpr float MinTipConeRadii = 2.f;      ///< ... con un mínimo en radios de la ramilla.
 
-    /** Por debajo de esta amplitud, la deformacion de seccion no se ve: no vale
-        la pena pagar ni los segmentos extra ni la pasada de normales. */
+    /** Por debajo de esta amplitud la deformación de sección no llega a verse, y no
+        compensa pagar ni los segmentos de anillo extra ni la pasada de normales. */
     constexpr float MinSectionDeform = 0.01f;
 
-    /** Minimo de segmentos de anillo con deformacion activa. Un hexagono no
-        puede tener tres lobulos: sin resolucion angular, el relieve no existe. */
+    /** Mínimo de segmentos de anillo cuando hay deformación. Un hexágono no puede tener
+        tres lóbulos: sin resolución angular suficiente, el relieve no existe. */
     constexpr int32 MinRingSegmentsForRelief = 8;
 
-    /** Vueltas que da la fase de los lobulos a lo largo del arbol. Es lo que se
-        lee como "tronco retorcido": una seccion lobulada que NO gira se lee como
-        un prisma extruido, que es tan artificial como el cilindro. */
+    /** Vueltas que da la fase de los lóbulos a lo largo del árbol. Es lo que se lee como
+        tronco retorcido: una sección lobulada que no gira parece un prisma extruido, tan
+        artificial como el cilindro. */
     constexpr float SectionTwistTurns = 0.4f;
 
-    /** Escala del relieve grueso, en radios de la base del tronco. */
+    /** Longitud de onda del relieve grueso de corteza, en radios de la base del tronco. */
     constexpr float ReliefWaveInBaseRadii = 1.2f;
 }
 
@@ -44,7 +64,7 @@ namespace TreeMeshBuilder
             return; // sin al menos un internodo no hay tubo que construir
         }
 
-        // --- Deformacion de seccion (el tronco deja de ser un cilindro) ---
+        // ==== Deformación de sección: el tronco deja de ser un cilindro ====
         const float LobeAmp = FMath::Clamp(Species.SectionLobeAmount, 0.f, 0.4f);
         const int32 LobeCount = FMath::Clamp(Species.SectionLobeCount, 2, 6);
         const float ReliefAmp = FMath::Clamp(Species.BarkReliefAmount, 0.f, 0.2f);
@@ -56,26 +76,20 @@ namespace TreeMeshBuilder
             K = FMath::Max(K, MinRingSegmentsForRelief);
         }
 
-        // ===================================================================
-        // FASE 6: atributos de viento y AO por NODO, antes de mallar.
-        //
-        // Se calculan a partir del esqueleto (padres, radios del pipe model) y
-        // de la rejilla de luz fina que dejo el SCA: no hay que reconstruir
-        // ninguna jerarquia ni hornear texturas de pivotes (doc. 6.1).
-        //
-        // FTreeWindData deja ademas publicadas las dos pasadas O(N) que comparte
-        // con el mallador (ChildCount y AlongLen): aqui se reutilizan, no se
-        // recalculan.
-        // ===================================================================
+        // ==== Atributos de viento y oclusión por nodo, antes de mallar ====
+        // Salen del propio esqueleto (padres y radios estructurales) y de la rejilla de
+        // luz fina, sin reconstruir jerarquías ni hornear texturas de pivotes. La pasada
+        // publica además ChildCount y AlongLen, que el mallador reutiliza en vez de
+        // recalcularlos.
         FTreeWindData Wind;
         Wind.Build(Skeleton, Species, FineLight, Seed);
 
         const TArray<int32>& ChildCount = Wind.ChildCount;
         const TArray<float>& AlongLen = Wind.AlongLen;
 
-        // --- Marcos de rotacion minima ---
-        // Se calculan en orden de indice (padre antes que hijo, por la invariante
-        // de FTreeSkeleton), asi el marco del hijo deriva del del padre.
+        // ==== Marcos de rotación mínima ====
+        // Se recorren en orden de índice: por la invariante del esqueleto el padre viene
+        // antes que el hijo, así que su marco ya está resuelto cuando se necesita.
         TArray<FVector> FrameN; FrameN.SetNumUninitialized(N); // normal del anillo
         TArray<FVector> FrameB; FrameB.SetNumUninitialized(N); // binormal del anillo
 
@@ -94,11 +108,12 @@ namespace TreeMeshBuilder
                 const int32 P = Node.Parent;
                 const FVector Tp = Skeleton.Nodes[P].Dir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
 
-                // Transporte paralelo: rota el marco del padre por la rotacion que
-                // lleva su tangente a la de este nodo -> minima torsion.
+                // Transporte paralelo: al marco del padre se le aplica la rotación que
+                // lleva su tangente a la de este nodo, que es la de torsión mínima. Un
+                // marco recalculado por anillo retorcería el tubo.
                 const FQuat Q = FQuat::FindBetweenNormals(Tp, T);
                 FVector Np = Q.RotateVector(FrameN[P]);
-                // Reortogonaliza contra T (elimina deriva numerica).
+                // Reortogonaliza contra T para eliminar la deriva numérica acumulada.
                 Np = (Np - FVector::DotProduct(Np, T) * T).GetSafeNormal(SMALL_NUMBER, EcoGeometry::AnyPerpendicular(T));
                 Nrm = Np;
             }
@@ -107,12 +122,12 @@ namespace TreeMeshBuilder
             FrameB[i] = FVector::CrossProduct(T, Nrm).GetSafeNormal(SMALL_NUMBER, FVector::CrossProduct(T, EcoGeometry::AnyPerpendicular(T)));
         }
 
-        // --- MADERA: reparto del buffer de vertices ---
+        // ==== Madera: reparto del buffer de vértices ====
         //   [0, N*RingVerts)          anillos, uno por nodo
         //   BaseCapVert               centro de la tapa de la base del tronco
-        //   ApexVert[i]               apice de cada nodo terminal
+        //   ApexVert[i]               ápice de cada nodo terminal
         FTreeMeshBuffers& W = OutMesh.Wood;
-        const int32 RingVerts = K + 1;          // <-- +1: vertice de costura (duplicado en u=1)
+        const int32 RingVerts = K + 1;          // el +1 es el vértice de costura, en u = 1
         const int32 RingBlock = N * RingVerts;
         const int32 BaseCapVert = RingBlock;
 
@@ -133,17 +148,19 @@ namespace TreeMeshBuilder
         W.SetNumVertices(VertCount);
         W.Triangles.Reserve(((N - 1) * K * 2 + NumApex * K + K) * 3);
 
-        // Escalas de la deformacion, derivadas del arbol (no hay que exponerlas
-        // como parametros ni escalarlas por bucket: salen ya proporcionadas).
+        // Escalas de la deformación derivadas del propio árbol: al ir referidas al radio
+        // de la base salen ya proporcionadas a su tamaño, sin parámetros de especie ni
+        // reescalado por bucket.
         const float TrunkBaseRadius = FMath::Max(Skeleton.Nodes[0].Radius, MinBranchRadiusCm);
         const float InvReliefWave = 1.f / FMath::Max(TrunkBaseRadius * ReliefWaveInBaseRadii, 2.f);
         float MaxAlongLen = 0.f;
         for (int32 i = 0; i < N; ++i) { MaxAlongLen = FMath::Max(MaxAlongLen, AlongLen[i]); }
         const float InvMaxAlong = (MaxAlongLen > KINDA_SMALL_NUMBER) ? (1.f / MaxAlongLen) : 0.f;
 
-        // Fase de los lobulos y offset del ruido: hash de la semilla, NUNCA
-        // EcoRand::Next*. El mallador no debe consumir RNG (ver la cabecera):
-        // desplazaria el stream que el SCA gasto antes sobre el mismo arbol.
+        // La fase de los lóbulos y el desplazamiento del ruido salen de un hash estable,
+        // nunca EcoRand::Next*. Consumir aquí desplazaría el flujo que la colonización
+        // del espacio ya gastó sobre este mismo árbol, y activar la deformación cambiaría
+        // la forma del esqueleto.
         const float LobeSeedPhase = EcoRand::HashUnit(Seed, 0x7F4A7C15u) * 2.f * PI;
         const FVector ReliefOffset(
             EcoRand::HashUnit(Seed, 0x9E3779B9u) * 512.f,
@@ -158,29 +175,28 @@ namespace TreeMeshBuilder
             const float Radius = FMath::Max(Node.Radius, MinBranchRadiusCm);
             const float V = AlongLen[i] * UvAlongScale;
 
-            // La deformacion se apaga en la madera fina: una ramilla de 1 cm no
-            // tiene lobulos, y ahi el desplazamiento solo produce ruido.
+            // La deformación se apaga en la madera fina: una ramilla de un centímetro no
+            // tiene lóbulos, y a esa escala el desplazamiento solo produce ruido.
             const float DeformWeight = bDeformSection
                 ? FMath::SmoothStep(TrunkBaseRadius * 0.06f, TrunkBaseRadius * 0.30f, Radius)
                 : 0.f;
 
-            // Fase de los lobulos: gira lentamente con la altura.
+            // La fase de los lóbulos gira lentamente con la longitud recorrida.
             const float LobePhase = LobeSeedPhase
                 + SectionTwistTurns * 2.f * PI * (AlongLen[i] * InvMaxAlong);
 
-            // Fase 6: TODOS los vertices del anillo comparten los atributos de su
-            // nodo. Es importante que sea asi: si variasen alrededor del anillo,
-            // el tubo se deformaria al aplicar el desplazamiento en el material.
+            // Los vértices de un anillo comparten los atributos de su nodo, sin excepción:
+            // si variasen alrededor del anillo, el desplazamiento que aplica el material
+            // deformaría la sección del tubo.
             const FTreeWindNode& Wn = Wind.Nodes[i];
 
             for (int32 k = 0; k <= K; ++k)
             {
-                // COSTURA: k = K es el MISMO punto que k = 0, duplicado solo para
-                // poder cerrar la UV en u = 1. Reusar literalmente el angulo de
-                // k = 0 hace que los dos vertices sean identicos BIT A BIT; si se
-                // dejara al azar de la aritmetica de coma flotante (cos(2*PI) no
-                // es exactamente cos(0)), cualquier deformacion no periodica
-                // abriria una raja a lo largo de todo el tronco.
+                // Costura: k = K es el mismo punto que k = 0, duplicado solo para poder
+                // cerrar la UV en u = 1. Reutilizar literalmente el ángulo de k = 0 hace
+                // que los dos vértices salgan idénticos bit a bit; dejarlo a la aritmética
+                // de coma flotante (cos(2*PI) no es exactamente cos(0)) abriría una raja a
+                // lo largo del tronco en cuanto la deformación no fuese periódica.
                 const int32 kWrap = (k == K) ? 0 : k;
                 const float Ang = 2.f * PI * (float)kWrap / (float)K;
                 const float C = FMath::Cos(Ang);
@@ -190,14 +206,13 @@ namespace TreeMeshBuilder
                 float RadiusScale = 1.f;
                 if (DeformWeight > 0.f)
                 {
-                    // (a) Lobulos: serie de Fourier en el angulo -> periodica en
-                    //     2*PI por construccion, sin costura posible.
+                    // Lóbulos: un término de serie de Fourier en el ángulo, periódico en
+                    // 2*PI por construcción, de modo que la costura nunca puede abrirse.
                     const float Lobes = LobeAmp * FMath::Cos((float)LobeCount * Ang + LobePhase);
 
-                    // (b) Relieve grueso: ruido 3D muestreado en la POSICION del
-                    //     vertice sin deformar. Al ser funcion de la posicion,
-                    //     sale coherente entre anillos vecinos gratis, sin tener
-                    //     que propagar ninguna fase a lo largo de la rama.
+                    // Relieve grueso: ruido de gradiente 3D muestreado en la posición del
+                    // vértice sin deformar. Al ser función de la posición sale coherente
+                    // entre anillos vecinos, sin propagar nada a lo largo de la rama.
                     float Relief = 0.f;
                     if (ReliefAmp > 0.f)
                     {
@@ -218,10 +233,10 @@ namespace TreeMeshBuilder
             }
         }
 
-        // --- MADERA: vertice apice de cada punta ---
-        // El eje sale del SEGMENTO padre->nodo, no de Node.Dir: el SCA puede
-        // dejar nodos cuya Dir apunta hacia atras, y ahi el cono se meteria
-        // dentro del tubo del padre.
+        // ==== Madera: vértice ápice de cada punta ====
+        // El eje del cono sale del segmento padre-nodo, no de Node.Dir: la colonización
+        // del espacio puede dejar nodos cuya dirección apunta hacia atrás, y con ella el
+        // cono se metería dentro del tubo del padre.
         for (int32 i = 0; i < N; ++i)
         {
             const int32 Av = ApexVert[i];
@@ -245,7 +260,7 @@ namespace TreeMeshBuilder
             W.SetWindVertex(Av, Wn);
         }
 
-        // --- MADERA: centro de la tapa de la base ---
+        // ==== Madera: centro de la tapa de la base ====
         {
             const FBranchNode& Root = Skeleton.Nodes[0];
             const FTreeWindNode& Wn = Wind.Nodes[0];
@@ -256,28 +271,27 @@ namespace TreeMeshBuilder
             W.SetWindVertex(BaseCapVert, Wn);
         }
 
-        // --- MADERA: conectar cada anillo con el de su padre ---
-        // Winding elegido para cara exterior. NOTA: si al probar en UE la corteza
-        // sale invertida (se ve el interior), intercambia dos indices de cada
-        // triangulo o pon el material de corteza a two-sided.
+        // ==== Madera: coser cada anillo con el de su padre ====
+        // El orden de los índices de cada triángulo es el que deja la cara exterior
+        // mirando hacia fuera.
         for (int32 i = 0; i < N; ++i)
         {
             const int32 P = Skeleton.Nodes[i].Parent;
             if (P < 0) { continue; }
 
-            const int32 BaseI = i * RingVerts;   // <-- paso RingVerts, no K
+            const int32 BaseI = i * RingVerts;   // el paso es RingVerts, no K
             const int32 BaseP = P * RingVerts;
-            for (int32 k = 0; k < K; ++k)        // K quads; k+1 nunca se sale (hay K+1 vertices)
+            for (int32 k = 0; k < K; ++k)        // K quads; k+1 cabe siempre: hay K+1 vértices
             {
                 W.Triangles.Add(BaseP + k);     W.Triangles.Add(BaseI + k);     W.Triangles.Add(BaseP + k + 1);
                 W.Triangles.Add(BaseP + k + 1); W.Triangles.Add(BaseI + k);     W.Triangles.Add(BaseI + k + 1);
             }
         }
 
-        // --- MADERA: cierres ---
-        // El abanico del apice es el quad de pared con el anillo del hijo
-        // colapsado en un punto; la tapa de la base, con el del padre. De ahi
-        // sale el winding sin tener que razonarlo de nuevo.
+        // ==== Madera: cierres de los dos extremos ====
+        // El abanico del ápice es el quad de pared con el anillo del hijo colapsado en un
+        // punto, y la tapa de la base lo mismo con el del padre: de ahí sale el orden de
+        // los índices sin volver a razonarlo.
         for (int32 i = 0; i < N; ++i)
         {
             const int32 Av = ApexVert[i];
@@ -296,25 +310,23 @@ namespace TreeMeshBuilder
             W.Triangles.Add(BaseCapVert); W.Triangles.Add(k); W.Triangles.Add(k + 1);
         }
 
-        // --- MADERA: normales reales de la superficie deformada ---
-        // Con el radio modulado por vertice, la normal RADIAL ya no es la normal
-        // de la superficie. Si no se recalcula, el sombreado sigue leyendose como
-        // un cilindro liso y toda la deformacion se pierde: el relieve estaria en
-        // la silueta pero no en la luz.
+        // ==== Madera: normales reales de la superficie deformada ====
+        // Con el radio modulado vértice a vértice, la normal radial ya no es la normal de
+        // la superficie: sin recalcularla el sombreado sigue leyéndose como un cilindro
+        // liso y el relieve queda en la silueta pero no en la luz.
         //
-        // Se acumula la normal de cada cara en sus tres vertices (ponderada por
-        // area, que es lo que da el producto vectorial sin normalizar) y se
-        // normaliza al final. Es O(triangulos) y siempre correcta, sin tener que
-        // derivar analiticamente el desplazamiento.
+        // Cada cara aporta su producto vectorial sin normalizar a sus tres vértices, lo
+        // que pondera automáticamente por área, y al final se normaliza. Es lineal en el
+        // número de triángulos y evita derivar analíticamente el desplazamiento.
         if (bDeformSection)
         {
             const int32 NumWoodVerts = W.Vertices.Num();
             TArray<FVector> Accum;
             Accum.Init(FVector::ZeroVector, NumWoodVerts);
 
-            // La tapa de la base se EXCLUYE: es un disco perpendicular al tubo y
-            // mezclarla suavizaria el borde inferior en una especie de embudo.
-            // Ademas queda enterrada, asi que no se gana nada.
+            // La tapa de la base se excluye: es un disco perpendicular al tubo y
+            // promediarla achaflanaría el borde inferior en forma de embudo. Además queda
+            // enterrada, así que no se gana nada a cambio.
             for (int32 t = 0; t + 2 < BaseCapFirstIndex; t += 3)
             {
                 const int32 I0 = W.Triangles[t];
@@ -330,10 +342,10 @@ namespace TreeMeshBuilder
                 Accum[I2] += FaceN;
             }
 
-            // COSTURA: k = 0 y k = K son el mismo punto con indices distintos, asi
-            // que cada uno solo ha recibido LA MITAD de sus caras. Sin sumarlos,
-            // sus normales difieren y aparece una linea de sombreado recorriendo
-            // todo el tubo, aunque la geometria este perfectamente cerrada.
+            // Costura: k = 0 y k = K son el mismo punto con índices distintos, así que
+            // cada uno ha recibido solo la mitad de sus caras. Sin sumar los dos
+            // acumuladores sus normales difieren y aparece una línea de sombreado a lo
+            // largo del tubo, aunque la geometría esté perfectamente cerrada.
             for (int32 i = 0; i < N; ++i)
             {
                 const int32 A = i * RingVerts;
@@ -348,21 +360,20 @@ namespace TreeMeshBuilder
                 FVector Nn = Accum[v].GetSafeNormal();
                 if (Nn.IsNearlyZero())
                 {
-                    continue; // vertice sin caras (o degenerado): se deja la radial
+                    continue; // vértice sin caras o degenerado: se queda con la radial
                 }
 
-                // Alinear al hemisferio de la normal radial preserva la
-                // convencion de cara exterior sin tener que volver a razonar el
-                // winding de cada abanico.
+                // Alinear la normal al hemisferio de la radial previa conserva la
+                // convención de cara exterior sin volver a razonar el orden de índices de
+                // cada abanico.
                 if (FVector::DotProduct(Nn, W.Normals[v]) < 0.f)
                 {
                     Nn = -Nn;
                 }
                 W.Normals[v] = Nn;
 
-                // Reortogonalizar la tangente contra la normal nueva: si no, el
-                // espacio tangente deja de ser ortonormal y el normal map de la
-                // corteza se descuadra.
+                // Reortogonalizar la tangente contra la normal nueva: sin esto el espacio
+                // tangente deja de ser ortonormal y el normal map de corteza se descuadra.
                 const FVector T = W.Tangents[v];
                 const FVector TOrtho = T - FVector::DotProduct(T, Nn) * Nn;
                 if (!TOrtho.IsNearlyZero())
@@ -372,7 +383,9 @@ namespace TreeMeshBuilder
             }
         }
 
-        // --- HOJAS ---
+        // ==== Hojas ====
+        // Los marcos de rotación mínima se pasan tal cual: el follaje los necesita para
+        // que el azimut de la espiral filotáctica no se retuerza a lo largo de la ramilla.
         TreeFoliage::Build(Skeleton, Wind, Species, FrameN, FrameB, FineLight, Seed, OutMesh.Leaves);
     }
 }

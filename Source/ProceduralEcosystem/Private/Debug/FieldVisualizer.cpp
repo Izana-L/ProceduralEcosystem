@@ -1,3 +1,19 @@
+/**
+ * @file FieldVisualizer.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del heatmap: textura transitoria, rampa de color y subida parcial
+ *        a GPU.
+ *
+ * Contiene la creación de la textura con la configuración que necesita un heatmap
+ * proyectado (sRGB, filtrado bilineal, direccionamiento por clamp, sin streaming ni
+ * mipmaps), la rampa de dos tramos evaluada en espacio lineal, la normalización del campo
+ * contra el rango dado o el suyo propio y la subida por regiones, cuyo buffer de origen
+ * libera el render thread cuando termina de usarlo.
+ *
+ * @ingroup eco_debug
+ * @see @ref bib_epicuetexturadinamica
+ */
+
 #include "Debug/FieldVisualizer.h"
 #include "Terrain/Field2D.h" 
 #include "Engine/Texture2D.h"
@@ -20,8 +36,8 @@ void UFieldVisualizer::Initialize(int32 InWidth, int32 InHeight)
 #if WITH_EDITORONLY_DATA
         DynamicTexture->MipGenSettings = TMGS_NoMipmaps;
 #endif
-        // Crea el recurso RHI UNA sola vez. A partir de aquí actualizamos con
-        // UpdateTextureRegions (barato) en vez de recrearlo.
+        // Única construcción del recurso RHI: los repintados posteriores van por
+        // UpdateTextureRegions y no vuelven a pasar por aquí.
         DynamicTexture->UpdateResource();
     }
 }
@@ -29,7 +45,8 @@ void UFieldVisualizer::Initialize(int32 InWidth, int32 InHeight)
 FColor UFieldVisualizer::Ramp(float T)
 {
     T = FMath::Clamp(T, 0.f, 1.f);
-    // azul (bajo) -> verde (medio) -> rojo (alto)
+    // Dos tramos interpolados en espacio lineal y convertidos a sRGB al final, que es la
+    // codificación con la que se ha marcado la textura.
     FLinearColor C;
     if (T < 0.5f)
     {
@@ -75,7 +92,9 @@ void UFieldVisualizer::UploadPixels()
 
     const int32 NumBytes = Width * Height * static_cast<int32>(sizeof(FColor));
 
-    
+    // Copia en heap de los píxeles y región también en heap: la subida es asíncrona, así
+    // que ni 'Pixels' ni una región en pila sobrevivirían al uso desde el render thread.
+    // El lambda de limpieza que se pasa abajo es el dueño de ambos.
     FColor* Buffer = static_cast<FColor*>(FMemory::Malloc(NumBytes));
     FMemory::Memcpy(Buffer, Pixels.GetData(), NumBytes);
 

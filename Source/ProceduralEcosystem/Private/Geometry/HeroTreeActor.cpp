@@ -1,7 +1,22 @@
+/**
+ * @file HeroTreeActor.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del actor de hero tree: generación, subida de la malla y depuración.
+ *
+ * Orquesta el pipeline de geometría para un árbol concreto: fija el margen de bounds que
+ * el viento necesita, pide la luz gruesa al subsistema vivo, encadena crecimiento y
+ * mallado, y sube las dos secciones al componente procedural pasando los vértices a
+ * coordenadas locales y convirtiendo las tangentes al tipo que espera esa API. Contiene
+ * también el dibujo de depuración del esqueleto y de la nube de atractores, único motivo
+ * por el que el actor tiene Tick.
+ *
+ * @ingroup eco_geometry
+ */
+
 #include "Geometry/HeroTreeActor.h"
 #include "Geometry/SpaceColonization.h"
-#include "Simulation/EcosystemSubsystem.h" // luz gruesa FRESCA en cada BuildNow
-#include "Config/EcosystemSettings.h"      // WindBoundsScale (fuente unica)
+#include "Simulation/EcosystemSubsystem.h" // luz gruesa fresca en cada BuildNow
+#include "Config/EcosystemSettings.h"      // WindBoundsScale: fuente única del margen
 #include "Species/SpeciesData.h"
 #include "ProceduralMeshComponent.h"
 #include "Engine/World.h"
@@ -9,11 +24,10 @@
 
 AHeroTreeActor::AHeroTreeActor()
 {
-    // El Tick de este actor SOLO sirve para el debug draw del esqueleto y los
-    // atractores. Optimizacion C7: arranca DESACTIVADO y lo enciende bDrawDebug.
-    // Con la cache LRU del gestor de LOD puede haber hasta 2*HeroBudget actores
-    // vivos (48 por defecto), y antes todos tickeaban cada frame solo para hacer
-    // un early-out. No son milisegundos, pero es coste puro y sale en stat game.
+    // El Tick de este actor solo sirve para el dibujo de depuración, así que arranca
+    // desactivado y lo enciende bDrawDebug. La caché del gestor de niveles de
+    // representación mantiene vivos hasta el doble del presupuesto de hero trees, y un
+    // Tick por actor que solo hace un early-out es coste puro que se ve en el perfilado.
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = false;
 
@@ -43,8 +57,8 @@ void AHeroTreeActor::Generate(const USpeciesData* InSpecies, uint32 Seed,
 
     SpeciesPtr = InSpecies;
     GenSeed = Seed;
-    // Solo se recuerda SI hay contexto de luz; el puntero al grid se pide fresco
-    // al subsistema en cada BuildNow (ver nota en el .h).
+    // Solo se recuerda si hay contexto de luz: el puntero a la rejilla se pide fresco al
+    // subsistema en cada BuildNow (ver la nota de bUseCoarseLight en la cabecera).
     bUseCoarseLight = (CoarseLight != nullptr);
     TrunkBaseWorld = WorldTrunkBase;
     SetActorLocation(WorldTrunkBase);
@@ -56,16 +70,16 @@ void AHeroTreeActor::Regenerate()
 {
     if (SpeciesPtr.IsValid())
     {
-        // Modo runtime: los parametros ya los fijo Generate().
+        // Modo runtime: los parámetros ya los fijó Generate().
         BuildNow();
         return;
     }
 
     if (DebugSpecies)
     {
-        // Uso suelto en editor: sin ecosistema, sin sombra de vecinos. Se
-        // releen especie/semilla/posicion cada vez (asi mover el actor o
-        // cambiar la semilla en el editor surte efecto).
+        // Uso suelto en el editor: sin ecosistema y sin sombra de vecinos. Especie,
+        // semilla y posición se releen cada vez, para que mover el actor o cambiar la
+        // semilla en el panel de detalles surta efecto.
         SpeciesPtr = DebugSpecies;
         GenSeed = (uint32)DebugSeed;
         bUseCoarseLight = false;
@@ -73,7 +87,7 @@ void AHeroTreeActor::Regenerate()
 
         BuildNow();
 
-        SpeciesPtr = nullptr; // no "pega" el estado runtime: proximo Regenerate re-lee
+        SpeciesPtr = nullptr; // no deja pegado el estado de runtime: el siguiente vuelve a leer
     }
 }
 
@@ -85,24 +99,24 @@ void AHeroTreeActor::BuildNow()
         return;
     }
 
-    // Fase 6 (6.1): margen de bounds para que el viento (WPO) no provoque
-    // culling prematuro. MISMA fuente (settings) que los componentes de
-    // instancing, para que hero e instancia lleven identico margen.
+    // Margen de bounds para que el desplazamiento de vértices del viento no provoque
+    // culling prematuro. Sale de los mismos ajustes que usan los componentes de
+    // instancing, para que hero e instancia lleven idéntico margen.
     Mesh->SetBoundsScale(FMath::Max(1.f, UEcosystemSettings::Get()->WindBoundsScale));
 
-    uint32 Rng = GenSeed; // stream local: la misma semilla da el mismo arbol
+    uint32 Rng = GenSeed; // stream local: la misma semilla da el mismo árbol
 
     FSpaceColonizationConfig Config;
     Config.bEnableSelfPruning = bEnableSelfPruning;
     Config.bEnablePhototropism = bEnablePhototropism;
-    // -1 (el caso del hero suelto en editor) = curvatura derivada de la semilla
-    // del propio arbol. El gestor de LOD lo rellena con la semilla de la variante
-    // para que el hero doble EXACTAMENTE como doblaba su instancia.
+    // Con -1, el caso del hero suelto en el editor, la curvatura se deriva de la semilla
+    // del propio árbol. El gestor de niveles de representación lo rellena con la semilla
+    // de la variante para que el hero doble exactamente como doblaba su instancia.
     Config.DeformSeedOverride = DeformSeedOverride;
 
-    // Luz gruesa FRESCA del subsistema vivo (nunca un puntero cacheado de otro
-    // frame: el dueño del grid es el subsistema y este actor puede sobrevivirle
-    // en la cache LRU del gestor de LOD).
+    // Luz gruesa fresca del subsistema vivo, nunca un puntero cacheado de otro frame: la
+    // rejilla es propiedad del subsistema y este actor puede sobrevivirle en la caché del
+    // gestor de niveles de representación.
     const FLightFieldCoarse* CoarseLight = nullptr;
     if (bUseCoarseLight)
     {
@@ -118,10 +132,10 @@ void AHeroTreeActor::BuildNow()
     SpaceColonization::GrowTree(*Sp, Rng, TrunkBaseWorld, CoarseLight, Config,
         Skeleton, FineLight, Attractors);
 
-    // Fase 6 (6.2): se le pasa al mallador la rejilla de luz FINA que acaba de
-    // dejar el SCA. De ahi sale el AO de copa por vertice: los mismos voxels que
-    // decidieron la autopoda oscurecen ahora el interior de la copa. Es la
-    // coherencia "material atado al campo de la simulacion" que pide el doc.
+    // Al mallador se le pasa la rejilla de luz fina tal y como la deja el crecimiento: de
+    // ahí sale la oclusión de copa por vértice, con lo que los mismos vóxeles que
+    // decidieron la autopoda oscurecen el interior de la copa y el material queda atado al
+    // campo de la simulación.
     TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData, &FineLight);
 
     UploadSection(0, MeshData.Wood, BarkMaterial);
@@ -141,10 +155,10 @@ void AHeroTreeActor::UploadSection(int32 SectionIndex, const FTreeMeshBuffers& B
         return;
     }
 
-    // Mundo -> local: la malla se guarda relativa a la base del tronco (que es
-    // la ubicacion del actor), no en coordenadas absolutas. Los pivotes de rama
-    // de la Fase 6 ya vienen en ESE mismo espacio local (ver TreeWindData.h), asi
-    // que no hay nada que convertir en ellos.
+    // Mundo -> local: la malla se guarda relativa a la base del tronco, que es la
+    // ubicación del actor, y no en coordenadas absolutas. Los pivotes de rama ya vienen en
+    // ese mismo espacio local (ver FTreeWindNode), así que en ellos no hay nada que
+    // convertir.
     const FVector Origin = TrunkBaseWorld;
     TArray<FVector> LocalVerts;
     LocalVerts.SetNumUninitialized(Buffers.Vertices.Num());
@@ -153,8 +167,8 @@ void AHeroTreeActor::UploadSection(int32 SectionIndex, const FTreeMeshBuffers& B
         LocalVerts[i] = Buffers.Vertices[i] - Origin;
     }
 
-    // FVector -> FProcMeshTangent (la conversion a la API de PMC vive aqui, no
-    // en el mallador, que es neutro).
+    // FVector -> FProcMeshTangent: la conversión a la API del componente vive aquí y no en
+    // el mallador, cuyos buffers son de formato neutro para servir también al horneado.
     TArray<FProcMeshTangent> Tangents;
     Tangents.SetNumUninitialized(Buffers.Tangents.Num());
     for (int32 i = 0; i < Buffers.Tangents.Num(); ++i)
@@ -162,21 +176,21 @@ void AHeroTreeActor::UploadSection(int32 SectionIndex, const FTreeMeshBuffers& B
         Tangents[i] = FProcMeshTangent(Buffers.Tangents[i], false);
     }
 
-    // FASE 6: se sube la malla con los CUATRO canales UV y el color de vertice.
-    // El UProceduralMeshComponent soporta exactamente UV0..UV3, que es justo el
-    // motivo de haber empaquetado los datos de viento en 4 canales y no en mas:
-    // asi el hero tree y la instancia horneada comparten material y un arbol no
-    // cambia de aspecto -ni deja de moverse- al cruzar de nivel de detalle.
+    // La malla sube con los cuatro canales UV y el color de vértice. El
+    // UProceduralMeshComponent soporta exactamente UV0..UV3, que es el motivo de haber
+    // empaquetado los datos de viento en cuatro canales y no en más: así el hero tree y la
+    // instancia horneada comparten material y un árbol no cambia de aspecto, ni deja de
+    // moverse, al cruzar de nivel de representación.
     Mesh->CreateMeshSection_LinearColor(
         SectionIndex,
         LocalVerts,
         Buffers.Triangles,
         Buffers.Normals,
-        Buffers.UVs,   // UV0: textura
-        Buffers.UV1,   // UV1: pivote.XY de la rama (metros, local)
-        Buffers.UV2,   // UV2: (pivote.Z, nivel de rama)
-        Buffers.UV3,   // UV3: (peso de balanceo, desfase)
-        Buffers.Colors,// (AO de copa, tinte, nivel, 1)
+        Buffers.UVs,   // UV0: textura de corteza u hoja
+        Buffers.UV1,   // UV1: pivote XY de la rama, en metros y local
+        Buffers.UV2,   // UV2: pivote Z y nivel de rama
+        Buffers.UV3,   // UV3: peso de balanceo y desfase
+        Buffers.Colors,// oclusión de copa, tinte, nivel y 1
         Tangents,
         /*bCreateCollision*/ false);
 
@@ -201,7 +215,7 @@ void AHeroTreeActor::Tick(float DeltaTime)
         return;
     }
 
-    // Esqueleto: linea de cada nodo a su padre (posiciones en mundo).
+    // Esqueleto: una línea de cada nodo a su padre, con las posiciones en mundo.
     for (int32 i = 0; i < Skeleton.Num(); ++i)
     {
         const int32 P = Skeleton.Nodes[i].Parent;
@@ -212,7 +226,7 @@ void AHeroTreeActor::Tick(float DeltaTime)
         }
     }
 
-    // Atractores: verde = vivo (aun perseguido), rojo = alcanzado o en sombra.
+    // Atractores: verde el que sigue vivo, rojo el alcanzado por una rama o en sombra.
     for (const FAttractor& A : Attractors.Attractors)
     {
         DrawDebugPoint(World, A.Pos, 4.f, A.bAlive ? FColor::Green : FColor::Red, false, -1.f, 0);
@@ -224,11 +238,11 @@ void AHeroTreeActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChang
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
 
-    // C7: el Tick solo existe para el debug draw, asi que sigue al flag tambien
+    // El Tick solo existe para el dibujo de depuración, así que sigue al flag también
     // cuando se marca desde el panel de detalles del editor.
     SetActorTickEnabled(bDrawDebug);
 
-    // Al tocar cualquier parametro en el editor, re-genera si hay especie de debug.
+    // Cualquier cambio de parámetro en el editor regenera el árbol si hay especie puesta.
     if (DebugSpecies)
     {
         Regenerate();

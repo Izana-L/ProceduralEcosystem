@@ -1,7 +1,28 @@
+/**
+ * @file Vigor.h
+ * @author Juan Luque Roldán
+ * @brief Función de vigor: el acoplamiento entre los campos de recursos y el crecimiento.
+ *
+ * Reúne las curvas de respuesta de una especie a la luz, al agua y a los nutrientes y
+ * la regla que las combina en el escalar de [0,1] que modula el crecimiento, alimenta
+ * el acumulador de estrés y decide la germinación. Cada curva tiene aquí su única
+ * copia —saturante de Monod, con semisaturación dependiente de la tolerancia a la
+ * sombra en el caso de la luz, o campana de nicho unimodal para agua y nutrientes— y
+ * EcoVigor::EvaluateVigor es el único punto del proyecto donde se evalúa el vigor, de
+ * modo que el tick, la germinación y el heatmap de idoneidad respondan con el mismo
+ * número. Todo inline salvo los Make*Response y el bake, que viven en Vigor.cpp.
+ *
+ * @ingroup eco_ecology
+ * @see @ref bib_liebig1840
+ * @see @ref bib_monod1949
+ * @see @ref bib_nichounimodal
+ * @see @ref bib_toleranciasombra
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Ecology/CarbonModel.h" // Fase 6: multiplicador de CO2
+#include "Ecology/CarbonModel.h" // EcoCarbon::FCO2Params (multiplicador de CO2)
 #include "Config/EcosystemSettings.h" // EEcoVigorCombine (UENUM: tiene que vivir en cabecera reflejada)
 
 struct FField2D;
@@ -11,36 +32,7 @@ struct FNutrientField;
 struct FLightFieldCoarse;
 class  USpeciesData;
 
-/**
- * Funcion de VIGOR: el acoplamiento entre los campos de recursos (agua,
- * nutrientes, luz) y el crecimiento. Es "el pegamento" de la Fase 1 y la
- * funcion central que consumira toda la simulacion de la Fase 2.
- *
- * Ley del minimo de Liebig (documento de diseno, 2.6):
- *
- *     fL = Q / (Q + KlMax*(1 - ShadeTolerance) + eps)     luz (tol. a la sombra)
- *     fW = (W/WaterDemand)   / ((W/WaterDemand)   + 1)     agua       (Monod)
- *     fN = (N/NutrientDemand)/ ((N/NutrientDemand)+ 1)     nutrientes (Monod)
- *     vigor = min(fL, fW, fN)          <- el recurso mas ESCASO limita
- *
- * FASE 6 (doc. 6.3): sobre ese minimo se aplica ademas un multiplicador
- * analitico de CO2 (Ecology/CarbonModel.h), que baja levemente el vigor dentro
- * de un dosel denso y a poca altura. Se pasa como puntero OPCIONAL: si es
- * nullptr no se aplica, de modo que todo el codigo anterior a la Fase 6 sigue
- * dando exactamente los mismos numeros.
- *
- * Un arbol en suelo rico pero a la sombra sigue limitado por la luz -> realista,
- * y ademas genera variedad: distintas zonas del paisaje quedan limitadas por
- * distinto recurso (ver EEcoLimiter).
- *
- * Todo son floats: los factores viven en [0,1] y el vigor tambien. Las tres
- * funciones de factor son inline (header) porque la Fase 2 las llamara por
- * agente en el bucle caliente; mantenerlas identicas aqui y alli garantiza que
- * el heatmap de idoneidad y el crecimiento real usen EXACTAMENTE la misma
- * formula.
- */
-
- /** Que recurso esta limitando el vigor en un punto (el argmin de Liebig). */
+/** Recurso que está limitando el vigor en un punto: el argmin de los tres factores. */
 enum class EEcoLimiter : uint8
 {
     Light,
@@ -48,15 +40,36 @@ enum class EEcoLimiter : uint8
     Nutrient
 };
 
+/**
+ * Curvas de respuesta a los recursos y regla que las combina en el vigor.
+ *
+ * @code
+ * fL = Amax * Q / (Q + KlMax*(1 - ShadeTolerance) + LightEps)   luz
+ * fW = (W/WaterDemand)    / ((W/WaterDemand)    + 1)            agua       (Monod)
+ * fN = (N/NutrientDemand) / ((N/NutrientDemand) + 1)            nutrientes (Monod)
+ * vigor = min(fL, fW, fN)                                       ley del mínimo
+ * @endcode
+ *
+ * Con la respuesta de nicho activa, fW y fN pasan a ser campanas unimodales
+ * (@ref NicheFactor) y el modo de combinación lo elige @ref EvaluateVigor. Un árbol en
+ * suelo rico pero a la sombra sigue limitado por la luz, y distintas zonas del paisaje
+ * quedan limitadas por distinto recurso (@ref EEcoLimiter). Factores y vigor viven en
+ * [0,1]; el multiplicador de CO2 (@ref EcoCarbon::CO2Factor) se aplica fuera, sobre el
+ * resultado, porque depende del individuo y no del punto.
+ */
 namespace EcoVigor
 {
-    /** Epsilon del denominador de luz (evita 0/0 en oscuridad total). Igual al del documento. */
+    /** Épsilon del denominador de la curva de luz: evita 0/0 en oscuridad total. */
     static constexpr float LightEps = 1e-4f;
 
     /**
-     * Factor de luz con tolerancia a la sombra. Kl = KlMax*(1-ShadeTolerance):
-     * una especie tolerante (ShadeTolerance->1) satura con poca luz; una
-     * heliofila (->0) necesita Q alto. Q es la luz disponible tras la sombra.
+     * Factor de luz con tolerancia a la sombra, @f$ f_L = Q/(Q + K_l + \varepsilon) @f$
+     * con @f$ K_l = K_{lMax}(1 - s) @f$: una especie tolerante (s→1) satura con poca
+     * luz y una heliófila (s→0) necesita Q alto.
+     *
+     * @param Q     Luz disponible en el punto, ya atenuada por el dosel.
+     * @param KlMax Semisaturación de la especie menos tolerante a la sombra.
+     * @return Factor en [0,1), sin el techo de asimilación de la especie.
      */
     FORCEINLINE float LightFactor(float Q, float ShadeTolerance, float KlMax)
     {
@@ -65,28 +78,31 @@ namespace EcoVigor
     }
 
     /**
-     * Respuesta de UNA especie a la luz, ya resuelta contra los settings.
-     * Mismo patron que FResourceResponse: se construye una vez con
-     * MakeLightResponse y se evalua con LightFactor.
+     * Respuesta de UNA especie a la luz, ya resuelta contra los settings. Mismo patrón
+     * que FResourceResponse: se construye una vez con @ref MakeLightResponse y se
+     * evalúa con @ref LightFactor.
      */
     struct FLightResponse
     {
+        /** Semisaturación de la especie menos tolerante, en unidades de luz. */
         float KlMax = 5.f;
+
+        /** Tolerancia a la sombra de la especie, en [0,1]. */
         float ShadeTolerance = 0.f;
 
         /**
-         * Capacidad fotosintetica MAXIMA de la especie, Amax(s) = 1 - c*s.
+         * Capacidad fotosintética máxima de la especie, @f$ A_{max}(s) = 1 - c\,s @f$.
          *
-         * Es el coste de la tolerancia a la sombra, y sin el ShadeTolerance es una
-         * ventaja estrictamente monotona y gratuita: sube fL a cualquier nivel de
-         * luz -tambien a pleno sol- sin costar nada en ninguna otra ecuacion. Con
-         * el coste, la curva de la pionera y la de la tolerante SE CRUZAN, y esa es
-         * la unica forma de que ninguna gane en todas partes.
+         * Es el coste de la tolerancia a la sombra. Sin él, ShadeTolerance sería una
+         * ventaja estrictamente monótona y gratuita: sube fL a cualquier nivel de luz
+         * —también a pleno sol— sin costar nada en ninguna otra ecuación. Con el coste,
+         * las curvas de la pionera y de la tolerante se cruzan, que es la única forma
+         * de que ninguna gane en todas partes.
          */
         float MaxAssimilation = 1.f;
     };
 
-    /** Evalua la curva de luz con el coste de tolerancia aplicado. */
+    /** Evalúa la curva de luz con el coste de la tolerancia aplicado. */
     FORCEINLINE float LightFactor(float Q, const FLightResponse& R)
     {
         return R.MaxAssimilation * LightFactor(Q, R.ShadeTolerance, R.KlMax);
@@ -95,59 +111,57 @@ namespace EcoVigor
     /** Factor de recurso saturante (Monod). Vale 0.5 cuando Resource == Demand. */
     FORCEINLINE float MonodFactor(float Resource, float Demand)
     {
-        // Demand llega ya con ClampMin>0 desde USpeciesData; el max es un cinturon
-        // de seguridad por si alguien construye un species en codigo sin validar.
+        // Demand llega con ClampMin>0 desde USpeciesData; el máximo es el cinturón de
+        // seguridad para una especie construida en código sin pasar por la validación.
         const float R = Resource / FMath::Max(Demand, KINDA_SMALL_NUMBER);
         return R / (R + 1.f);
     }
 
+    /** Factor de agua: Monod sobre la demanda hídrica de la especie. */
     FORCEINLINE float WaterFactor(float W, float WaterDemand) { return MonodFactor(W, WaterDemand); }
+
+    /** Factor de nutrientes: Monod sobre la demanda de nutrientes de la especie. */
     FORCEINLINE float NutrientFactor(float N, float NutrientDemand) { return MonodFactor(N, NutrientDemand); }
 
     // =====================================================================
-    //  NICHO DE RECURSO: respuesta UNIMODAL
+    //  Respuesta de nicho: campana unimodal frente a saturante
     // =====================================================================
-    // MonodFactor es MONOTONA CRECIENTE: "mas agua es mejor" es cierto para
-    // todas las especies a la vez. Con esa forma, dos especies NUNCA pueden
-    // repartirse un gradiente de humedad -solo cambia CUANTO les gusta el sitio
-    // humedo, no CUAL es su sitio-, y el resultado es que la mejor en el eje
-    // gana en todo el mapa: exclusion competitiva garantizada por la forma de la
-    // curva, antes incluso de mirar los numeros.
-    //
-    // La respuesta unimodal le da a cada especie un OPTIMO y una ANCHURA. La de
-    // vaguada gana en la vaguada y la de ladera seca en la ladera, y la
-    // coexistencia se sostiene sola porque cada una es la mejor EN ALGUN SITIO.
-    // Eso es lo que convierte la heterogeneidad que ya calcula la Fase 1 (TWI
-    // del agua, fBm de los nutrientes) en un tablero con varias casillas
-    // ganadoras en vez de en un ranking global.
+    // MonodFactor es monótona creciente —«más agua es mejor» vale para todas las
+    // especies a la vez—, así que la mejor en el eje gana en todo el mapa y la
+    // exclusión competitiva queda decidida por la forma de la curva antes de mirar
+    // los números. La campana unimodal da a cada especie un óptimo y una anchura: la
+    // de vaguada gana en la vaguada y la de ladera seca en la ladera. Es lo que
+    // convierte la heterogeneidad del terreno (TWI del agua, fBm de los nutrientes)
+    // en un tablero con varias casillas ganadoras en vez de en un ranking global.
 
     /**
-     * Campana gaussiana centrada en Optimum: vale 1 en el optimo y cae a los dos
-     * lados con escala Width (a una anchura del optimo queda en e^-1 = 0.37).
+     * Campana gaussiana centrada en Optimum: vale 1 en el óptimo y cae a los dos lados
+     * con escala Width (a una anchura del óptimo queda en @f$ e^{-1} = 0{,}37 @f$).
      *
-     * DeficitWidth y ExcessWidth son las anchuras de las dos ramas. Que la de
-     * exceso sea MAYOR es como se expresa "un suelo mas rico (o mas humedo) de lo
-     * que la especie necesita la perjudica menos que quedarse corta" sin renunciar
-     * a la unimodalidad, que es lo unico que reparte territorio entre especies.
+     * Las dos ramas tienen anchura propia. Que la de exceso sea mayor expresa que un
+     * suelo más rico —o más húmedo— de lo que la especie necesita la perjudica menos
+     * que quedarse corta, sin renunciar a la unimodalidad, que es lo que reparte
+     * territorio entre especies.
      *
-     * Resource, Optimum y Width van todos en las UNIDADES DEL CAMPO (los mismos
-     * valores que devuelve SampleWater/SampleNutrient), no normalizados: la
-     * conversion desde la fraccion que guarda el asset la hacen Make*Response.
+     * @param Resource     Valor del campo en el punto, en unidades del campo.
+     * @param Optimum      Óptimo de la especie, en las mismas unidades.
+     * @param DeficitWidth Anchura de la rama por debajo del óptimo.
+     * @param ExcessWidth  Anchura de la rama por encima; <= 0 satura la respuesta en 1.
+     * @return Factor en (0,1].
+     * @note Nada de esto va normalizado: la conversión desde la fracción que guarda el
+     *       asset a unidades del campo la hacen los Make*Response.
      */
     FORCEINLINE float NicheFactor(float Resource, float Optimum, float DeficitWidth, float ExcessWidth)
     {
         const float Delta = Resource - Optimum;
 
-        // Rama derecha (exceso) con su propia anchura: una campana ASIMETRICA sigue
-        // siendo unimodal -y por tanto sigue repartiendo territorio- mientras deja
-        // que pasarse de humedo o de fertil cueste menos que quedarse corto, que es
-        // lo que se queria decir con "un suelo mas rico no hace dano".
+        // Rama de exceso con anchura propia: la campana asimétrica sigue siendo
+        // unimodal, y por tanto sigue repartiendo territorio.
         //
-        // ExcessWidth <= 0 recorta la respuesta a 1 por encima del optimo. Es el
-        // comportamiento anterior y NO es inocuo: la curva deja de ser unimodal y se
-        // vuelve monotona no decreciente, con lo que un optimo mas bajo pasa a ser
-        // mejor-o-igual en el 100% de las celdas. Se conserva solo para poder
-        // reproducir corridas antiguas.
+        // ExcessWidth <= 0 recorta la respuesta a 1 por encima del óptimo y no es
+        // inocuo: la curva se vuelve monótona no decreciente y un óptimo más bajo pasa
+        // a ser mejor-o-igual en el 100% de las celdas. Solo sirve para reproducir
+        // corridas hechas con esa configuración.
         if (Delta > 0.f)
         {
             if (ExcessWidth <= 0.f) { return 1.f; }
@@ -160,36 +174,38 @@ namespace EcoVigor
     }
 
     /**
-     * Respuesta de UNA especie a UN recurso, ya resuelta a las unidades del
-     * campo. Se construye con Make*Response y se evalua con ResourceFactor.
+     * Respuesta de UNA especie a UN recurso, ya resuelta a las unidades del campo. Se
+     * construye con Make*Response y se evalúa con @ref ResourceFactor.
      *
-     * Lleva los dos modelos a la vez a proposito: bUseNiche sale de
-     * UEcosystemSettings::bUseNicheResponse, asi que se puede comparar A/B el
-     * comportamiento nuevo con el anterior cambiando UNA clave del .ini, sin
-     * tocar assets ni recompilar.
+     * Lleva los dos modelos a la vez a propósito: bUseNiche sale de
+     * UEcosystemSettings::bUseNicheResponse, así que comparar campana y saturante es
+     * cambiar una clave del .ini, sin tocar assets ni recompilar.
      */
     struct FResourceResponse
     {
-        /** Solo se usa con bUseNiche=false (modelo Monod anterior). */
+        /** Demanda de la especie; solo interviene con bUseNiche=false (curva de Monod). */
         float Demand = 1.f;
 
-        /** Optimo y anchura en unidades del campo (ya multiplicados por su maximo). */
+        /** Óptimo de la especie en unidades del campo (la fracción del asset por su máximo). */
         float OptimumAbs = 5.f;
+
+        /** Anchura de la rama por DEBAJO del óptimo, en las mismas unidades. */
         float WidthAbs = 3.5f;
 
-        /** Anchura de la rama por ENCIMA del optimo. <= 0 = saturar en 1 (ver NicheFactor). */
+        /** Anchura de la rama por ENCIMA del óptimo; <= 0 satura en 1 (@ref NicheFactor). */
         float ExcessWidthAbs = 3.5f;
 
+        /** Curva elegida: campana de nicho si es true, saturante de Monod si no. */
         bool  bUseNiche = false;
     };
 
-    /** Solo la campana de tolerancia (sin decidir entre nicho y Monod). */
+    /** Solo la campana de tolerancia, sin decidir entre nicho y Monod. */
     FORCEINLINE float NicheOnly(float Available, const FResourceResponse& R)
     {
         return NicheFactor(Available, R.OptimumAbs, R.WidthAbs, R.ExcessWidthAbs);
     }
 
-    /** Evalua la respuesta elegida. Unico punto donde se decide que curva se usa. */
+    /** Evalúa la respuesta elegida: único punto donde se decide qué curva se usa. */
     FORCEINLINE float ResourceFactor(float Available, const FResourceResponse& R)
     {
         return R.bUseNiche ? NicheOnly(Available, R) : MonodFactor(Available, R.Demand);
@@ -199,9 +215,9 @@ namespace EcoVigor
      * Construyen la respuesta de una especie resolviendo las fracciones del asset
      * contra WaterOutputMax / NutrientOutputMax de los settings.
      *
-     * El asset guarda FRACCIONES [0..1] y no valores absolutos justamente para
-     * que cambiar el rango de salida de un campo no invalide en silencio la
-     * calibracion de las especies.
+     * El asset guarda fracciones de [0,1] y no valores absolutos precisamente para que
+     * cambiar el rango de salida de un campo no invalide en silencio la calibración de
+     * las especies.
      */
     PROCEDURALECOSYSTEM_API FResourceResponse MakeWaterResponse(
         const USpeciesData& Species, const UEcosystemSettings& Settings);
@@ -213,12 +229,12 @@ namespace EcoVigor
         const USpeciesData& Species, const UEcosystemSettings& Settings);
 
     /**
-     * Las TRES respuestas de una especie, resueltas de una vez.
+     * Las tres respuestas de una especie, resueltas de una vez.
      *
-     * Se construyen una sola vez por tick -no por arbol: son identicas para todos
-     * los individuos de la especie- y se pasan por valor al bucle paralelo, asi que
-     * dentro del ParallelFor no se toca ni un UObject. Y garantizan que el tick, la
-     * germinacion, el heatmap y la auditoria evaluen literalmente las mismas curvas.
+     * Se construyen una vez por tick —no por árbol: son idénticas para todos los
+     * individuos de la especie— y se pasan por valor al bucle paralelo, de modo que
+     * dentro del ParallelFor no se toca ni un UObject. Garantizan además que el tick,
+     * la germinación, el heatmap y la auditoría evalúen las mismas curvas.
      */
     struct FSpeciesResponses
     {
@@ -230,20 +246,28 @@ namespace EcoVigor
     PROCEDURALECOSYSTEM_API FSpeciesResponses MakeSpeciesResponses(
         const USpeciesData& Species, const UEcosystemSettings& Settings);
 
-    /** Ley del minimo: el recurso mas escaso manda. */
+    /** Ley del mínimo: el recurso más escaso manda. */
     FORCEINLINE float Combine(float fL, float fW, float fN)
     {
         return FMath::Min3(fL, fW, fN);
     }
 
-    /** Media geometrica de los tres factores: todos pesan, siempre. */
+    /**
+     * Media geométrica de los tres factores: todos pesan siempre y, con el exponente
+     * 1/3, se conserva la escala del vigor (tres factores de 0.6 dan 0.6), de modo que
+     * los umbrales de estrés y los GrowthRate de los assets siguen calibrados.
+     */
     FORCEINLINE float CombineGeometric(float fL, float fW, float fN)
     {
         const float Product = FMath::Max(fL, 0.f) * FMath::Max(fW, 0.f) * FMath::Max(fN, 0.f);
         return (Product > 0.f) ? FMath::Pow(Product, 1.f / 3.f) : 0.f;
     }
 
-    /** Igual que Combine pero ademas dice CUAL de los tres es el limitante. */
+    /**
+     * Igual que @ref Combine, pero devuelve además cuál de los tres es el limitante.
+     * @param OutLimiter Recibe el argmin; los empates se resuelven en el orden luz,
+     *                   agua, nutrientes.
+     */
     FORCEINLINE float CombineWithLimiter(float fL, float fW, float fN, EEcoLimiter& OutLimiter)
     {
         float V = fL; OutLimiter = EEcoLimiter::Light;
@@ -253,22 +277,21 @@ namespace EcoVigor
     }
 
     /**
-     * =====================================================================
-     *  EL UNICO SITIO DONDE SE EVALUA EL VIGOR
-     * =====================================================================
-     * Devuelve el vigor de una especie en un punto y, de paso, que recurso lo
-     * limita. Lo llaman el tick, la germinacion y el horneado del heatmap: si
-     * cada uno montara la formula por su cuenta, el mapa de idoneidad dejaria de
-     * explicar por que el bosque crece donde crece en cuanto uno de los tres se
-     * quedara atras. (Es el mismo motivo por el que LightFactor y MonodFactor
-     * tienen una sola copia; aqui se extiende a la combinacion entera.)
+     * Único punto del proyecto donde se evalúa el vigor: devuelve la calidad del sitio
+     * para una especie y, de paso, qué recurso la limita. Lo llaman el tick, la
+     * germinación y el horneado del heatmap; si cada uno montara la fórmula por su
+     * cuenta, el mapa de idoneidad dejaría de explicar por qué el bosque crece donde
+     * crece en cuanto uno de los tres se quedara atrás.
      *
-     * El LIMITANTE que devuelve es siempre el argmin de los tres factores, en
-     * cualquier modo: la pregunta "que recurso esta frenando a este arbol" tiene
-     * la misma respuesta se combinen luego como se combinen.
+     * El limitante es siempre el argmin de los tres factores, sea cual sea el modo: la
+     * pregunta «qué recurso frena a este árbol» tiene una única respuesta.
      *
-     * NO aplica el multiplicador de CO2: ese depende de la altura de copa del
-     * individuo, que no es una propiedad del punto. Lo pone el llamante.
+     * @param Mode       Modo de combinación. El híbrido MinSupplyTimesNiche exige
+     *                   respuesta de nicho activa y, sin ella, degenera en Minimum.
+     * @param OutLimiter Recibe el recurso limitante.
+     * @return Vigor en [0,1].
+     * @note No aplica el multiplicador de CO2: depende de la altura de copa del
+     *       individuo, que no es una propiedad del punto. Lo pone el llamante.
      */
     FORCEINLINE float EvaluateVigor(
         float LightQ, float WaterAvailable, float NutrientAvailable,
@@ -277,10 +300,9 @@ namespace EcoVigor
     {
         const float fL = LightFactor(LightQ, Light);
 
-        // Hibrido: el minimo decide entre SUMINISTROS (curvas Monod, recursos que
-        // se consumen y se agotan) y las tolerancias multiplican aparte. Sin
-        // respuesta de nicho activa no hay tolerancias que separar y degenera en
-        // la ley del minimo, que es justo lo que debe hacer.
+        // Híbrido: el mínimo decide entre SUMINISTROS (curvas de Monod, recursos que se
+        // consumen y se agotan) y las TOLERANCIAS multiplican aparte, porque son aptitud
+        // y no disponibilidad. Sin respuesta de nicho no hay tolerancias que separar.
         if (Mode == EEcoVigorCombine::MinSupplyTimesNiche && Water.bUseNiche)
         {
             const float fWs = MonodFactor(WaterAvailable, Water.Demand);
@@ -298,7 +320,7 @@ namespace EcoVigor
             : MinValue;
     }
 
-    /** Atajo sobre el paquete de respuestas de una especie. */
+    /** Atajo sobre el paquete de respuestas de una especie (@ref FSpeciesResponses). */
     FORCEINLINE float EvaluateVigor(float LightQ, float WaterAvailable, float NutrientAvailable,
         const FSpeciesResponses& R, EEcoVigorCombine Mode, EEcoLimiter& OutLimiter)
     {
@@ -306,38 +328,28 @@ namespace EcoVigor
     }
 
     /**
-     * Rellena un campo de IDONEIDAD (vigor en [0,1]) para una especie sobre toda
-     * la rejilla del relieve: en cada nodo muestrea agua/nutrientes/luz al nivel
-     * del suelo y evalua Liebig. Es lo que pinta el heatmap de la Fase 1.
+     * Hornea el campo de idoneidad de una especie sobre la rejilla del relieve: en cada
+     * nodo muestrea agua, nutrientes y luz a ras de suelo y evalúa el vigor. Es el campo
+     * que pinta el heatmap de idoneidad.
      *
-     * OJO A QUE CAMPOS SE LE PASAN. Water y Nutrient son FField2D crudos
-     * precisamente para que el llamante elija: el campo BASE es el potencial del
-     * terreno -congelado, optimista- mientras que el POOL es lo que los arboles
-     * leen de verdad, ya deprimido por el consumo. La diferencia no es cosmetica:
-     * un bosque denso puede bajar la mediana de nutrientes un 20%, y un mapa de
-     * idoneidad calculado sobre el base declara "cada especie tiene su zona" sobre
-     * un reparto que en el pool real ya no existe. Pasa SIEMPRE el pool cuando la
-     * simulacion este corriendo.
+     * OutSuitability se reinicializa con la misma geometría que Height.Field, así que el
+     * TArray resultante encaja en el UFieldVisualizer junto al resto de campos.
      *
-     * OutSuitability se reinicializa con la MISMA geometria que Height.Field, de
-     * modo que el TArray<float> resultante encaja directamente en el
-     * UFieldVisualizer (mismo tamano que el resto de campos).
-     *
-     * @param Responses   Las tres respuestas de la especie (MakeSpeciesResponses).
-     * @param CombineMode El MISMO que usa el tick (settings). Ambos se pasan ya
-     *                     construidos para que el heatmap evalue exactamente la
-     *                     misma curva que el tick: si el mapa de idoneidad y el
-     *                     crecimiento real usaran modelos distintos, el heatmap
-     *                     dejaria de servir para explicar por que el bosque crece
-     *                     donde crece.
-     * @param OutLimiter  Opcional: si no es null, se rellena con el limitante por
-     *                     nodo (0=luz,1=agua,2=nutrientes) para un mapa cualitativo.
-     * @param CO2         Fase 6: si no es nullptr se aplica el multiplicador de
-     *                     CO2 (doc. 6.3) a ras de suelo, igual que hace el tick.
-     *                     Pasarlo es importante para que el heatmap siga
-     *                     representando el MISMO numero que usa el tick; si no,
-     *                     el mapa de idoneidad y el crecimiento real dejarian
-     *                     de cuadrar.
+     * @param Water       Campo de agua a muestrear (ver la advertencia).
+     * @param Nutrient    Campo de nutrientes, con el mismo criterio.
+     * @param Responses   Las tres respuestas de la especie (@ref MakeSpeciesResponses).
+     * @param CombineMode El mismo modo que usa el tick; con otro, el mapa deja de
+     *                    explicar el crecimiento real.
+     * @param OutLimiter  Opcional: limitante por nodo (0=luz, 1=agua, 2=nutrientes).
+     * @param CO2         Opcional: aplica el multiplicador de CO2 a ras de suelo, igual
+     *                    que hace el tick. Pasarlo mantiene el heatmap y el crecimiento
+     *                    real sobre el mismo número.
+     * @warning Water y Nutrient son FField2D crudos para que el llamante elija: el campo
+     *          base es el potencial del terreno, congelado y optimista, y el pool es lo
+     *          que los árboles leen de verdad, ya deprimido por el consumo. Con la
+     *          simulación corriendo hay que pasar el pool; un bosque denso puede haber
+     *          bajado la mediana de nutrientes un 20%, y sobre el base el mapa declara
+     *          un reparto de nicho que ya no existe.
      */
     PROCEDURALECOSYSTEM_API void BakeSuitabilityField(
         const FHeightField& Height,

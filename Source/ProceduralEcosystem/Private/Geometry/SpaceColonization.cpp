@@ -1,34 +1,62 @@
+/**
+ * @file SpaceColonization.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del motor de colonización del espacio y del pipeline de generación.
+ *
+ * Contiene las piezas puras que declara la cabecera —mezcla de tropismos, jitter de
+ * dirección, ángulo de inserción, pipe model y perfil de tronco—, los dos helpers
+ * privados del crecimiento —la dirección del eje principal, sinuosa por ruido de
+ * gradiente 1D sobre la altura, y la marca de atractores alcanzados— y GrowTree, que
+ * orquesta la secuencia completa: sembrar la nube, dimensionar y sembrar la rejilla de
+ * luz fina, podar lo que nace en sombra, indexar, encadenar el eje y entrar en el bucle
+ * asociar-crecer-matar con refresco periódico de luz, para terminar doblando el árbol y
+ * asignándole radios. Es la única secuencia del módulo: no hay tick, toda la carga es
+ * puntual en el momento de generar un árbol.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_runions2007
+ * @see @ref bib_prusinkiewicz1990
+ * @see @ref bib_shinozaki1964
+ * @see @ref bib_metzger1893
+ * @see @ref bib_perlin1985
+ */
+
 #include "Geometry/SpaceColonization.h"
 #include "Geometry/TreeSkeleton.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Geometry/AttractorCloud.h"
-#include "Geometry/TrunkDeformer.h" // doblado por-arbol del esqueleto terminado
+#include "Geometry/TrunkDeformer.h" // doblado del esqueleto terminado, por árbol
 #include "Terrain/LightFieldCoarse.h"
 #include "Species/SpeciesData.h"
-#include "Core/EcoCore.h"     // EcoRand
-#include "Core/EcoGeometry.h" // AnyPerpendicular (copia unica, ver la cabecera)
+#include "Core/EcoCore.h"     // EcoRand: generador determinista
+#include "Core/EcoGeometry.h" // AnyPerpendicular: copia única del proyecto
 
 namespace
 {
     /**
-     * Tope de inclinacion del eje respecto a la vertical (~20 grados).
+     * Tope de inclinación del eje respecto a la vertical, unos 20 grados.
      *
-     * No es solo estetico: el bucle que encadena el eje avanza D*cos(Theta) en
-     * Z, no D, y su condicion de parada es en Z. Sin tope, un angulo grande
-     * hace que el eje avance casi nada por paso y el bucle se dispare.
+     * No es solo estético: el bucle que encadena el eje avanza @f$D\cos\theta@f$ en Z,
+     * no @f$D@f$, y su condición de parada es en Z. Sin tope, un ángulo grande hace que
+     * el eje avance casi nada por paso y el bucle se dispare.
      */
     constexpr float MaxAxisTiltRad = 0.35f;
 
     /**
-     * Direccion del eje principal a la altura H sobre la base.
+     * Dirección unitaria del eje principal a la altura H sobre la base del tronco.
      *
-     * Dos capas superpuestas, las dos de ruido 1D sobre la ALTURA (no aleatorio
-     * por nodo): asi la sucesion de direcciones es continua y el eje describe
-     * una CURVA, no una poligonal temblorosa.
-     *   - sweep:  longitud de onda ~ el arbol entero -> la inclinacion suave del
-     *             fuste completo, que es como se inclina un arbol de verdad.
-     *   - wobble: longitud de onda corta -> el serpenteo que quita la lectura de
-     *             "extrusion perfecta".
+     * Dos capas de ruido de gradiente 1D evaluadas sobre la ALTURA, no una tirada
+     * aleatoria por nodo: así la sucesión de direcciones es continua y el eje describe
+     * una curva en vez de una poligonal temblorosa.
+     *
+     * @li sweep: longitud de onda del orden del árbol entero, la inclinación suave del
+     *     fuste completo.
+     * @li wobble: longitud de onda corta, el serpenteo que rompe la lectura de
+     *     extrusión perfecta.
+     *
+     * @param SweepAzim Azimut base de la inclinación; el ruido lo modula, de modo que un
+     *                  árbol no se inclina siempre hacia el mismo lado.
+     * @return Vector unitario, la vertical exacta si ambas amplitudes son nulas.
      */
     FVector AxisDirection(float H, float SweepRad, float WobbleRad,
         float SweepWaveCm, float WobbleWaveCm,
@@ -36,7 +64,7 @@ namespace
     {
         if (SweepRad <= 0.f && WobbleRad <= 0.f)
         {
-            return FVector::UpVector; // eje recto: comportamiento anterior
+            return FVector::UpVector; // sin sinuosidad: eje perfectamente recto
         }
 
         const float NA = FMath::PerlinNoise1D(SweepPhase + H / SweepWaveCm);
@@ -52,14 +80,11 @@ namespace
     }
 
     /**
-     * Marca como alcanzados los atractores vivos a menos de RadiusCm de Pos
-     * (paso "MATAR" del SCA).
+     * Paso MATAR: marca como alcanzados los atractores vivos a menos de RadiusCm de Pos.
      *
-     * El SCA lo hacia dos veces con el bloque copiado: una tras pre-construir el
-     * eje -que atraviesa la copa y se come atractores por el camino- y otra por
-     * cada hijo nuevo de cada iteracion. Con una sola copia, el criterio de
-     * "alcanzado" (consulta por rango + distancia real al cuadrado) no puede
-     * divergir entre las dos.
+     * Copia única del criterio de «alcanzado» —consulta por rango sobre el índice y
+     * distancia real al cuadrado—, que se aplica en dos sitios: sobre cada nodo del eje
+     * pre-construido, que atraviesa la copa, y sobre cada hijo nuevo de cada iteración.
      */
     void KillAttractorsNear(FAttractorCloud& Cloud, const FVector& Pos, float RadiusCm)
     {
@@ -87,7 +112,8 @@ namespace SpaceColonization
             + wPhot * LightGradient
             + wPrev * DirPrev;
 
-        // Si todo se cancela, caemos a la direccion del SCA (o arriba).
+        // Si los términos se cancelan entre sí, se cae a la dirección de los
+        // atractores; si ésa también es nula, a la vertical.
         const FVector FallBack = DirSCA.IsNearlyZero() ? FVector::UpVector : DirSCA;
         return Blended.GetSafeNormal(SMALL_NUMBER, FallBack);
     }
@@ -99,9 +125,9 @@ namespace SpaceColonization
             return Dir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
         }
 
-        // Vector aleatorio en el cubo [-1,1]^3 -> direccion aleatoria; se suma a
-        // Dir escalado por el ruido y se renormaliza. Un angulo mayor cuanto
-        // mayor NoiseAmount, acotado para no invertir la direccion.
+        // Vector aleatorio en el cubo [-1,1]^3, sumado a Dir escalado por el ruido y
+        // renormalizado. La desviación angular crece con NoiseAmount; el clamp a 1
+        // impide que el término perturbador domine y llegue a invertir la dirección.
         const FVector R(
             EcoRand::NextRange(RngState, -1.f, 1.f),
             EcoRand::NextRange(RngState, -1.f, 1.f),
@@ -126,13 +152,13 @@ namespace SpaceColonization
         const float CosMin = FMath::Cos(MinAngle);
         if (C <= CosMin)
         {
-            return Dn; // ya se separa lo suficiente: no tocamos lo que eligio el SCA
+            return Dn; // ya se separa lo suficiente: se respeta lo que eligieron los atractores
         }
 
-        // Componente de Dir perpendicular al padre. Girar DENTRO de ese plano es
-        // el giro minimo que consigue el angulo pedido, o sea el que menos
-        // estropea la direccion hacia los atractores. Si Dir es paralelo al
-        // padre no hay plano que preservar y cualquier perpendicular sirve.
+        // Componente de Dir perpendicular al padre. Girar DENTRO de ese plano es el
+        // giro mínimo que alcanza el ángulo pedido, o sea el que menos estropea la
+        // dirección hacia los atractores. Si Dir es paralelo al padre no hay plano
+        // que preservar y cualquier perpendicular sirve.
         FVector Perp = Dn - C * P;
         if (Perp.IsNearlyZero())
         {
@@ -155,9 +181,10 @@ namespace SpaceColonization
         const double TipR = FMath::Max((double)KINDA_SMALL_NUMBER, (double)Species.TipRadiusCm);
         const double TipTaper = FMath::Clamp((double)Species.TipTaper, 0.05, 1.0);
 
-        // Acc[i] = suma de r^n de los hijos de i. Recorremos en indice
-        // decreciente: por la invariante Parent < indice, eso procesa cada
-        // hijo antes que su padre (doc. 3.6, "NodesByDecreasingDepth").
+        // Acc[i] = suma de r^n de los hijos de i. El recorrido en índice decreciente
+        // procesa cada hijo antes que su padre por la invariante Parent < índice, de
+        // modo que Acc[i] ya está completo cuando se llega a i. Sin ordenar por
+        // profundidad y sin recursión.
         TArray<double> Acc;
         Acc.Init(0.0, N);
 
@@ -166,17 +193,17 @@ namespace SpaceColonization
             const bool bTip = (Acc[i] <= 0.0);
             const double R = bTip ? TipR : FMath::Pow(Acc[i], 1.0 / PipeExp);
 
-            // El padre hereda el radio SIN afilar: el afilado es un remate de la
-            // punta, no debe adelgazar toda la cadena hasta el tronco.
+            // El padre acumula el radio SIN afilar: el afilado es un remate visual de
+            // la punta y no debe adelgazar toda la cadena hasta el tronco.
             const int32 P = Skeleton.Nodes[i].Parent;
             if (P >= 0)
             {
                 Acc[P] += FMath::Pow(R, PipeExp);
             }
 
-            // Radius es lo que se malla y ApplyTrunkProfile lo pisa despues;
-            // PipeRadius conserva el radio ESTRUCTURAL para quien pregunte por
-            // rigidez y no por geometria (ver FBranchNode::PipeRadius).
+            // Radius es lo que se malla y ApplyTrunkProfile lo pisa después;
+            // PipeRadius conserva el radio estructural para quien pregunte por
+            // rigidez y no por geometría (@ref FBranchNode::PipeRadius).
             const float FinalR = (float)(bTip ? R * TipTaper : R);
             Skeleton.Nodes[i].Radius = FinalR;
             Skeleton.Nodes[i].PipeRadius = FinalR;
@@ -200,15 +227,15 @@ namespace SpaceColonization
         const bool bNoTaper = (TopTaper >= 1.f - KINDA_SMALL_NUMBER);
         if (bNoFlare && bNoTaper)
         {
-            return; // perfil desactivado: Radius se queda tal cual lo dejo el pipe model
+            return; // perfil desactivado: Radius se queda como lo dejó el pipe model
         }
 
         TArray<float> AlongLen;
         Skeleton.ComputeAlongLengths(AlongLen);
 
-        // Referencia de grosor. El peso se expresa RELATIVO a ella y no en cm
-        // absolutos: asi es invariante de escala y los buckets pequenos no
-        // necesitan un tuneo aparte.
+        // Referencia de grosor: el radio de la base. El peso del perfil se expresa
+        // RELATIVO a ella y no en cm absolutos, con lo que es invariante de escala y
+        // los buckets de edad pequeños no necesitan un ajuste aparte.
         const float BaseR = FMath::Max(Skeleton.Nodes[0].PipeRadius, KINDA_SMALL_NUMBER);
 
         // Longitud del eje principal: es la escala sobre la que afila el fuste.
@@ -227,14 +254,13 @@ namespace SpaceColonization
             FBranchNode& Node = Skeleton.Nodes[i];
             const float R = Node.PipeRadius;
 
-            // A quien se aplica el perfil. Dos senales:
-            //   - Es EJE: senal directa y exacta, la marca el SCA al construirlo.
-            //     Es la que hace que el afilado recorra el fuste hasta el apice.
-            //   - Es MADERA GRUESA: para que una rama baja de tamano considerable
-            //     tambien ensanche en su insercion, como pasa de verdad.
-            // Relativo al radio de la base -no en cm-, para que una ramilla que
-            // casualmente pase cerca del suelo no se infle: el flare es del
-            // tronco, no de todo lo que este bajo.
+            // A quién se aplica el perfil, por dos señales. Ser EJE es la señal exacta
+            // y la marca el propio crecimiento: es la que hace que el afilado recorra
+            // el fuste hasta el ápice. Ser MADERA GRUESA extiende el ensanche a la
+            // inserción de una rama baja de tamaño considerable, como ocurre de
+            // verdad. El umbral es relativo al radio de la base y no en cm, para que
+            // una ramilla que casualmente pase cerca del suelo no se infle: el
+            // ensanche es del tronco, no de todo lo que esté bajo.
             const float W = Node.IsAxis()
                 ? 1.f
                 : FMath::SmoothStep(BaseR * 0.15f, BaseR * 0.55f, R);
@@ -245,22 +271,22 @@ namespace SpaceColonization
 
             const float H = AlongLen[i];
 
-            // Ensanche de base: decae casi exponencialmente con la altura, que
-            // es la estadistica del butt swell real (a 3*FlareH ya no queda nada).
+            // Ensanche de pie: decae exponencialmente con la longitud de arco, que es
+            // la estadística del butt swell real (a 3*FlareH ya no queda nada).
             const float FlareMul = 1.f + Flare * FMath::Exp(-H / FlareH);
 
-            // Afilado del eje con la altura.
+            // Afilado del fuste con la altura, normalizada a la longitud del eje.
             const float T = FMath::Clamp(H * InvAxisLen, 0.f, 1.f);
             const float TaperMul = FMath::Lerp(1.f, TopTaper, FMath::Pow(T, TaperExp));
 
             Node.Radius = R * FMath::Lerp(1.f, FlareMul * TaperMul, W);
         }
 
-        // --- Monotonia: ningun nodo mas fino que su hijo mas grueso ---
-        // Recorrer en indice DECRECIENTE visita cada hijo antes que su padre
-        // (invariante de FTreeSkeleton), asi que una sola pasada basta. Sin
-        // esto, el afilado puede dejar el eje mas fino que el primer nodo de
-        // copa y aparece un estrangulamiento en cono invertido bajo la copa.
+        // ==== Monotonía: ningún nodo más fino que su hijo más grueso ====
+        // Recorrer en índice decreciente visita cada hijo antes que su padre, así que
+        // una sola pasada basta. Sin ella, el afilado puede dejar el eje más fino que
+        // el primer nodo de copa y aparece un estrangulamiento en cono invertido justo
+        // bajo la copa.
         for (int32 i = N - 1; i >= 1; --i)
         {
             const int32 P = Skeleton.Nodes[i].Parent;
@@ -281,7 +307,8 @@ namespace SpaceColonization
         FTreeLightGridFine& OutFineLight,
         FAttractorCloud& OutAttractors)
     {
-        // Parametros de la especie (con guardas para no dividir por 0 / bucles vacios).
+        // Parámetros de la especie, con guardas para no dividir por cero ni entrar en
+        // bucles vacíos. La relación de diseño entre ellos es d_k < D < d_i.
         const float d_i = FMath::Max(Species.InfluenceRadiusDi, 1.f);
         const float d_k = FMath::Max(Species.KillRadiusDk, 0.1f);
         const float D = FMath::Max(Species.StepLengthD, 1.f);
@@ -289,30 +316,27 @@ namespace SpaceColonization
         const int32 MaxChildren = FMath::Max(Config.MaxChildrenPerNode, 1);
         const int32 MaxAxisChildren = FMath::Max(Config.MaxAxisChildrenPerNode, MaxChildren);
 
-        // Cono de percepcion: 180 grados = esfera completa = desactivado.
+        // Cono de percepción: 180 grados equivale a la esfera completa, o sea desactivado.
         const float CosPerception = FMath::Cos(FMath::DegreesToRadians(
             FMath::Clamp(Species.PerceptionAngleDeg, 20.f, 180.f)));
         const float BranchAngleDeg = FMath::Clamp(Species.BranchAngleDeg, 0.f, 85.f);
 
-        // Semilla del arbol ANTES de consumir nada. De ella cuelgan los
-        // sub-streams (eje aqui, envolvente en SampleCrownEnvelope) que NO deben
-        // desplazar el stream principal: si el eje tirase de RngState, tocar el
-        // tronco cambiaria tambien todo el jitter posterior de la copa.
+        // Semilla del árbol, tomada ANTES de consumir nada. De ella cuelgan por hash
+        // los sub-streams de las características que no deben desplazar el stream
+        // principal: el eje aquí, la envolvente en SampleCrownEnvelope, la deformación
+        // justo debajo. Si el eje tirase de RngState, tocar el tronco cambiaría también
+        // todo el jitter posterior de la copa.
         const uint32 TreeSeed = RngState;
 
-        // Deformacion de tronco de ESTE arbol (arqueado / torcido). Se resuelve
-        // aqui arriba, antes de nada, por dos motivos: su alcance lateral
-        // dimensiona la rejilla de luz fina (mas abajo), y su sub-stream se
-        // deriva por hash igual que el del eje, sin tocar RngState -> un arbol
-        // sin capas de deformacion sale bit a bit como salia antes.
+        // Curvatura de tronco de ESTE árbol. Se resuelve antes que nada porque su
+        // alcance lateral dimensiona el margen de la rejilla de luz fina, más abajo.
         const uint32 DeformSeed = (Config.DeformSeedOverride >= 0)
             ? static_cast<uint32>(Config.DeformSeedOverride)
             : EcoRand::Hash32(TreeSeed ^ 0x0DEF0B75u);
         const TrunkDeformer::FTrunkDeformState Deform = TrunkDeformer::Sample(Species, DeformSeed);
 
-        // Geometria vertical del arbol. Sube hasta aqui (antes se calculaba
-        // junto al eje principal) porque TotalH hace falta para el margen de la
-        // rejilla fina y para la altura normalizada del deformador.
+        // Geometría vertical del árbol. Se resuelve aquí porque TotalH hace falta para
+        // el margen de la rejilla fina y para la altura normalizada del deformador.
         const float TrunkFrac = FMath::Clamp(Species.TrunkFraction, 0.f, 0.95f);
         const float CrownH = FMath::Max(Species.CrownHeightCm, 1.f);
         const float TrunkH = CrownH * TrunkFrac / (1.f - TrunkFrac);
@@ -323,26 +347,26 @@ namespace SpaceColonization
         const float LeafShadowDepth = D * FMath::Max(Config.LeafShadowDepthScale, 0.f);
         const bool  bHasCoarse = (CoarseLight != nullptr) && CoarseLight->IsValid();
 
-        // --- 1) Sembrar atractores en la copa (determinista desde RngState) ---
+        // ==== Sembrar los atractores en la copa ====
         OutAttractors.SampleCrownEnvelope(Species, TrunkBaseWorld, RngState);
 
-        // --- 2) Rejilla fina sobre la envolvente + trunk base; sombra de vecinos ---
+        // ==== Rejilla de luz fina sobre la envolvente y sombra de los vecinos ====
         FBox EnvBounds(ForceInit);
         for (const FAttractor& A : OutAttractors.Attractors)
         {
             EnvBounds += A.Pos;
         }
-        EnvBounds += TrunkBaseWorld; // que la rejilla cubra tambien el tronco
+        EnvBounds += TrunkBaseWorld; // que la rejilla cubra también el tronco
 
-        // Margen extra por si a este arbol le toca doblarse: la copa deformada
-        // muestrea AO por vertice y heliotropismo de hoja en posiciones que la
-        // rejilla ajustada a la envolvente RECTA ya no cubriria. No reventaria
-        // (WorldToVoxelClamped clampa a los bordes), pero el gradiente se aplana
-        // contra el borde y las hojas dejan de orientarse a la luz.
+        // Margen extra por si a este árbol le toca doblarse: la copa deformada muestrea
+        // el AO por vértice y el heliotropismo de la hoja en posiciones que una rejilla
+        // ajustada a la envolvente recta ya no cubriría. No hay riesgo de desbordar
+        // —el muestreo clampa a los bordes—, pero el gradiente se aplana contra el
+        // borde y las hojas dejan de orientarse hacia la luz.
         //
-        // Se dimensiona con los MAXIMOS del asset, no con la tirada de este
-        // arbol: asi todos los arboles de la especie usan la misma rejilla y no
-        // hay un salto de calidad de AO entre el recto y el arqueado.
+        // El margen se calcula con los máximos del asset y no con la tirada de este
+        // árbol, para que todos los de la especie usen la misma rejilla y no haya un
+        // salto de calidad del AO entre el ejemplar recto y el arqueado.
         OutFineLight.InitForBounds(EnvBounds, Species.FineVoxelSizeCm,
             Config.FineGridPaddingCm + TrunkDeformer::MaxLateralReachCm(Species, TotalH));
 
@@ -351,47 +375,45 @@ namespace SpaceColonization
             OutFineLight.SeedFromCoarse(*CoarseLight);
         }
 
-        // --- 3) Cull inicial (micro<-macro): atractores en la sombra de vecinos ---
+        // ==== Poda inicial: atractores que nacen en la sombra de los vecinos ====
+        // Es la conexión micro<-macro, lo que hace que un árbol pegado a otro grande
+        // crezca ladeado en vez de ignorarlo.
         OutAttractors.CullByShade(OutFineLight, Config.LightCullThreshold);
 
-        // --- 4) Indice espacial de atractores (celda = d_i) ---
+        // ==== Índice espacial de atractores, con celda igual a d_i ====
         OutAttractors.BuildIndex(d_i);
 
-        // --- 5) Nodo raiz + EJE PRINCIPAL (tronco desnudo + lider) ---
+        // ==== Nodo raíz y eje principal: tronco desnudo más líder ====
         OutSkeleton.Reset();
         OutSkeleton.Reserve(OutAttractors.Num() * 2 + 64);
         OutSkeleton.InitRoot(TrunkBaseWorld, FVector::UpVector);
 
-        // (TrunkFrac / CrownH / TrunkH / CrownBaseZ / TotalH se calculan arriba,
-        //  antes de la rejilla fina, porque TotalH dimensiona su margen.)
-
-        // El eje ya NO muere en la base de la copa: la ATRAVIESA hasta
-        // LeaderFraction de su altura (ver USpeciesData::LeaderFraction). Con el
-        // eje parado abajo, su punta era el unico nodo que veia los atractores
-        // -y en copa conica el radio maximo cae justo ahi-, asi que se los
-        // llevaba todos y salia la silueta de paraguas.
+        // El eje no muere en la base de la copa: la atraviesa hasta LeaderFraction de
+        // su altura (@ref USpeciesData::LeaderFraction). Parado abajo, su punta sería
+        // el único nodo que ve los atractores —y en copa cónica el radio máximo cae
+        // justo ahí—, se los llevaría todos y saldría la silueta de paraguas.
         const float LeaderFrac = FMath::Clamp(Species.LeaderFraction, 0.f, 1.f);
         const float AxisTopZ = CrownBaseZ + CrownH * LeaderFrac;
 
-        // Sinuosidad del eje, desde un sub-stream propio derivado por hash.
+        // Sinuosidad del eje, con fase y azimut de un sub-stream propio derivado por hash.
         const float SweepRad = FMath::DegreesToRadians(FMath::Clamp(Species.TrunkSweepDeg, 0.f, 20.f));
         const float WobbleRad = FMath::DegreesToRadians(FMath::Clamp(Species.TrunkWobbleDeg, 0.f, 8.f));
         uint32 AxisRng = EcoRand::Hash32(TreeSeed ^ 0x5EED1A5Fu);
         const float SweepPhase = EcoRand::NextRange(AxisRng, 0.f, 512.f);
         const float SweepAzim = EcoRand::NextRange(AxisRng, 0.f, 2.f * PI);
         const float WobblePhase = EcoRand::NextRange(AxisRng, 0.f, 512.f);
-        // Sweep: UNA ondulacion en todo el arbol (un arbol se inclina como un
-        // todo, no como un muelle). Wobble: una fraccion pequena de eso.
+        // Sweep: una sola ondulación en todo el árbol, porque un árbol se inclina
+        // como un todo y no como un muelle. Wobble: una fracción pequeña de eso.
         const float SweepWaveCm = FMath::Max(TotalH, D * 4.f);
         const float WobbleWaveCm = FMath::Max(TotalH * 0.15f, D * 1.5f);
 
         {
             int32 AxisTip = 0;
 
-            // Techo de pasos. El paso avanza D*cos(Theta) en Z, no D, y la
-            // condicion de parada es en Z: con el angulo acotado el avance no
-            // puede anularse, pero un bucle de crecimiento sin techo es
-            // exactamente el fallo que solo asoma con datos raros.
+            // Techo de pasos. El paso avanza D*cos(Theta) en Z, no D, y la condición
+            // de parada es en Z: con el ángulo acotado por MaxAxisTiltRad el avance no
+            // puede anularse, pero un bucle de crecimiento sin techo se dispararía ante
+            // un asset con valores extremos.
             const float AxisSpanZ = FMath::Max(AxisTopZ - (float)TrunkBaseWorld.Z, 0.f);
             const int32 MaxAxisNodes = FMath::Clamp(
                 FMath::CeilToInt(AxisSpanZ / FMath::Max(D * 0.5f, 1.f)) + 4, 0, 4096);
@@ -414,9 +436,9 @@ namespace SpaceColonization
             }
         }
 
-        // El eje atraviesa la copa, o sea que se come atractores por el camino.
-        // Si no se dan por alcanzados, el SCA sacaria munones diminutos pegados
-        // al fuste apuntando a puntos que el propio fuste ya ocupa.
+        // El eje atraviesa la copa y ocupa atractores por el camino. Si no se dan por
+        // alcanzados, el crecimiento saca muñones diminutos pegados al fuste que
+        // apuntan a puntos que el propio fuste ya ocupa.
         {
             const int32 NumAxisNodes = OutSkeleton.Num();
             for (int32 v = 0; v < NumAxisNodes; ++v)
@@ -425,12 +447,13 @@ namespace SpaceColonization
             }
         }
 
-        // Grado alcanzado por cada nodo. Arranca del eje recien encadenado y se
-        // mantiene incrementalmente al anadir hijos.
+        // Hijos ya emitidos por cada nodo. Arranca del eje recién encadenado y se
+        // mantiene de forma incremental al añadir hijos; es lo que consulta el
+        // presupuesto por nodo.
         TArray<int32> Degree;
         OutSkeleton.ComputeChildCounts(Degree);
 
-        // Scratch reutilizado entre iteraciones.
+        // Scratch reutilizado entre iteraciones para no realojar cada vuelta.
         TArray<FVector> SumDir;
         TArray<int32>   Count;
         TArray<int32>   NewChildren;
@@ -438,9 +461,9 @@ namespace SpaceColonization
         for (int32 Iter = 0; Iter < MaxIter; ++Iter)
         {
             const int32 NumNodes = OutSkeleton.Num();
-            Degree.SetNumZeroed(NumNodes); // los nodos nacidos en la iteracion previa entran a 0
+            Degree.SetNumZeroed(NumNodes); // los nodos nacidos en la iteración previa entran a 0
 
-            // ---- ASOCIAR: cada atractor vivo -> su nodo mas cercano dentro de d_i ----
+            // ==== ASOCIAR: cada atractor vivo elige su nodo más cercano dentro de d_i ====
             for (FAttractor& A : OutAttractors.Attractors)
             {
                 if (A.bAlive)
@@ -452,11 +475,11 @@ namespace SpaceColonization
 
             for (int32 v = 0; v < NumNodes; ++v)
             {
-                // Un nodo saturado no compite por atractores: si lo hiciera, los
-                // suyos quedarian asignados a un nodo que ya no puede crecer y
-                // nunca se consumirian. Los nodos del eje tienen presupuesto
-                // propio porque su continuacion ya viene pre-construida y les
-                // gasta un hijo de entrada.
+                // Un nodo saturado no compite por atractores: si lo hiciera, los suyos
+                // quedarían asignados a un nodo que ya no puede crecer y no se
+                // consumirían nunca. Los nodos del eje tienen presupuesto propio
+                // porque su continuación viene pre-construida y les gasta un hijo de
+                // entrada.
                 const int32 Budget = OutSkeleton.Nodes[v].IsAxis() ? MaxAxisChildren : MaxChildren;
                 if (Degree[v] >= Budget) { continue; }
 
@@ -471,10 +494,10 @@ namespace SpaceColonization
                         const float Dd = (float)ToA.Size();
                         if (Dd >= A.BestDist) { return; }
 
-                        // Cono de percepcion: un nodo no reclama lo que tiene
-                        // DETRAS. Sin esto, la punta del eje -por estar centrada-
-                        // resulta ser la mas cercana a casi todo y se lo lleva
-                        // todo, que es de donde sale el abanico de ramas.
+                        // Cono de percepción: un nodo no reclama lo que tiene DETRÁS.
+                        // Sin él, la punta del eje, por estar centrada, resulta ser la
+                        // más cercana a casi todo y se lo lleva todo: de ahí sale el
+                        // abanico de ramas.
                         if (Dd > KINDA_SMALL_NUMBER &&
                             FVector::DotProduct(ToA / Dd, NodeDir) < CosPerception)
                         {
@@ -486,7 +509,7 @@ namespace SpaceColonization
                     });
             }
 
-            // ---- Acumular direccion promedio hacia los atractores por nodo ----
+            // ==== Dirección media hacia los atractores asignados a cada nodo ====
             SumDir.Reset(); SumDir.SetNumZeroed(NumNodes);
             Count.Reset();  Count.SetNumZeroed(NumNodes);
 
@@ -500,7 +523,7 @@ namespace SpaceColonization
                 }
             }
 
-            // ---- CRECER: un hijo por nodo activo (SCA + tropismos + jitter) ----
+            // ==== CRECER: un hijo por nodo activo, con tropismos y jitter ====
             const int32 Base = NumNodes;
             NewChildren.Reset();
 
@@ -521,11 +544,11 @@ namespace SpaceColonization
                     Species.wSCA, Species.wGrav, Species.wPhot, Species.wPrev);
                 Dir = JitterDirection(Dir, Species.DirNoise, RngState);
 
-                // Angulo de insercion. Si el nodo YA tiene descendencia -y un
-                // nodo interior del eje siempre la tiene, porque su continuacion
-                // viene pre-construida-, este hijo es una rama LATERAL y debe
-                // separarse del padre. Sin esto sale casi paralela al eje y se
-                // lee como fuste deshilachado, no como rama.
+                // Ángulo de inserción. Si el nodo ya tiene descendencia —y un nodo
+                // interior del eje siempre la tiene, porque su continuación viene
+                // pre-construida—, este hijo es una rama LATERAL y debe separarse del
+                // padre. Sin ello sale casi paralela al eje y se lee como fuste
+                // deshilachado, no como rama.
                 if (Degree[v] > 0 && BranchAngleDeg > 0.f)
                 {
                     Dir = ApplyBranchAngle(Dir, NodeDir, BranchAngleDeg);
@@ -542,19 +565,23 @@ namespace SpaceColonization
 
             if (NewChildren.Num() == 0)
             {
-                break; // no crecio nada: hemos terminado
+                break; // ningún nodo pudo crecer: el árbol está terminado
             }
 
-            // ---- MATAR: atractores dentro de d_k de algun hijo nuevo ----
+            // ==== MATAR: atractores a menos de d_k de algún hijo nuevo ====
             for (int32 Ci : NewChildren)
             {
                 KillAttractorsNear(OutAttractors, OutSkeleton.Nodes[Ci].Pos, d_k);
             }
 
-            // ---- Refresco de luz / autopoda emergente ----
+            // ==== Refresco de luz: la autopoda de la copa interior ====
+            // No hay ninguna regla explícita de borrar ramas: al sombrearse el interior
+            // de la copa, sus atractores se descartan y las ramas de dentro dejan de
+            // tener hacia dónde crecer.
             if (Config.bEnableSelfPruning && Species.LightEvery > 0 && (Iter % Species.LightEvery == 0))
             {
-                // Base = sombra de vecinos (o limpia) + follaje propio actual.
+                // Se rehace la sombra desde cero: base de vecinos (o limpia) más el
+                // follaje propio en su estado actual.
                 if (bHasCoarse) { OutFineLight.SeedFromCoarse(*CoarseLight); }
                 else { OutFineLight.ClearShadow(); }
 
@@ -568,25 +595,22 @@ namespace SpaceColonization
             }
         }
 
-        // --- Deformacion de tronco: doblar el arbol YA CRECIDO ---
-        // Va aqui, entre el fin del SCA y los radios, y no en otro sitio:
-        //   - despues del SCA porque dobla el arbol ENTERO (tronco y copa) como
-        //     una vara; hacerlo dentro del bucle solo torceria el eje y dejaria
-        //     las ramas ya colgadas donde estaban;
-        //   - antes de ComputeRadii/ApplyTrunkProfile porque asi el ensanche del
-        //     pie y el afilado del fuste SIGUEN al tronco doblado. Y sale gratis:
-        //     el deformador es isometrico y el perfil trabaja sobre longitud de
-        //     arco (ComputeAlongLengths), que no cambia al doblar;
-        //   - antes de mallar porque el mallador orienta cada anillo de seccion
-        //     con FBranchNode::Dir, que el deformador rota a la vez que Pos.
+        // ==== Deformación de tronco: doblar el árbol ya crecido ====
+        // El sitio en la secuencia es obligado. Después del crecimiento, porque dobla
+        // el árbol entero —tronco y copa— como una vara: dentro del bucle solo torcería
+        // el eje y dejaría las ramas ya colgadas donde estaban. Antes de los radios,
+        // para que el ensanche de pie y el afilado sigan al tronco doblado, lo que sale
+        // gratis porque el doblado es isométrico y el perfil trabaja sobre longitud de
+        // arco. Y antes de mallar, porque el mallador orienta cada anillo de sección
+        // con FBranchNode::Dir, que el deformador rota a la vez que Pos.
         TrunkDeformer::ApplyToSkeleton(OutSkeleton, Deform, TrunkBaseWorld, TotalH);
 
-        // --- Radios de rama: pipe model sobre el esqueleto terminado ---
+        // ==== Radios de rama: pipe model sobre el esqueleto terminado ====
         ComputeRadii(OutSkeleton, Species);
 
-        // --- Perfil de tronco encima del pipe model (ensanche de base + afilado) ---
-        // Va DESPUES a proposito: el pipe model es la estructura y este es el
-        // acabado. ApplyTrunkProfile solo pisa Radius y deja PipeRadius intacto.
+        // ==== Perfil de tronco encima del pipe model ====
+        // El orden es deliberado: el pipe model da la estructura y esto es el acabado
+        // geométrico. Solo pisa Radius y deja PipeRadius intacto.
         ApplyTrunkProfile(OutSkeleton, Species);
     }
 }

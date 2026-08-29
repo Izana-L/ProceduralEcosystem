@@ -1,7 +1,22 @@
-#include "Species/SpeciesData.h"
+/**
+ * @file SpeciesData.cpp
+ * @author Juan Luque Roldán
+ * @brief Validación del asset de especie en tiempo de editor.
+ *
+ * Contiene el único código ejecutable de USpeciesData, y solo se compila con el editor: en
+ * runtime la ficha de especie es una fuente de datos pasiva y de solo lectura. IsDataValid
+ * separa dos clases de comprobación. Los errores duros bloquean lo imposible: los rasgos que
+ * actúan como divisores y darían NaN o infinitos, y las invariantes geométricas sin las
+ * cuales el generador de árboles no llega a producir esqueleto ni malla. Los avisos
+ * comprueban que la especie paga por sus ventajas, porque el modelo no impone ningún coste
+ * por sí solo y sin compromisos explícitos existe una estrategia estrictamente dominante.
+ *
+ * @ingroup eco_species
+ * @see @ref bib_exclusioncompetitiva
+ * @see @ref bib_epicueconfig
+ */
 
-// En Fase 0 los parámetros se editan como asset; no hay lógica de runtime.
-// Lo único que añadimos es validación en tiempo de editor.
+#include "Species/SpeciesData.h"
 
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
@@ -36,16 +51,13 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
     // =====================================================================
     //  COMPROMISOS ENTRE RASGOS
     // =====================================================================
-    // Estos avisos no comprueban que el asset sea "correcto": comprueban que la
-    // especie PAGA por sus ventajas. El modelo no impone ningun coste por si
-    // solo -subir tolerancia, crecimiento, longevidad o fecundidad sale gratis-
-    // y sin compromisos existe una estrategia estrictamente dominante, con lo
-    // que la exclusion competitiva deja de ser un resultado y pasa a ser una
-    // certeza. Son avisos, no errores: si sabes por que lo haces, ignoralos.
-    //
-    // Para la comparacion ENTRE especies (que es la que de verdad decide si hay
-    // una dominante) usa el comando de consola Eco.AuditarEspecies: un asset no
-    // puede ver a los demas desde aqui.
+    // Estos avisos no comprueban que el asset sea correcto, sino que la especie paga por sus
+    // ventajas. Subir tolerancia, crecimiento, longevidad o fecundidad sale gratis en el
+    // modelo, y sin compromiso la exclusión competitiva deja de ser un resultado del
+    // ecosistema para pasar a ser una certeza aritmética. Son avisos y no errores porque una
+    // especie puede saltárselos a propósito. La comparación entre especies, que es la que de
+    // verdad decide si hay una dominante, no cabe aquí —un asset no ve a los demás— y la
+    // resuelve el comando de consola Eco.AuditarEspecies.
 
     if (ShadeTolerance > 0.7f && GrowthRate > 0.30f)
     {
@@ -61,11 +73,10 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             GrowthRate, Longevity)));
     }
 
-    // El umbral de luz para germinar y la tolerancia a la sombra describen LO
-    // MISMO desde dos lados (donde puedo instalarme / donde puedo vivir). Si se
-    // contradicen, la especie germina en sitios donde luego se muere, o al reves
-    // desaprovecha el sotobosque que si podria ocupar -que es donde una climax se
-    // juega la partida-.
+    // El umbral de luz para germinar y la tolerancia a la sombra describen lo mismo desde
+    // dos lados: dónde puede instalarse la especie y dónde puede vivir. Si se contradicen,
+    // la especie germina en sitios donde luego se muere o desaprovecha el sotobosque que sí
+    // podría ocupar, que es donde una climácica se juega la partida.
     if (ShadeTolerance > 0.7f && MinLightForGermination > 0.3f)
     {
         Context.AddWarning(FText::FromString(FString::Printf(
@@ -86,11 +97,11 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             SeedRateScale, GerminationRateScale)));
     }
 
-    // --- Nicho de recurso (respuesta unimodal) ---
-    // La campana solo reparte nicho si es lo bastante ESTRECHA. Una anchura del
-    // orden del rango entero del campo deja la respuesta casi plana: la especie
-    // responde igual en todo el mapa y vuelve a competir solo por el ranking
-    // global, que es justo lo que el nicho venia a evitar.
+    // --- Nicho de recurso: respuesta unimodal ---
+    // La campana solo reparte nicho si es lo bastante estrecha. Una anchura del orden del
+    // rango entero del campo deja la respuesta casi plana: la especie responde igual en todo
+    // el mapa y vuelve a competir solo por el ranking global, que es justo lo que el nicho
+    // viene a evitar.
     if (WaterTolerance >= 1.f)
     {
         Context.AddWarning(FText::FromString(FString::Printf(
@@ -105,10 +116,9 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
     }
     if (!bWaterloggingPenalty && WaterOptimum > 0.5f)
     {
-        // Sin penalizacion por exceso la campana satura en 1 por encima del
-        // optimo, o sea que por arriba vuelve a ser monotona: la especie es
-        // igual de buena en su optimo que en todo lo mas humedo, y la de
-        // vaguada acaba ganando tambien donde no le toca.
+        // Sin penalización por exceso la campana satura en 1 por encima del óptimo, con lo
+        // que por arriba vuelve a ser monótona: la especie es igual de buena en su óptimo
+        // que en todo lo más húmedo, y la de vaguada acaba ganando también donde no le toca.
         Context.AddWarning(FText::FromString(
             TEXT("bWaterloggingPenalty desactivado con un WaterOptimum alto: por encima del optimo la respuesta al agua vuelve a ser monotona y se pierde la mitad humeda del reparto de nicho.")));
     }
@@ -117,28 +127,29 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
     {
         Context.AddWarning(FText::FromString(
             TEXT("MaturityAge >= Longevity: la especie moriría (casi) antes de poder reproducirse.")));
-        // Es un aviso, no un error: puede ser intencionado para pruebas.
+        // Aviso y no error: una especie así es válida como caso de prueba.
     }
     if (!(KillRadiusDk < StepLengthD && StepLengthD < InfluenceRadiusDi))
     {
         Context.AddError(FText::FromString(
             TEXT("Debe cumplirse d_k < D < d_i (KillRadiusDk < StepLengthD < InfluenceRadiusDi); "
-                "si no, el SCA no ramifica o los atractores no se consumen (doc. §3.1).")));
+                "si no, el SCA no ramifica o los atractores no se consumen.")));
         Fail();
     }
+    // Longitud de fuste desnudo bajo la copa: la altura total sale de
+    // CrownHeightCm / (1 - TrunkFraction), luego el hueco vale CrownHeightCm * f / (1 - f).
     const float TrunkGap = CrownHeightCm * FMath::Clamp(TrunkFraction, 0.f, 0.95f) / (1.f - FMath::Clamp(TrunkFraction, 0.f, 0.95f));
     if (SubCrownFraction <= 0.f && InfluenceRadiusDi <= TrunkGap)
     {
-        // Solo es un error SIN falda de sub-copa: con ella hay atractores
-        // repartidos por el fuste y el SCA arranca aunque d_i no llegue a la
-        // base de la copa.
+        // Solo es un error sin falda de sub-copa: con ella hay atractores repartidos por el
+        // fuste y el SCA arranca aunque d_i no llegue a la base de la copa.
         Context.AddError(FText::FromString(FString::Printf(
             TEXT("InfluenceRadiusDi (%.0f) <= hueco de tronco (%.0f cm) y SubCrownFraction = 0: el SCA no arrancara (ningun atractor en rango del nodo base). Sube d_i o pon algo de SubCrownFraction."),
             InfluenceRadiusDi, TrunkGap)));
         Result = EDataValidationResult::Invalid;
     }
 
-    // --- Perfil y relieve de tronco (troncos organicos) ---
+    // --- Perfil y relieve de tronco ---
     if (TrunkFlareHeightCm <= 0.f)
     {
         Context.AddError(FText::FromString(
@@ -154,7 +165,7 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
         Fail();
     }
 
-    // --- Deformacion de tronco por arbol (arqueado / torcido) ---
+    // --- Deformación de tronco por árbol: presupuesto de doblado acumulado ---
     {
         float SumMaxDeg = 0.f;
         for (int32 i = 0; i < TrunkDeformLayers.Num(); ++i)
@@ -181,7 +192,8 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             }
         }
 
-        // 57 grados = MaxTrunkBendRad (1 rad), el tope que aplica TrunkDeformer.
+        // 57 grados es MaxTrunkBendRad (1 rad), el tope de doblado que recorta
+        // TrunkDeformer: por encima, un árbol al que le toquen varias capas sale clipeado.
         if (SumMaxDeg > 57.f)
         {
             Context.AddWarning(FText::FromString(FString::Printf(

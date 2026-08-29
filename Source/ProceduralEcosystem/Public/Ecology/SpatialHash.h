@@ -1,3 +1,22 @@
+/**
+ * @file SpatialHash.h
+ * @author Juan Luque Roldán
+ * @brief Índice espacial 2D de los agentes-árbol en formato CSR.
+ *
+ * Declara FSpatialHash, la rejilla uniforme que responde a «qué árboles hay alrededor de
+ * este punto»: de ella dependen el espaciado mínimo de la germinación y el recuento de
+ * conespecíficos. El índice son dos arrays planos —CellStart con el prefijo de cada celda
+ * y SortedIdx con los agentes agrupados por celda— que se construyen por counting sort en
+ * una sola pasada serial de coste @f$O(N)@f$, repetida entera cada tick porque
+ * nacimientos y muertes cambian el conjunto de agentes. Recorrer los agentes en índice
+ * creciente al construirlo fija el orden de visita de todas las consultas, y ese orden
+ * forma parte del contrato de determinismo del tick.
+ *
+ * @ingroup eco_ecology
+ * @see @ref bib_countingsortcsr
+ * @see @ref bib_teschner2003
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -5,65 +24,50 @@
 #include "Core/GridMath.h"
 
 /**
- * Spatial hash grid 2D sobre las posiciones de los agentes-arbol (doc. Fase 2, 2.3).
+ * Rejilla uniforme densa sobre la caja del mundo que indexa las posiciones de los agentes
+ * en formato CSR (Compressed Sparse Row).
  *
- * POR QUE UN HASH GRID Y NO UN OCTREE: los arboles son puntos de densidad
- * ~uniforme en el plano XY (la altura no importa para saber quien esta al
- * lado de quien). Un grid plano es mas simple, mas barato de reconstruir
- * cada tick y encaja mejor que un octree, que esta pensado para densidad
- * MUY desigual (ahi si se usa: en el grid de luz global grueso y en el fino
- * por hero-tree de la Fase 3).
+ * Los agentes de la celda `c` son los `SortedIdx[k]` con `k` en
+ * @f$[\mathrm{CellStart}[c], \mathrm{CellStart}[c+1])@f$. Dos arrays planos en lugar de un
+ * `TArray<TArray<int32>>` por celda: consultar no reserva memoria y construir es una única
+ * pasada. Se prefiere a un octree porque los árboles son puntos de densidad casi uniforme
+ * en el plano XY —la altura no interviene en quién está al lado de quién—; el octree queda
+ * para las rejillas de luz, donde la densidad sí es muy desigual.
  *
- * IMPLEMENTACION CSR (Compressed Sparse Row / "counting sort"): en vez de un
- * TArray<TArray<int32>> por celda (una allocation por celda, fragmentado en
- * memoria), se guardan dos arrays planos:
- *   - CellStart[c]  : indice de arranque de la celda c dentro de SortedIdx
- *   - SortedIdx[k]  : indices de agente, agrupados por celda
- * Consultar la celda c es iterar SortedIdx desde CellStart[c] hasta
- * CellStart[c+1]. Cero allocations por consulta, una sola pasada de
- * construccion por tick.
- *
- * DETERMINISMO: Build() es una pasada SERIAL (se llama una vez, antes del
- * ParallelFor del tick - ver doc. 2.5, "PRE"). Recorre los agentes en orden
- * de indice creciente, asi que dentro de cada celda SortedIdx queda siempre
- * en el mismo orden para una misma poblacion de entrada. ForEachNeighbor()
- * hereda ese orden fijo: dos corridas con la misma poblacion visitan los
- * vecinos en el mismo orden, sin importar cuantos hilos procesen despues
- * cada agente.
- *
- * Se reconstruye ENTERO cada tick (O(N)): nacimientos y muertes cambian el
- * conjunto de agentes, asi que no compensa mantenerlo incrementalmente.
- *
- * CONSUMIDORES: el espaciado minimo de germinacion (SimulateTick) y, a partir
- * de la Fase 3, las consultas por rango del SCA.
+ * @note Pese al nombre no hay función hash ni tabla hash: la clave es directamente el
+ *       índice de celda, con clamp en los bordes del mundo.
+ * @pre Init antes del primer Build, y un Build de este tick antes de cualquier consulta.
  */
 struct PROCEDURALECOSYSTEM_API FSpatialHash
 {
-    double    CellSize = 100.0; // cm; ver nota de dimensionado mas abajo
-    int32     GridW = 0;
-    int32     GridH = 0;
-    FVector2D Origin = FVector2D::ZeroVector;
+    double    CellSize = 100.0;               ///< Lado de celda en cm.
+    int32     GridW = 0;                      ///< Celdas en X.
+    int32     GridH = 0;                      ///< Celdas en Y.
+    FVector2D Origin = FVector2D::ZeroVector; ///< Esquina mínima del mundo indexado, en cm.
 
-    TArray<int32> CellStart; // tamano GridW*GridH + 1
-    TArray<int32> SortedIdx; // tamano Num (tras el ultimo Build)
+    TArray<int32> CellStart;                  ///< Prefijos por celda; tamaño GridW*GridH + 1.
+    TArray<int32> SortedIdx;                  ///< Índices de agente agrupados por celda.
 
+    /** true si la geometría está dimensionada, es decir, si Init ya se ha llamado. */
     bool IsValid() const { return GridW > 0 && GridH > 0; }
 
     /**
-     * Fija la geometria del grid a partir de los limites del mundo simulado
-     * y el tamano de celda. Llamar solo cuando cambie el mundo (no cada
-     * tick); Build() se encarga de repoblarlo con las posiciones actuales.
+     * Dimensiona la rejilla a partir de los límites del mundo simulado y el lado de celda,
+     * y vacía el índice.
      *
-     * @param WorldBounds  Extension del terreno simulable (cm), p.ej. la de
-     *                     FHeightField::GetWorldBounds().
-     * @param InCellSize   ~ radio de interaccion maximo entre arboles (doc.
-     *                     Apendice A). Con vecindad de 3x3 celdas cubres un
-     *                     radio de busqueda de hasta CellSize sin falsos
-     *                     negativos cerca de los bordes de celda.
+     * Se llama solo cuando cambia el mundo, nunca cada tick: repoblar el índice con las
+     * posiciones actuales es cosa de Build.
+     *
+     * @param WorldBounds Extensión del terreno simulable en cm, típicamente la de
+     *                    FHeightField::GetWorldBounds().
+     * @param InCellSize  Lado de celda en cm, del orden del radio de interacción máximo
+     *                    entre árboles: con una vecindad de 3x3 celdas se cubre un radio
+     *                    de búsqueda de hasta CellSize sin falsos negativos junto a los
+     *                    bordes de celda. Se acota a un mínimo de 1 cm.
      */
     void Init(const FBox2D& WorldBounds, double InCellSize);
 
-    /** Celda (cx,cy) -> indice lineal, con clamp a los bordes del grid. */
+    /** Índice lineal de la celda que contiene a P, con clamp a los bordes de la rejilla. */
     FORCEINLINE int32 CellOf(const FVector& P) const
     {
         const int32 Cx = EcoGrid::WorldToCellClamped(P.X, Origin.X, CellSize, GridW);
@@ -72,19 +76,28 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
     }
 
     /**
-     * Reconstruye el grid a partir de las posiciones actuales (counting sort
-     * en dos pasadas: contar por celda, prefijo acumulado, volcar). O(Num).
-     * Num puede ser menor que Pos.Num() (p.ej. si en el futuro se separan
-     * vivos/muertos); nunca al reves.
+     * Reconstruye el índice completo a partir de las posiciones actuales, por counting
+     * sort: contar por celda, prefijo acumulado y volcado con cursor. Coste @f$O(Num)@f$.
+     *
+     * @param Pos Posiciones de mundo de los agentes, en cm.
+     * @param Num Cuántas entradas de Pos se indexan, desde el principio.
+     * @pre Num <= Pos.Num().
+     * @note Pasada serial, previa al paso paralelo del tick. El recorrido en índice
+     *       creciente deja SortedIdx siempre en el mismo orden dentro de cada celda para
+     *       una misma población de entrada, y de ahí hereda su determinismo
+     *       @ref ForEachNeighbor.
      */
     void Build(const TArray<FVector>& Pos, int32 Num);
 
     /**
-     * Invoca Fn(AgentIndex) por cada agente en las celdas dentro de Radius
-     * de P (radio en CELDAS, redondeado hacia arriba: revisa un cuadrado de
-     * (2r+1)x(2r+1) celdas, no un circulo exacto - falsos positivos baratos
-     * de descartar en Fn si hace falta distancia exacta).
-     * Fn debe ser invocable como Fn(int32 AgentIndex).
+     * Invoca `Fn(int32 AgentIndex)` por cada agente indexado en las celdas que rodean a P.
+     *
+     * @param P      Centro de la consulta, en cm de mundo.
+     * @param Radius Radio de búsqueda en cm; se convierte a celdas redondeando hacia
+     *               arriba y se recorre un bloque cuadrado de (2R+1)x(2R+1) celdas.
+     * @param Fn     Invocable como `Fn(int32 AgentIndex)`.
+     * @note El bloque es cuadrado, no circular: filtrar por distancia exacta corresponde
+     *       al llamante, que es donde resulta barato.
      */
     template<typename FuncT>
     void ForEachNeighbor(const FVector& P, float Radius, FuncT&& Fn) const
@@ -98,14 +111,13 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
         const int32 Cy = EcoGrid::WorldToCellClamped(P.Y, Origin.Y, CellSize, GridH);
         const int32 R = FMath::CeilToInt32(Radius / CellSize);
 
-        // Recorrido compartido con FAttractorCloud (EcoGrid::ForEachItemInBox):
-        // una rejilla 2D es la 3D con una sola capa. Mismo orden de visita que
-        // antes (y ademas sin el test de limites por celda).
+        // Recorrido compartido con FAttractorCloud (EcoGrid::ForEachItemInBox): una
+        // rejilla 2D es la 3D con una sola capa, así que basta con Depth = 1.
         EcoGrid::ForEachItemInBox(CellStart, SortedIdx, Cx, Cy, /*Cz*/ 0, R,
             GridW, GridH, /*Depth*/ 1, Forward<FuncT>(Fn));
     }
 
-    /** Bytes de los buffers persistentes (para Eco.Profile). */
+    /** Bytes reservados por los buffers persistentes, para el informe de perfilado. */
     int32 ScratchBytes() const
     {
         return (CellStart.Max() + SortedIdx.Max() + Cursor.Max()) * sizeof(int32);
@@ -113,9 +125,11 @@ struct PROCEDURALECOSYSTEM_API FSpatialHash
 
 private:
     /**
-     * Cursor de escritura del counting sort, PERSISTENTE (optimizacion C5).
-     * Antes era un `TArray<int32> Cursor = CellStart;` local: a 205x205 celdas
-     * son ~168 KB de allocation + copia por tick. Como miembro se reutiliza.
+     * Cursor de escritura del counting sort, miembro persistente en lugar de local.
+     *
+     * Como el índice se reconstruye entero cada tick, un cursor local costaría una reserva
+     * y una copia del orden de 168 KB a 205x205 celdas cada vez; conservado entre llamadas
+     * se reutiliza su capacidad y la reconstrucción no toca el heap.
      */
     TArray<int32> Cursor;
 };

@@ -1,3 +1,19 @@
+/**
+ * @file TreeMeshBaker.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del horneado a malla estática y del impostor de dos tarjetas.
+ *
+ * Contiene el volcado de una sección —madera o follaje— a FMeshDescription como grupo de
+ * polígonos propio con sus cuatro canales de UV y su color de vértice, la construcción de la
+ * malla estática de dos secciones con los parámetros de build que exige el runtime, y la
+ * generación del impostor: dos tarjetas perpendiculares dimensionadas desde la caja local y
+ * deliberadamente sin canales de viento, para que el mismo material no las mueva.
+ *
+ * @ingroup eco_render
+ * @see @ref bib_impostores
+ * @see @ref bib_pivotpainter
+ */
+
 #include "Render/TreeMeshBaker.h"
 
 #include "Engine/StaticMesh.h"
@@ -7,25 +23,29 @@
 
 namespace
 {
-    /** Fase 6: canales UV que lleva la malla (0 textura + 3 de viento). */
+    /** Canales de UV de la malla: uno de textura y tres de viento. */
     constexpr int32 kNumUVChannels = 4;
 
     /**
-     * Vuelca una seccion (madera u hojas) en el FMeshDescription como un
-     * polygon group propio -> una slot de material propia -> una seccion de
-     * malla propia. Es lo que permite que la madera vaya con corteza opaca y el
-     * follaje con material masked/two-sided, que es lo caro (doc. 4.6).
+     * Vuelca una sección —madera u hojas— en el FMeshDescription como un grupo de polígonos
+     * propio, que se convierte en una ranura de material propia y en una sección de malla
+     * propia. Es lo que permite que la madera vaya opaca y el follaje enmascarado y a dos
+     * caras, que es la parte cara de dibujar.
      *
-     * Un vertex instance por vertice: los buffers de la Fase 3 ya duplican los
-     * vertices donde los atributos difieren (costura del anillo, esquinas de
-     * hoja), asi que no hay que partir nada aqui.
+     * Un vertex instance por vértice: los buffers del mallador ya duplican los vértices donde
+     * los atributos difieren —costura del anillo, esquinas de hoja—, así que aquí no hay que
+     * partir nada.
      *
-     * FASE 6: ademas de UV0 se copian UV1/UV2/UV3 (pivote de rama, nivel,
-     * balanceo y desfase) y el color de vertice (AO de copa + tinte). Es lo que
-     * hace que la MISMA malla instanciada se mueva con el viento y tenga la
-     * oclusion de copa horneada, sin datos extra por instancia. Si un buffer no
-     * trae esos canales -por ejemplo el impostor, que no debe moverse- se
-     * escriben ceros y blanco: el material los interpreta como "sin balanceo".
+     * Además de UV0 se copian UV1..UV3 —pivote de rama, nivel jerárquico, peso de balanceo y
+     * desfase— y el color de vértice, que lleva la oclusión de copa y la variación de tinte.
+     * Eso es lo que hace que una misma malla instanciada se mueva con el viento y tenga su
+     * autosombra horneada, sin ningún dato extra por instancia. Si un buffer no trae esos
+     * canales —el impostor, que no debe moverse— se escriben ceros y blanco, y el material
+     * los interpreta como ausencia de balanceo.
+     *
+     * @param OriginWorld      Origen al que se referencian los vértices; se resta a cada uno.
+     * @param SlotName         Nombre de la ranura de material del grupo de polígonos.
+     * @param InOutLocalBounds Se amplía con cada vértice volcado.
      */
     void AppendSection(FMeshDescription& MeshDesc, FStaticMeshAttributes& Attributes,
         const FTreeMeshBuffers& Buffers, const FVector& OriginWorld, FName SlotName,
@@ -69,7 +89,7 @@ namespace
             UVs.Set(VI, 0, Buffers.UVs.IsValidIndex(i)
                 ? FVector2f(Buffers.UVs[i]) : FVector2f::ZeroVector);
 
-            // --- Fase 6: canales de viento (ver Geometry/TreeMeshBuilder.h) ---
+            // --- Canales de viento; el contrato lo fija Geometry/TreeMeshBuilder.h ---
             UVs.Set(VI, 1, Buffers.UV1.IsValidIndex(i)
                 ? FVector2f(Buffers.UV1[i]) : FVector2f::ZeroVector);
             UVs.Set(VI, 2, Buffers.UV2.IsValidIndex(i)
@@ -77,7 +97,7 @@ namespace
             UVs.Set(VI, 3, Buffers.UV3.IsValidIndex(i)
                 ? FVector2f(Buffers.UV3[i]) : FVector2f::ZeroVector);
 
-            // --- Fase 6: AO de copa y variacion de tinte en el color de vertice ---
+            // --- Oclusión ambiental de copa y variación de tinte, en el color de vértice ---
             Colors[VI] = Buffers.Colors.IsValidIndex(i)
                 ? FVector4f(Buffers.Colors[i].R, Buffers.Colors[i].G, Buffers.Colors[i].B, Buffers.Colors[i].A)
                 : FVector4f(1.f, 1.f, 1.f, 1.f);
@@ -95,7 +115,7 @@ namespace
             }
             if (I0 == I1 || I1 == I2 || I0 == I2)
             {
-                continue; // degenerado: FMeshDescription lo rechazaria con un check
+                continue; // degenerado: FMeshDescription lo rechazaría con un check
             }
 
             MeshDesc.CreateTriangle(PolyGroup, TArray<FVertexInstanceID>{ Instances[I0], Instances[I1], Instances[I2] });
@@ -118,14 +138,14 @@ namespace TreeMeshBaker
         FMeshDescription MeshDesc;
         FStaticMeshAttributes Attributes(MeshDesc);
         Attributes.Register();
-        // Fase 6: 4 canales. UV0 = textura; UV1..UV3 = pivote de rama, nivel,
-        // balanceo y desfase (viento sin Pivot Painter, doc. 6.1).
+        // UV0 es la textura; UV1..UV3 llevan el pivote de rama, el nivel jerárquico, el peso
+        // de balanceo y el desfase, es decir la jerarquía de viento sin texturas de pivotes.
         Attributes.GetVertexInstanceUVs().SetNumChannels(kNumUVChannels);
 
-        OutLocalBounds.Init(); // caja realmente vacia (IsValid = 0)
+        OutLocalBounds.Init(); // caja realmente vacía (IsValid = 0)
 
-        // El ORDEN de los polygon groups tiene que casar con el de las slots de
-        // material: grupo 0 -> material 0, grupo 1 -> material 1.
+        // El orden de los grupos de polígonos tiene que casar con el de las ranuras de
+        // material: grupo 0 con material 0, grupo 1 con material 1.
         TArray<FStaticMaterial> Materials;
         if (bHasWood)
         {
@@ -146,9 +166,9 @@ namespace TreeMeshBaker
         Mesh->SetStaticMaterials(Materials);
 
         UStaticMesh::FBuildMeshDescriptionsParams Params;
-        Params.bBuildSimpleCollision = false; // el bosque no colisiona: 20k cuerpos serian inasumibles
-        Params.bCommitMeshDescription = false; // runtime: no guardamos la descripcion (memoria)
-        Params.bFastBuild = true;             // OBLIGATORIO fuera del editor
+        Params.bBuildSimpleCollision = false;  // el bosque no colisiona: 20k cuerpos son inviables
+        Params.bCommitMeshDescription = false; // en runtime la descripción no se conserva
+        Params.bFastBuild = true;              // obligatorio fuera del editor; excluye Nanite
         Params.bMarkPackageDirty = false;
 
         if (!Mesh->BuildFromMeshDescriptions({ &MeshDesc }, Params))
@@ -156,28 +176,24 @@ namespace TreeMeshBaker
             return nullptr;
         }
 
-        // NOTA (Fase 6): el material de viento desplaza vertices (WPO), asi que
-        // la caja envolvente "geometrica" de la malla se queda corta y UE puede
-        // cullar un arbol cuyas ramas todavia asoman en pantalla (parpadeo en el
-        // borde del encuadre). El margen NO se pone aqui sino en el COMPONENTE,
-        // con SetBoundsScale(): es una sola llamada por componente ISM en vez de
-        // por malla, y vale igual para el UProceduralMeshComponent del hero.
+        // El material de viento desplaza vértices, así que la caja envolvente geométrica de
+        // la malla se queda corta y el culling puede descartar un árbol cuyas ramas todavía
+        // asoman en pantalla. El margen no se pone aquí sino en el componente, con
+        // SetBoundsScale: es una llamada por componente en vez de por malla, y sirve igual
+        // para el mallado procedural de un hero tree.
         // Ver UTreeLibrary::GetOrCreateComponent y AHeroTreeActor.
 
         return Mesh;
     }
 
-    // NOTA: esto es un CROSSBOARD fijo (2 tarjetas perpendiculares), no un
-    // impostor octaedrico ni billboard que encare camara. Es suficiente con una
-    // textura de follaje masked y es lo mas barato. Si en el pulido quieres el
-    // octaedrico del doc, hace falta UNA card orientada a camara + material con
-    // UV dependientes de la vista (Impostor Baker); esta geometria NO lo sirve.
+    // Es un crossboard fijo de dos tarjetas perpendiculares, no un impostor octaédrico ni un
+    // billboard que encare a la cámara: con una textura de follaje enmascarada basta y es lo
+    // más barato. Un impostor octaédrico exigiría una tarjeta orientada a cámara y un
+    // material con UV dependientes de la vista, que esta geometría no sirve.
     //
-    // FASE 6: el impostor NO recibe canales de viento a proposito. El doc. 6.1 es
-    // explicito en el caveat: "desactiva el WPO de viento a distancia (solo se
-    // mueven los arboles cercanos; los impostors lejanos quedan estaticos)". Al
-    // no traer UV1..UV3 el bakeador escribe ceros -> SwayWeight = 0 -> el mismo
-    // material no produce ningun desplazamiento aunque se reutilice.
+    // El impostor no recibe canales de viento deliberadamente: al no traer UV1..UV3 se
+    // escriben ceros, el peso de balanceo queda a 0 y el mismo material no produce ningún
+    // desplazamiento aunque se reutilice. Es lo que deja estático el campo lejano.
     UStaticMesh* BuildImpostorMesh(UObject* Outer, const FBox& LocalBounds, UMaterialInterface* ImpostorMaterial)
     {
         if (!LocalBounds.IsValid)
@@ -207,11 +223,11 @@ namespace TreeMeshBaker
                 {
                     Cards.Normals.Add(Normal);
                     Cards.Tangents.Add(Right);
-                    // Blanco: sin AO horneado (el impostor ya es una silueta plana).
+                    // Blanco: sin oclusión horneada, el impostor ya es una silueta plana.
                     Cards.Colors.Add(FLinearColor::White);
                 }
 
-                // v = 0 arriba (convenio de UV de UE para una textura de arbol).
+                // v = 0 arriba, el convenio de UV del motor para una textura de árbol.
                 Cards.UVs.Add(FVector2D(0.f, 1.f));
                 Cards.UVs.Add(FVector2D(1.f, 1.f));
                 Cards.UVs.Add(FVector2D(1.f, 0.f));
@@ -224,7 +240,7 @@ namespace TreeMeshBaker
         AddCard(FVector::RightVector, FVector::ForwardVector); // tarjeta en el plano XZ
         AddCard(FVector::ForwardVector, FVector::RightVector); // tarjeta en el plano YZ
 
-        // Se hornea como "follaje" para que use el material de impostor (masked).
+        // Se hornea como sección de follaje para que tome el material de impostor enmascarado.
         FTreeMeshData Data;
         Data.Leaves = MoveTemp(Cards);
 

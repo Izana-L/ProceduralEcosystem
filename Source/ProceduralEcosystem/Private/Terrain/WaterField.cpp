@@ -1,39 +1,60 @@
+/**
+ * @file WaterField.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del bake hidrológico: depresiones, D8, acumulación y TWI.
+ *
+ * Contiene el rellenado de depresiones Priority-Flood + épsilon, con heap binario
+ * propio y desempate por índice de celda, y FWaterField::BakeFromHeightField, que
+ * encadena sobre él las cuatro etapas restantes del pipeline: dirección de flujo
+ * D8, ordenación descendente por cota, acumulación aguas abajo y evaluación del
+ * índice con su normalización. Aloja también los offsets de la vecindad D8,
+ * compartidos por el rellenado y por el enrutado para que no puedan divergir.
+ *
+ * @ingroup eco_terrain
+ * @see @ref bib_barnes2014
+ * @see @ref bib_ocallaghan1984
+ * @see @ref bib_beven1979
+ */
+
 #include "Terrain/WaterField.h"
 #include "Terrain/HeightField.h"
 #include "Async/ParallelFor.h"
 
 // =====================================================================
-// Rellenado de sumideros: Priority-Flood + epsilon (Barnes et al. 2014).
-//
-// El D8 simple sobre ruido fractal deja muchos minimos locales que cortan
-// la acumulacion de flujo en microcuencas inconexas. Rellenar las
-// depresiones hace que toda celda interior drene de forma MONOTONA hasta el
-// borde, conectando la red y dando valles humedos realistas.
-//
-// El termino epsilon impone una pendiente minima en lo rellenado, asi que
-// el D8 siempre halla un vecino cuesta abajo y no quedan planos indefinidos.
-//
-// Se trabaja en double para que el epsilon no se pierda por precision de
-// float en terrenos grandes. Cola de prioridad con desempate por indice ->
-// resultado determinista (reproducible bit a bit). Heap binario propio para
-// no depender de la version de la API de TArray::Heap* ni sufrir el realloc
-// por shrink en cada pop.
+// Rellenado de depresiones (Priority-Flood + épsilon)
 // =====================================================================
 namespace
 {
-    // Offsets de los 8 vecinos (D8), en el MISMO orden para el priority-flood y
-    // para la direccion de flujo. Una sola copia: antes estaban declarados por
-    // duplicado dentro de cada funcion y podian divergir en silencio.
+    /** Offsets de los 8 vecinos (D8), en el MISMO orden para el rellenado de
+        depresiones y para la dirección de flujo: copia única, de modo que ambos
+        recorridos no puedan divergir en silencio. */
     constexpr int32 GD8X[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
     constexpr int32 GD8Y[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
 
+    /** Entrada de la cola de prioridad: cota de trabajo e índice lineal de celda. */
     struct FPFNode { double Z; int32 Idx; };
 
+    /** Orden del min-heap. El desempate por índice lo hace reproducible bit a bit. */
     FORCEINLINE bool PFLess(const FPFNode& A, const FPFNode& B)
     {
         return A.Z != B.Z ? A.Z < B.Z : A.Idx < B.Idx; // min-heap; desempate determinista
     }
 
+    /**
+     * Rellena las depresiones del relieve para que toda celda interior drene de
+     * forma MONÓTONA hasta el borde.
+     *
+     * Inunda desde el borde con una cola de prioridad: al extraer la celda más
+     * baja se cierran sus vecinos aún abiertos y se eleva a @f$ z_{cur}+\varepsilon @f$
+     * todo el que quede por debajo de la cota actual. El épsilon impone una
+     * pendiente mínima en lo rellenado, así que el D8 posterior siempre encuentra
+     * un vecino cuesta abajo y no quedan planos indefinidos.
+     *
+     * @param H      Relieve de partida, con alturas en cm.
+     * @param Filled Cotas de trabajo resultantes; se dimensiona aquí.
+     * @note Trabaja en double porque con float el épsilon de 0.01 cm se perdería
+     *       por precisión en terrenos grandes.
+     */
     void FillDepressionsPriorityFlood(const FField2D& H, TArray<double>& Filled)
     {
         const int32 W = H.Width;
@@ -45,8 +66,9 @@ namespace
         TArray<uint8> Closed;
         Closed.Init(0, N);
 
-        // Almacenamiento del heap preasignado a N (cada celda entra 1 vez):
-        // asi GetData() no se invalida y no hay reasignaciones ni shrink.
+        // Heap binario propio, preasignado a N (cada celda entra una sola vez):
+        // así GetData() no se invalida y no hay reasignaciones ni shrink por
+        // extracción.
         TArray<FPFNode> HeapBuf;
         HeapBuf.SetNumUninitialized(N);
         FPFNode* Heap = HeapBuf.GetData();
@@ -87,8 +109,8 @@ namespace
                 return top;
             };
 
-        // Semilla: todas las celdas del borde conservan su cota y hacen de
-        // salida del mapa (el agua abandona el terreno por el borde).
+        // Siembra: todas las celdas del borde conservan su cota y hacen de salida
+        // del mapa; el agua abandona el terreno por ahí.
         for (int32 y = 0; y < Ht; ++y)
         {
             for (int32 x = 0; x < W; ++x)
@@ -103,7 +125,7 @@ namespace
             }
         }
 
-        const double Epsilon = 0.01; // cm: pendiente minima impuesta al rellenar
+        const double Epsilon = 0.01; // cm: pendiente mínima impuesta al rellenar
 
         while (Count > 0)
         {
@@ -122,7 +144,7 @@ namespace
                 Closed[n] = 1;
 
                 double z = static_cast<double>(H.Data[n]);
-                if (z <= cur.Z) z = cur.Z + Epsilon; // rellena la depresion
+                if (z <= cur.Z) z = cur.Z + Epsilon; // rellena la depresión
                 Filled[n] = z;
                 Push(z, n);
             }
@@ -142,9 +164,9 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
     Field.Init(W, Ht, H.CellSize, H.Origin, 0.f);
 
     // -----------------------------------------------------------------
-    // 0) Cotas de trabajo (double): relieve con sumideros rellenados o, si
-    //    se desactiva (ablacion), una copia del relieve crudo. Todo lo que
-    //    viene despues usa Elev en vez de H.Data.
+    // 0) Cotas de trabajo (double): relieve con las depresiones rellenadas o,
+    //    si el rellenado se desactiva, una copia del relieve crudo. Todo lo
+    //    que viene después usa Elev y no H.Data.
     // -----------------------------------------------------------------
     TArray<double> Elev;
     if (bFillSinks)
@@ -158,13 +180,14 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
     }
 
     // -----------------------------------------------------------------
-    // 1) Direccion de flujo D8: para cada celda, el vecino con mayor
-    //    caida por unidad de distancia. Tras el rellenado, toda celda
-    //    interior tiene vecino cuesta abajo; solo el borde queda sin salida.
-    //    Cada celda escribe su propio FlowTo[c] -> paralelizable y determinista.
+    // 1) Dirección de flujo D8: toda el agua de una celda va al único vecino
+    //    de los ocho con mayor caída por unidad de distancia. Tras el
+    //    rellenado, toda celda interior tiene vecino cuesta abajo; solo el
+    //    borde queda sin salida. Cada celda escribe su propio FlowTo[c], así
+    //    que la pasada es paralelizable por filas y determinista.
     // -----------------------------------------------------------------
     TArray<int32> FlowTo;
-    FlowTo.Init(-1, N); // -1 = sin salida (borde / salida del mapa)
+    FlowTo.Init(-1, N); // -1 = sin salida (borde: el agua deja el mapa)
 
     static const double NDist[8] = { 1.0, 1.41421356, 1.0, 1.41421356,
                                      1.0, 1.41421356, 1.0, 1.41421356 };
@@ -201,10 +224,10 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
         });
 
     // -----------------------------------------------------------------
-    // 2) Orden descendente por cota (rellenada). Procesar de mas alto a mas
-    //    bajo garantiza que, al tocarle el turno a una celda, ya recibio
-    //    todo lo que drena hacia ella desde arriba. Desempate por indice ->
-    //    bake reproducible bit a bit.
+    // 2) Orden descendente por cota de trabajo. Procesar de más alto a más
+    //    bajo garantiza que, cuando le toca el turno a una celda, ya ha
+    //    recibido todo lo que drena hacia ella desde arriba. El desempate por
+    //    índice deja el bake reproducible bit a bit.
     // -----------------------------------------------------------------
     TArray<int32> Order;
     Order.SetNumUninitialized(N);
@@ -219,9 +242,9 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
         });
 
     // -----------------------------------------------------------------
-    // 3) Acumulacion de flujo: cada celda empieza en 1 (ella misma) y
-    //    entrega su acumulado a la celda hacia la que drena. SERIAL: hay
-    //    dependencia aguas arriba -> abajo, no se paraleliza.
+    // 3) Acumulación de flujo: cada celda empieza en 1 (ella misma) y entrega
+    //    su acumulado a la celda hacia la que drena. SERIAL: la dependencia
+    //    aguas arriba -> aguas abajo impide paralelizarlo.
     // -----------------------------------------------------------------
     TArray<float> FlowAcc;
     FlowAcc.Init(1.f, N);
@@ -236,10 +259,10 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
     }
 
     // -----------------------------------------------------------------
-    // 4) TWI crudo = ln(acumulacion / tan(pendiente)). Pendiente = la del
-    //    propio drenaje D8 sobre la cota rellenada (coherente con la
-    //    acumulacion). Un minimo evita dividir por cero en zonas planas, que
-    //    deben salir humedas (mucho TWI). Paralelizable; min/max en serial.
+    // 4) TWI crudo = ln(acumulación / tan(pendiente)). La pendiente es la del
+    //    propio enlace D8 sobre la cota de trabajo, coherente con la
+    //    acumulación. El mínimo evita dividir por cero en zonas planas, que
+    //    deben salir húmedas (TWI alto).
     // -----------------------------------------------------------------
     constexpr double MinSlopeRad = 0.001; // ~0.06 grados
     TArray<float> TwiRaw;
@@ -266,8 +289,10 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
         });
 
     // -----------------------------------------------------------------
-    // 5) Normalizacion lineal a [0, OutputMax]: deja el campo listo para la
-    //    formula de vigor (Monod, Fase 2) sin reescalados ahi.
+    // 5) Normalización lineal a [0, OutputMax]: deja el campo listo para la
+    //    función de vigor sin reescalados ahí. Destruye la escala física del
+    //    índice, lo que es deliberado: agua y nutrientes deben entrar en el
+    //    vigor con rangos comparables.
     // -----------------------------------------------------------------
     Field.FillNormalizedFrom(TwiRaw, OutputMax);
 }

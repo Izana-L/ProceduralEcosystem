@@ -1,3 +1,25 @@
+/**
+ * @file AttractorCloud.h
+ * @author Juan Luque Roldán
+ * @brief Nube de atractores de la colonización del espacio y su índice de consulta por rango.
+ *
+ * Declara FAttractorCloud, que responde a las dos preguntas que el algoritmo de
+ * colonización del espacio hace sobre el hueco disponible en la copa: dónde hay algo
+ * hacia lo que crecer y qué atractores ve un nodo concreto. La siembra reparte los
+ * puntos dentro de la envolvente de copa de la especie —cónica, columnar o elipsoidal,
+ * más una falda bajo la base de copa— de forma determinista desde la semilla del árbol.
+ * La consulta se apoya en un índice CSR 3D de celda @f$d_i@f$ construido por counting
+ * sort, que baja el paso ASOCIAR de @f$O(N)@f$ por nodo a @f$O(\text{vecindad})@f$. Los
+ * atractores no se mueven nunca —solo se marcan muertos—, así que el índice se
+ * construye una sola vez por árbol.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_runions2007
+ * @see @ref bib_weberpenn1995
+ * @see @ref bib_countingsortcsr
+ * @see @ref bib_teschner2003
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -7,78 +29,87 @@ class USpeciesData;          // Species/SpeciesData.h        (se incluye en el .
 struct FTreeLightGridFine;   // Geometry/TreeLightGridFine.h (se incluye en el .cpp)
 
 /**
- * Un atractor del SCA (doc. Fase 3, 3.1): un punto de "espacio/luz libre" en
- * la copa hacia el que el arbol quiere crecer. Se siembra una nube dentro de
- * la envolvente y el arbol crece nodo a nodo hacia ellos.
+ * Punto de espacio libre dentro de la copa hacia el que el árbol quiere crecer.
  *
- * BestNode/BestDist son estado de trabajo del paso ASOCIAR: se recalculan en
- * cada iteracion del SCA (no persisten). bAlive pasa a false cuando el atractor
- * se da por alcanzado (paso MATAR) o queda en sombra (autopoda).
+ * BestNode y BestDist son estado de trabajo del paso ASOCIAR: se reinician y se
+ * recalculan enteros en cada iteración del algoritmo, no persisten. `bAlive` pasa a
+ * false por dos vías y no vuelve a true: alcanzado (paso MATAR, una rama nueva cae a
+ * menos de @f$d_k@f$) o en sombra (@ref FAttractorCloud::CullByShade).
  */
 struct FAttractor
 {
-    FVector Pos = FVector::ZeroVector;
-    bool    bAlive = true;
-    int32   BestNode = INDEX_NONE; // nodo mas cercano dentro de d_i (se resetea cada iter)
-    float   BestDist = 0.f;        // distancia a BestNode
+    FVector Pos = FVector::ZeroVector; ///< Posición en mundo, en cm.
+    bool    bAlive = true;             ///< false = alcanzado o podado por falta de luz.
+    int32   BestNode = INDEX_NONE;     ///< Nodo más cercano dentro de @f$d_i@f$ en esta iteración.
+    float   BestDist = 0.f;            ///< Distancia a BestNode; arranca en @f$d_i@f$.
 };
 
 /**
- * Nube de atractores + indice espacial para el SCA (doc. Fase 3, 3.1/3.2).
+ * Nube de atractores de un árbol: siembra de la envolvente de copa e índice espacial.
  *
- * Dos responsabilidades:
- *   1. SEMBRAR la envolvente de copa por especie (SampleCrownEnvelope), con la
- *      forma conica/esferica/columnar del Paso 1. Es determinista desde el
- *      RngState del arbol (doc. 3.8): mismo arbol -> misma nube.
- *   2. Servir de INDICE por rango para el paso "Asociar" del SCA: un indice CSR
- *      3D (counting sort) sobre las posiciones, para consultar los atractores
- *      cerca de un nodo en O(vecindad) en vez de O(N). Es el uso clasico de la
- *      rejilla como estructura de aceleracion del SCA.
+ * Dos responsabilidades. Sembrar la envolvente de copa de la especie
+ * (@ref SampleCrownEnvelope) según su ECrownShape, de forma determinista desde el
+ * RngState del árbol: misma semilla, misma nube. Y servir de índice por rango al paso
+ * ASOCIAR (@ref ForEachInRange) sobre un CSR 3D de celda @f$d_i@f$.
  *
- * NOTA de decision: en el documento el primer CullByShade usa el grid grueso
- * global directamente; aqui se unifica en el grid FINO, que ya trae la sombra
- * de los vecinos via FTreeLightGridFine::SeedFromCoarse. Asi CullByShade tiene
- * una sola firma (contra el grid fino), tanto para el contexto de vecinos como
- * para la autopoda del follaje propio.
+ * @ref CullByShade tiene una sola firma, siempre contra la rejilla de luz FINA: ésta ya
+ * trae la sombra de los vecinos vía FTreeLightGridFine::SeedFromCoarse, de modo que el
+ * mismo código sirve para el contexto de vecinos y para la autopoda del follaje propio.
  *
- * El indice se construye UNA vez tras sembrar (los atractores no se mueven,
- * solo se marcan dead). Las consultas devuelven TODOS los indices de las
- * celdas: es el llamador (el SCA) quien filtra por bAlive, igual que hace
- * FSpatialHash en la Fase 2.
+ * El índice se construye una vez tras sembrar, porque los atractores no se mueven, solo
+ * se marcan muertos. Las consultas devuelven todos los índices de las celdas del bloque
+ * y filtrar por `bAlive` corresponde al llamador, igual que en @ref FSpatialHash.
  */
 struct PROCEDURALECOSYSTEM_API FAttractorCloud
 {
     TArray<FAttractor> Attractors;
 
-    // --- Indice CSR 3D (construido por BuildIndex tras SampleCrownEnvelope) ---
-    float   CellSize = 0.f;                    // usar d_i (radio de influencia)
-    FVector GridOrigin = FVector::ZeroVector;  // esquina min de la rejilla
-    int32   GridW = 0, GridH = 0, GridD = 0;
-    TArray<int32> CellStart;                   // offsets CSR, tamano GridW*GridH*GridD + 1
-    TArray<int32> SortedIdx;                   // indices de atractor agrupados por celda
+    // ==== Índice CSR 3D (lo construye BuildIndex tras sembrar) ====
+    float   CellSize = 0.f;                    ///< Arista de celda; el crecimiento usa @f$d_i@f$.
+    FVector GridOrigin = FVector::ZeroVector;  ///< Esquina mínima de la rejilla, en mundo.
+    int32   GridW = 0, GridH = 0, GridD = 0;   ///< Dimensiones de la rejilla en celdas.
+    TArray<int32> CellStart;                   ///< Prefijo por celda: W*H*D + 1 entradas.
+    TArray<int32> SortedIdx;                   ///< Índices de atractor agrupados por celda.
 
     int32 Num() const { return Attractors.Num(); }
+
+    /** Atractores todavía vivos; el bucle de crecimiento lo usa como condición de parada. */
     int32 CountAlive() const;
+
+    /** Vacía la nube y el índice. */
     void Reset();
 
     /**
-     * Siembra NumAttractors puntos dentro de la envolvente de copa de la
-     * especie (forma segun ECrownShape), en mundo, con la base del tronco en
-     * TrunkBaseWorld. REEMPLAZA el contenido. Consume RngState -> reproducible.
+     * Siembra Species.NumAttractors puntos en la envolvente de copa, en coordenadas de
+     * mundo y con la base del tronco en TrunkBaseWorld.
+     *
+     * @param RngState Estado del generador; se consume y avanza, de ahí la
+     *                 reproducibilidad de la nube.
+     * @note Reemplaza el contenido previo. El índice queda obsoleto: hay que volver a
+     *       llamar a @ref BuildIndex después.
      */
     void SampleCrownEnvelope(const USpeciesData& Species, const FVector& TrunkBaseWorld, uint32& RngState);
 
-    /** Construye el indice CSR con InCellSize (usar d_i). Llamar tras sembrar. */
+    /**
+     * Construye el índice CSR con celda InCellSize.
+     * @pre La nube ya está sembrada. El crecimiento pasa @f$d_i@f$, con lo que la
+     *      vecindad de una consulta de ese radio cabe en el bloque de 3x3x3 celdas.
+     */
     void BuildIndex(float InCellSize);
 
-    /** Marca dead los atractores cuya luz esta por debajo de LightThreshold en
-        la rejilla fina (micro<-macro de vecinos y/o autopoda del follaje). */
+    /**
+     * Marca muertos los atractores cuya luz disponible en la rejilla fina queda por
+     * debajo de LightThreshold: sombra de los vecinos y autopoda del follaje propio.
+     */
     void CullByShade(const FTreeLightGridFine& Light, float LightThreshold);
 
     /**
-     * Invoca Fn(int32 AttractorIndex) por cada atractor en las celdas dentro de
-     * Radius de P (radio en unidades de mundo; se convierte a celdas). Incluye
-     * atractores dead: filtra por Attractors[i].bAlive en Fn si hace falta.
+     * Invoca `Fn(int32 AttractorIndex)` para cada atractor de las celdas que cubren la
+     * esfera de radio Radius (en unidades de mundo) centrada en P.
+     *
+     * @note Es una consulta por CELDAS: devuelve también atractores fuera del radio
+     *       exacto y atractores muertos. Filtrar por distancia y por `bAlive`
+     *       corresponde a Fn.
      */
     template<typename FuncT>
     void ForEachInRange(const FVector& P, float Radius, FuncT&& Fn) const
@@ -93,15 +124,15 @@ struct PROCEDURALECOSYSTEM_API FAttractorCloud
         const int32 Cz = EcoGrid::WorldToCell(P.Z, GridOrigin.Z, CellSize);
         const int32 R = FMath::CeilToInt(Radius / CellSize);
 
-        // Recorrido compartido con FSpatialHash (EcoGrid::ForEachItemInBox):
-        // este bucle estaba duplicado entre las dos estructuras y es el mas
-        // caliente del SCA (una consulta por nodo y por iteracion).
+        // Recorrido del bloque de celdas compartido con FSpatialHash. Es el bucle más
+        // caliente de la generación —una consulta por nodo y por iteración— y su orden
+        // de visita forma parte del contrato de determinismo.
         EcoGrid::ForEachItemInBox(CellStart, SortedIdx, Cx, Cy, Cz, R,
             GridW, GridH, GridD, Forward<FuncT>(Fn));
     }
 
 private:
-    /** Mundo -> celda lineal con clamp (para construir el indice). */
+    /** Posición en mundo a índice lineal de celda, con clamp a la rejilla. */
     FORCEINLINE int32 CellOf(const FVector& P) const
     {
         const int32 Cx = EcoGrid::WorldToCellClamped(P.X, GridOrigin.X, CellSize, GridW);

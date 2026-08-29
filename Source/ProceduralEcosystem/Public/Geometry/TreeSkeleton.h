@@ -1,142 +1,162 @@
+/**
+ * @file TreeSkeleton.h
+ * @author Juan Luque Roldán
+ * @brief Esqueleto de ramas de un árbol: el nodo plano con padre por índice y su
+ *        contenedor.
+ *
+ * Declara FBranchNode y FTreeSkeleton, la estructura que produce la colonización del
+ * espacio y consumen después el deformador de tronco, el mallador, los datos de viento y
+ * el follaje. Un árbol es aquí un array plano de nodos que apuntan a su padre por
+ * índice, no un grafo de punteros, y su invariante de construcción —el padre ocupa
+ * siempre un índice menor que el hijo— permite recorrer la topología entera en una sola
+ * pasada, hacia delante o hacia atrás, sin recursión ni ordenación previa. Fija además
+ * la distinción entre el radio estructural que deja el pipe model y el radio que
+ * realmente se malla.
+ *
+ * @ingroup eco_geometry
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 
 /**
- * Bits de FBranchNode::Flags. Caben en el padding que el struct ya tenia, asi
- * que marcar el eje principal no cuesta memoria (ver la nota de tamano abajo).
+ * Bits de FBranchNode::Flags. Caben en el hueco de alineación que el struct ya tenía,
+ * así que marcar el eje principal no cuesta memoria.
  */
 enum EBranchNodeFlag : uint8
 {
     BNF_None = 0,
 
-    /** El nodo forma parte del EJE PRINCIPAL (tronco + lider que atraviesa la
-        copa). Lo marca el SCA al pre-construir el eje y lo consumen el perfil
-        de tronco (que solo afila y ensancha el eje) y los datos de viento (el
-        eje continua SIEMPRE la misma rama al bifurcar, ver TreeWindData). */
+    /** El nodo forma parte del EJE PRINCIPAL (tronco más el líder que atraviesa la
+        copa). Lo marca la colonización del espacio al pre-construir el eje, y lo
+        consumen el perfil de tronco —que solo afila y ensancha el eje— y los datos de
+        viento, donde el eje continúa siempre la misma rama al bifurcar. */
     BNF_Axis = 1 << 0
 };
 
 /**
- * Un nodo del esqueleto de ramas de un arbol (doc. Fase 3, 3.2).
+ * Un nodo del esqueleto de ramas: el extremo de un internodo.
  *
- * El esqueleto es una lista de nodos con puntero al PADRE (indice), no un
- * arbol de punteros: asi se reconstruyen las ramas y, sobre todo, se calculan
- * los radios del pipe model recorriendo de las puntas a la base sin punteros
- * ni recursion.
+ * El esqueleto es una lista de nodos que apuntan al PADRE por índice, no un árbol de
+ * punteros: así se reconstruyen las ramas y, sobre todo, se calculan los radios del pipe
+ * model recorriendo de las puntas a la base sin punteros ni recursión.
  *
- * Struct PLANO (no USTRUCT): es dato caliente: el SCA genera cientos a pocos
- * miles por arbol y el mallador los recorre entero. No necesita reflexion ni
- * exponerse a Blueprint.
+ * Struct plano, no USTRUCT: es dato caliente —de cientos a pocos miles por árbol, y el
+ * mallador los recorre enteros—, no necesita reflexión ni exponerse a Blueprint.
  */
 struct FBranchNode
 {
-    /** Posicion de mundo del extremo del internodo (cm). */
+    /** Posición de mundo del extremo del internodo (cm). */
     FVector Pos = FVector::ZeroVector;
 
-    /** Indice del nodo padre en FTreeSkeleton::Nodes; -1 = raiz (base del tronco). */
+    /** Índice del nodo padre en FTreeSkeleton::Nodes; -1 = raíz (base del tronco). */
     int32 Parent = -1;
 
-    /** Orden de rama: 0 = tronco, aumenta al alejarse de la raiz. */
+    /** Orden de rama: 0 = tronco, aumenta al alejarse de la raíz. */
     int32 Depth = 0;
 
-    /** Direccion del internodo (unitaria). Da la INERCIA (wPrev) a la siguiente
-        iteracion del SCA y orienta el anillo de seccion al mallar. */
+    /** Dirección del internodo (unitaria). Aporta el término de inercia a la mezcla de
+        direcciones de crecimiento y orienta el anillo de sección al mallar. */
     FVector Dir = FVector::UpVector;
 
-    /** Radio de la rama en este nodo (cm). Se rellena al final con el pipe
-        model (doc. 3.6); vale 0 hasta entonces. Es el radio que MALLA el
-        tubo, o sea el que ya lleva encima el perfil de tronco. */
+    /** Radio mallado de la rama en este nodo (cm): el que ve el tubo, con el perfil de
+        tronco ya aplicado encima. Lo rellena el pipe model al terminar el crecimiento y
+        lo reescribe después @ref SpaceColonization::ApplyTrunkProfile; vale 0 hasta
+        entonces. */
     float Radius = 0.f;
 
     /**
-     * Radio ESTRUCTURAL del pipe model, sin el perfil de tronco (ensanche de
-     * base y taper) que ApplyTrunkProfile aplica despues sobre Radius.
+     * Radio ESTRUCTURAL del pipe model, sin el ensanche de pie ni el afilado que el
+     * perfil de tronco aplica después sobre Radius.
      *
-     * Existe porque hay consumidores que preguntan "que tan gruesa es esta
-     * rama" para deducir RIGIDEZ, no para dibujarla: FTreeWindData normaliza
-     * el balanceo contra el radio de la base, y si esa referencia llevase el
-     * ensanche de raiz -que puede duplicar el radio del pie- todo el arbol
-     * pasaria a considerarse "fino" y se balancearia de mas. La geometria usa
-     * Radius; la fisica del viento, PipeRadius.
+     * Existe porque hay consumidores que preguntan cuán gruesa es una rama para deducir
+     * RIGIDEZ, no para dibujarla: los datos de viento normalizan el balanceo contra el
+     * radio de la base, y si esa referencia llevase el ensanche de raíz —que puede
+     * duplicar el radio del pie— el árbol entero pasaría a considerarse fino y se
+     * balancearía de más. La geometría usa Radius; la respuesta al viento, PipeRadius.
      */
     float PipeRadius = 0.f;
 
     /** Bits de EBranchNodeFlag (BNF_Axis). */
     uint8 Flags = 0;
 
-    /** El nodo pertenece al eje principal (tronco + lider). */
+    /** El nodo pertenece al eje principal (tronco más líder). */
     FORCEINLINE bool IsAxis() const { return (Flags & BNF_Axis) != 0; }
 
     /**
-     * Radio estructural con FALLBACK a Radius. Los esqueletos construidos a
-     * mano (tests, utilidades) rellenan Radius y no PipeRadius; sin el
-     * fallback verian grosor 0 y las formulas que dividen por el radio de la
-     * base darian resultados absurdos.
+     * Radio estructural con fallback a Radius.
+     *
+     * @note Los esqueletos construidos a mano (pruebas, utilidades) rellenan Radius y no
+     *       PipeRadius; sin el fallback verían grosor 0 y las fórmulas que dividen por el
+     *       radio de la base darían resultados absurdos.
      */
     FORCEINLINE float GetPipeRadius() const { return (PipeRadius > 0.f) ? PipeRadius : Radius; }
 };
 
 /**
- * Esqueleto de UN arbol: contenedor PASIVO de nodos (doc. Fase 3, 3.2).
+ * Esqueleto de UN árbol: contenedor PASIVO de nodos.
  *
- * Es la salida de la colonizacion del espacio (clase SpaceColonization) y la
- * entrada del mallador (clase TreeMeshBuilder). Igual que FTreePopulation en
- * la Fase 2, aqui SOLO hay datos y operaciones basicas de gestion del array:
- * ni siembra atractores, ni conoce la luz, ni tropismos. Eso vive en el motor
- * del SCA.
+ * Es la salida de la colonización del espacio (@ref SpaceColonization::GrowTree) y la
+ * entrada del mallador. Aquí solo hay datos y las operaciones básicas de gestión del
+ * array: no siembra atractores, no conoce la luz ni los tropismos; eso vive en el motor
+ * de crecimiento.
  *
- * INVARIANTE DE CONSTRUCCION (la garantiza el SCA y de ella dependen otros
- * pasos): un hijo se anade SIEMPRE despues de su padre, luego
- *   Parent < indice-del-hijo    y    Depth es no-decreciente con el indice.
- * Consecuencia util: recorrer los nodos en orden de indice DECRECIENTE visita
- * cada hijo antes que su padre, que es justo lo que pide el pipe model
- * (doc. 3.6, "NodesByDecreasingDepth") sin necesidad de ordenar nada.
+ * INVARIANTE DE CONSTRUCCIÓN: un hijo se añade siempre después de su padre, luego
+ * `Parent` < índice del hijo y `Depth` no decrece con el índice. Recorrer en índice
+ * DECRECIENTE visita cada hijo antes que su padre, que es lo que piden el pipe model y
+ * la pasada de monotonía del perfil de tronco; recorrer en índice CRECIENTE garantiza
+ * que el padre ya está resuelto, que es lo que piden el deformador de tronco, los marcos
+ * de rotación mínima del mallador y la detección de ramas. Ningún consumidor ordena ni
+ * recurre.
  */
 struct PROCEDURALECOSYSTEM_API FTreeSkeleton
 {
-    /** Nodos del arbol. El indice 0 es la raiz tras InitRoot(). */
+    /** Nodos del árbol. El índice 0 es la raíz tras InitRoot(). */
     TArray<FBranchNode> Nodes;
 
     int32 Num() const { return Nodes.Num(); }
 
-    /** Vacia el esqueleto sin liberar la capacidad reservada. */
+    /** Vacía el esqueleto sin liberar la capacidad reservada. */
     void Reset();
 
     /** Reserva espacio para evitar realojos durante el crecimiento. */
     void Reserve(int32 ExpectedNodes);
 
     /**
-     * Reinicia el esqueleto y crea el nodo raiz en la base del tronco.
-     * Devuelve su indice (siempre 0). InitialDir es la direccion de arranque
-     * del tronco (normalmente hacia arriba).
+     * Reinicia el esqueleto y crea el nodo raíz en la base del tronco, marcado como eje.
+     *
+     * @param InitialDir Dirección de arranque del tronco, normalmente hacia arriba.
+     * @return El índice de la raíz, siempre 0.
      */
     int32 InitRoot(const FVector& TrunkBaseWorld, const FVector& InitialDir = FVector::UpVector);
 
     /**
-     * Anade un hijo de ParentIndex en Pos con direccion Dir (debe venir
-     * normalizada). Deriva Depth = Padre.Depth + 1 y preserva la invariante
-     * Parent < indice. Devuelve el indice del nuevo nodo.
+     * Añade un hijo de ParentIndex, derivando `Depth` del padre y preservando la
+     * invariante `Parent` < índice.
      *
-     * InFlags son bits de EBranchNodeFlag; pasa BNF_Axis al encadenar el eje
-     * principal. Por defecto 0 (rama normal), asi que las llamadas existentes
-     * no cambian de significado.
+     * @param Dir     Dirección del nuevo internodo; debe venir normalizada.
+     * @param InFlags Bits de EBranchNodeFlag; BNF_Axis al encadenar el eje principal.
+     * @return El índice del nuevo nodo, o INDEX_NONE si ParentIndex no es válido.
      */
     int32 AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir, uint8 InFlags = BNF_None);
 
     /**
-     * Nº de hijos de cada nodo. UNICA copia de la pasada que necesitan tanto el
-     * mallador (nodos terminales = puntas con hoja) como los datos de viento
-     * (un nodo abre rama nueva si su padre bifurco). Deja OutChildCount con
-     * Num() elementos.
+     * Número de hijos de cada nodo, en un array de Num() elementos.
+     *
+     * Copia única de la pasada que necesitan tanto el mallador —los nodos sin hijos son
+     * las puntas que rematan en ápice— como los datos de viento, donde un nodo abre rama
+     * nueva si su padre bifurcó.
      */
     void ComputeChildCounts(TArray<int32>& OutChildCount) const;
 
     /**
-     * Longitud acumulada desde la raiz hasta cada nodo (cm), siguiendo la
-     * cadena de padres. Explota la invariante Parent < indice (una pasada, sin
-     * recursion). La comparten el mallador (UV.v de la corteza) y los datos de
-     * viento (posicion a lo largo del arbol para el peso de balanceo).
+     * Longitud de arco acumulada desde la raíz hasta cada nodo (cm), siguiendo la cadena
+     * de padres en una sola pasada gracias a la invariante `Parent` < índice.
+     *
+     * La comparten el mallador (coordenada v de la UV de corteza), los datos de viento
+     * (posición a lo largo del árbol, que gradúa el peso de balanceo) y el follaje
+     * (ranuras de la espiral filotáctica).
      */
     void ComputeAlongLengths(TArray<float>& OutAlongLen) const;
 };

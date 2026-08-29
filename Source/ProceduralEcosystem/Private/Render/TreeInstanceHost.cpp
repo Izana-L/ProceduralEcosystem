@@ -1,3 +1,16 @@
+/**
+ * @file TreeInstanceHost.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del actor contenedor y de la fábrica de componentes de instancing.
+ *
+ * Contiene el constructor, que deja el actor sin tick, sin colisión y con una raíz movible; el
+ * spawn en la identidad con su etiqueta de editor; y la creación del componente instanciado
+ * con la configuración común, fijando los canales de datos por instancia antes de registrarlo
+ * y colgándolo de la raíz.
+ *
+ * @ingroup eco_render
+ */
+
 #include "Render/TreeInstanceHost.h"
 
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
@@ -11,7 +24,7 @@ ATreeInstanceHost::ATreeInstanceHost()
     PrimaryActorTick.bCanEverTick = false;
 
     USceneComponent* Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
-    Root->SetMobility(EComponentMobility::Movable); // los HISM hijos se modifican en runtime
+    Root->SetMobility(EComponentMobility::Movable); // los componentes hijos cambian en runtime
     SetRootComponent(Root);
 
     SetActorEnableCollision(false);
@@ -41,9 +54,8 @@ ATreeInstanceHost* ATreeInstanceHost::SpawnHost(UWorld* World, const TCHAR* Edit
     (void)EditorLabel;
 #endif
 
-    // Red de seguridad: los ISM se cuelgan del root, y sin el no se registran.
-    // El constructor ya lo crea, pero un host que llegue de otra ruta (o de una
-    // subclase futura) no tiene por que traerlo.
+    // Los componentes de instancing se cuelgan de la raíz, y sin ella no se registran. El
+    // constructor la crea, pero una subclase no tiene por qué traerla.
     if (!Host->GetRootComponent())
     {
         USceneComponent* Root = NewObject<USceneComponent>(Host, TEXT("InstanceHostRoot"));
@@ -70,8 +82,8 @@ UHierarchicalInstancedStaticMeshComponent* ATreeInstanceHost::CreateInstancedCom
         return nullptr;
     }
 
-    // Movable: se anaden y quitan instancias en runtime. Con Static, UE asume
-    // que el buffer de instancias no cambia tras registrar el componente.
+    // Movable porque se añaden y quitan instancias en runtime: con Static, el motor asume que
+    // el buffer de instancias no cambia una vez registrado el componente.
     Comp->SetMobility(EComponentMobility::Movable);
     Comp->SetStaticMesh(Mesh);
     if (OverrideMaterial)
@@ -80,7 +92,7 @@ UHierarchicalInstancedStaticMeshComponent* ATreeInstanceHost::CreateInstancedCom
     }
     Comp->NumCustomDataFloats = FMath::Max(0, NumCustomDataFloats);
     Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    Comp->SetCanEverAffectNavigation(false); // si no, cada alta/baja pide rebuild de navmesh
+    Comp->SetCanEverAffectNavigation(false); // si no, cada alta o baja pide rebuild del navmesh
     Comp->SetCastShadow(bCastShadow);
 
     Comp->SetupAttachment(Host->GetRootComponent());

@@ -1,3 +1,32 @@
+/**
+ * @file EcoStats.h
+ * @author Juan Luque Roldán
+ * @brief Declaración de toda la instrumentación del simulador: grupos de stats,
+ *        ámbitos de Unreal Insights y categoría del CSV profiler.
+ *
+ * Conecta el proyecto con las tres vías oficiales de medición del motor y las mapea
+ * una a una sobre las etapas del bucle de tick y del gestor de niveles de representación,
+ * de modo que leer `stat EcoSim` equivale a leer el diagrama de flujo del simulador. Los
+ * contadores se declaran aquí con PROCEDURALECOSYSTEM_API y se definen en EcoStats.cpp;
+ * los ámbitos de traza se abren en los puntos de uso.
+ *
+ * @par Las tres vías y cómo se leen
+ * @li Grupos de stats: contadores por frame en pantalla con `stat EcoSim` y
+ *     `stat EcoRender`, junto a `stat Unit`, `stat GPU` y `stat RHI`. Primer vistazo
+ *     para situar el cuello en el game thread o en el render thread.
+ * @li Unreal Insights: los mismos ámbitos, abiertos con TRACE_CPUPROFILER_EVENT_SCOPE,
+ *     salen anidados en la timeline y dan el reparto real dentro de un tick. Se captura
+ *     lanzando el editor con `-trace=cpu,frame,bookmark,counters`.
+ * @li CSV profiler: la categoría Eco escribe una fila por frame a un .csv
+ *     (`CsvCategory Eco 1`, `Csv.Start` / `Csv.Stop`, o `Eco.Frame.Capture N`).
+ *
+ * @note Las tres se compilan a nada en Shipping o con las stats desactivadas, y no
+ *       consumen RNG ni tocan estado: activarlas no altera el bosque resultante.
+ *
+ * @ingroup eco_core
+ * @see @ref bib_epicueperfilado
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -5,47 +34,13 @@
 #include "ProfilingDebugging/CsvProfiler.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 
-/**
- * =============================================================================
- *  INSTRUMENTACION DEL PROYECTO (Fase 6, doc. 6.4: "medir primero, optimizar
- *  despues").
- * =============================================================================
- *
- * Hasta la Fase 5 la unica medida era Eco.Profile: una media exponencial hecha
- * a mano con FPlatformTime::Seconds(). Sirve para saber si un tick cuesta 2 o 20
- * ms, pero NO se ve en las herramientas del motor, que es donde de verdad se
- * decide si el cuello es CPU o GPU. Este fichero conecta el proyecto con las
- * tres vias oficiales:
- *
- *   1. STAT GROUPS  -> consola: `stat EcoSim`, `stat EcoRender`.
- *      Contadores por frame superpuestos en pantalla, junto a `stat Unit`,
- *      `stat GPU` y `stat RHI`. Es el primer vistazo del "orden de ataque" del
- *      doc. 6.4 (¿game thread o render thread?).
- *
- *   2. UNREAL INSIGHTS -> TRACE_CPUPROFILER_EVENT_SCOPE.
- *      Los mismos ambitos aparecen como bloques nombrados en la timeline de
- *      Insights, anidados: se ve el reparto REAL dentro de un tick y cuanto
- *      ocupa el tick dentro del frame. Se captura con:
- *         UnrealEditor.exe <Proyecto> -trace=cpu,frame,bookmark,counters
- *
- *   3. CSV PROFILER -> categoria "Eco".
- *      Escribe una fila por frame a un .csv (consola: `CsvCategory Eco 1` y
- *      `Csv.Start` / `Csv.Stop`, o Eco.Frame.Capture N). Es EXACTAMENTE el
- *      material del capitulo de resultados de la Fase 7: curvas de framerate
- *      frente al numero de arboles, sin post-procesar logs a mano.
- *
- * COSTE: los tres se compilan a nada en Shipping (o con stats desactivadas), y
- * en Development son unos pocos nanosegundos por ambito. No cambia el resultado
- * de la simulacion: la instrumentacion NO consume RNG ni toca estado.
- */
-
 // -----------------------------------------------------------------------------
 //  Grupos de stats (consola: `stat EcoSim`, `stat EcoRender`)
 // -----------------------------------------------------------------------------
 DECLARE_STATS_GROUP(TEXT("EcoSim"), STATGROUP_EcoSim, STATCAT_Advanced);
 DECLARE_STATS_GROUP(TEXT("EcoRender"), STATGROUP_EcoRender, STATCAT_Advanced);
 
-// --- Simulacion: las cinco etapas del bucle de tick (doc. 2.5) ---
+// --- Simulacion: una entrada por etapa del bucle de tick ---
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Tick (total)"), STAT_EcoTickTotal, STATGROUP_EcoSim, PROCEDURALECOSYSTEM_API);
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Spatial hash"), STAT_EcoHash, STATGROUP_EcoSim, PROCEDURALECOSYSTEM_API);
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Grid de luz grueso"), STAT_EcoLight, STATGROUP_EcoSim, PROCEDURALECOSYSTEM_API);
@@ -56,7 +51,7 @@ DECLARE_CYCLE_STAT_EXTERN(TEXT("Muertes + germinacion"), STAT_EcoGermination, ST
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Arboles vivos"), STAT_EcoPopulation, STATGROUP_EcoSim, PROCEDURALECOSYSTEM_API);
 DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Ticks por frame"), STAT_EcoTicksThisFrame, STATGROUP_EcoSim, PROCEDURALECOSYSTEM_API);
 
-// --- Render: el gestor de LOD (doc. 4.3/4.4) ---
+// --- Render: etapas y poblaciones del gestor de niveles de representación ---
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Re-nivelado de LOD"), STAT_EcoRelevel, STATGROUP_EcoRender, PROCEDURALECOSYSTEM_API);
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Flush de instancias"), STAT_EcoFlushInstances, STATGROUP_EcoRender, PROCEDURALECOSYSTEM_API);
 DECLARE_CYCLE_STAT_EXTERN(TEXT("Generacion de hero trees"), STAT_EcoHeroGen, STATGROUP_EcoRender, PROCEDURALECOSYSTEM_API);

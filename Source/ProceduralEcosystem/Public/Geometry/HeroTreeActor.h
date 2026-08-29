@@ -1,3 +1,20 @@
+/**
+ * @file HeroTreeActor.h
+ * @author Juan Luque Roldán
+ * @brief Actor de un hero tree: árbol de geometría única generado en vivo sobre malla procedural.
+ *
+ * Declara AHeroTreeActor, la puerta de entrada del módulo de geometría al mundo del juego.
+ * Encadena la colonización del espacio y el mallado para un árbol concreto y sube el
+ * resultado a un UProceduralMeshComponent con dos secciones, madera y follaje, cada una
+ * con su material. El árbol crece en coordenadas de mundo, que es lo que le permite leer
+ * la sombra de los vecinos en la rejilla de luz gruesa, y la malla se guarda relativa a la
+ * base del tronco. Es el extremo de detalle de la representación en dos escalas: unos
+ * pocos árboles cercanos con malla propia frente a la masa del bosque, que son instancias
+ * de la librería de arquetipos.
+ *
+ * @ingroup eco_geometry
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -14,21 +31,21 @@ class USpeciesData;
 struct FLightFieldCoarse;
 
 /**
- * Hero tree: un arbol con geometria UNICA generada en vivo por el SCA (doc.
- * Fase 3). Es el hito visible de la fase y la punta del iceberg de la
- * arquitectura en dos escalas: pocos arboles cercanos con malla propia; la
- * masa (Fase 4) sera instancias de una libreria.
+ * Hero tree: un árbol con geometría única, generada en vivo por la colonización del
+ * espacio en lugar de instanciada desde la librería de arquetipos.
  *
- * Flujo de Generate(): SCA en MUNDO (para leer la sombra de vecinos del grid
- * grueso)  mallado  los vertices se pasan a LOCAL (base del tronco = origen
- * del actor) y se suben a un UProceduralMeshComponent con dos secciones
- * (0 = madera, 1 = follaje), cada una con su material.
+ * Generate() encadena tres pasos: crecimiento en coordenadas de mundo, para poder leer la
+ * sombra de los vecinos en la rejilla gruesa; mallado; y subida de los vértices, pasados a
+ * local respecto a la base del tronco, a las dos secciones del componente procedural
+ * (0 = madera, 1 = follaje).
  *
- * Dos formas de uso:
- *    Runtime, desde el ecosistema: UEcosystemSubsystem::SpawnHeroTree llama a
- *    Generate() con la especie, la semilla del arbol y la luz gruesa actual.
- *    Suelto en editor: coloca el actor, asigna DebugSpecies y pulsa
- *     "Regenerate" (crece sin contexto de vecinos, CoarseLight = nullptr).
+ * @li Uso en runtime: @ref UEcosystemSubsystem::SpawnHeroTree y el gestor de niveles de
+ *     representación llaman a Generate() con la especie, la semilla del árbol y la luz
+ *     gruesa del momento.
+ * @li Uso suelto en el editor: se coloca el actor, se le asigna DebugSpecies y se pulsa
+ *     Regenerate; el árbol crece sin contexto de vecinos.
+ *
+ * @note El Tick solo existe para el dibujo de depuración y arranca desactivado.
  */
 UCLASS()
 class PROCEDURALECOSYSTEM_API AHeroTreeActor : public AActor
@@ -41,39 +58,44 @@ public:
     virtual void Tick(float DeltaTime) override;
 
     /**
-     * Genera el arbol y sube la malla. WorldTrunkBase es la base del tronco en
-     * mundo; el actor se coloca ahi y la malla queda relativa a el. CoarseLight
-     * puede ser nullptr (demo sin ecosistema  sin sombra de vecinos).
+     * Genera el árbol y sube la malla.
+     *
+     * @param Seed            Semilla del árbol: la misma semilla da exactamente la misma
+     *                        geometría.
+     * @param CoarseLight     Rejilla de luz gruesa de la que sale la sombra de los
+     *                        vecinos; nullptr para crecer sin ese contexto.
+     * @param WorldTrunkBase  Base del tronco en mundo. El actor se coloca ahí y la malla
+     *                        queda relativa a ese punto.
      */
     void Generate(const USpeciesData* InSpecies, uint32 Seed,
         const FLightFieldCoarse* CoarseLight, const FVector& WorldTrunkBase);
 
-   
+    /** Nodos del esqueleto generado. */
     int32 GetNodeCount() const { return Skeleton.Num(); }
 
     /**
-     * Regenera con los parametros actuales. Si nunca se llamo a Generate
-     * (arbol suelto en editor), usa DebugSpecies/DebugSeed y la posicion del
-     * actor, sin sombra de vecinos.
+     * Regenera el árbol con los parámetros actuales. Si nunca se llamó a Generate —el
+     * caso del árbol suelto en el editor— toma especie, semilla y posición de
+     * DebugSpecies, DebugSeed y la ubicación del actor, sin sombra de vecinos.
      */
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "Hero Tree")
     void Regenerate();
 
-    // --- Uso suelto en editor (sin ecosistema) ---
+    // ==== USO SUELTO EN EL EDITOR, SIN ECOSISTEMA ====
     UPROPERTY(EditAnywhere, Category = "Hero Tree")
     TObjectPtr<USpeciesData> DebugSpecies;
 
     UPROPERTY(EditAnywhere, Category = "Hero Tree")
     int32 DebugSeed = 12345;
 
-    // --- Materiales (si null, el PMC usa el material por defecto) ---
+    // ==== MATERIALES: si son nulos, el componente usa el material por defecto ====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree")
     TObjectPtr<UMaterialInterface> BarkMaterial;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree")
     TObjectPtr<UMaterialInterface> LeafMaterial;
 
-    // --- Toggles del SCA (el resto de la config va por defecto) ---
+    // ==== INTERRUPTORES DE LA GENERACIÓN: el resto de los ajustes van por defecto ====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree")
     bool bEnableSelfPruning = true;
 
@@ -81,61 +103,69 @@ public:
     bool bEnablePhototropism = true;
 
     /**
-     * Identidad de la deformacion de tronco (ver
-     * FSpaceColonizationConfig::DeformSeedOverride). -1 = derivarla de la semilla
-     * del arbol, que es lo correcto para un hero suelto en editor o generado a
-     * mano con Eco.GrowHeroTree.
+     * Identidad de la deformación de tronco, con -1 como centinela de «derivarla de la
+     * semilla del árbol», que es lo correcto para un hero suelto en el editor.
      *
-     * El gestor de LOD SI lo rellena al promocionar un arbol del bosque, con la
-     * semilla de la variante de su instancia: sin eso, una instancia arqueada se
-     * enderezaria al convertirse en hero delante del jugador, que es el pop mas
-     * visible que puede producir este sistema.
+     * El gestor de niveles de representación sí lo rellena al promocionar un árbol del
+     * bosque, con la semilla de la variante de su instancia: sin eso, una instancia
+     * arqueada se enderezaría al convertirse en hero delante del jugador, que es el salto
+     * más visible que puede producir este sistema.
      *
-     * int64 (y no uint32) para que el centinela -1 no colisione con una semilla
-     * valida; no es UPROPERTY editable porque no es un parametro de diseño sino
-     * plumbing entre capas.
+     * @note Es int64 y no uint32 para que el centinela -1 no colisione con una semilla
+     *       válida, y no es UPROPERTY editable porque no es un parámetro de diseño sino
+     *       una conexión entre capas.
+     * @see FSpaceColonizationConfig::DeformSeedOverride
      */
     int64 DeformSeedOverride = -1;
 
-    // --- Debug draw (esqueleto + atractores) ---
-    /** Usa SetDrawDebug() en codigo: ademas de este flag, enciende/apaga el Tick
-        del actor (que solo existe para este dibujo, ver C7 en el constructor). */
+    // ==== DIBUJO DE DEPURACIÓN: ESQUELETO Y ATRACTORES ====
+    /** Marcarlo desde código con SetDrawDebug(), que enciende también el Tick del actor. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hero Tree|Debug")
     bool bDrawDebug = false;
 
-    /** Enciende/apaga el debug draw Y el Tick del actor a la vez. */
+    /** Enciende o apaga a la vez el dibujo de depuración y el Tick que lo alimenta. */
     UFUNCTION(BlueprintCallable, Category = "Hero Tree|Debug")
     void SetDrawDebug(bool bInDrawDebug);
 
 protected:
     virtual void BeginPlay() override;
 
-    /** Hace que el actor tambien tickee en el viewport del editor (sin darle a
-        Play), para que el debug draw del esqueleto/atractores se vea al pulsar
-        Regenerate. Sin esto, los AActor solo tickean en PIE. */
+    /** Hace que el actor tickee también en el viewport del editor, sin darle a Play, para
+        que el dibujo de depuración se vea al pulsar Regenerate. Sin esto un AActor solo
+        tickea con el juego en marcha. */
     virtual bool ShouldTickIfViewportsOnly() const override { return true; }
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
 
 private:
+    /** Genera el esqueleto y la malla con el estado actual y sube las dos secciones. */
     void BuildNow();
+
+    /** Vuelca una sección de la malla en el componente procedural: pasa los vértices a
+        local, convierte las tangentes al tipo de la API y le asigna el material. */
     void UploadSection(int32 SectionIndex, const FTreeMeshBuffers& Buffers, UMaterialInterface* Material);
 
     UPROPERTY(VisibleAnywhere, Category = "Hero Tree")
     TObjectPtr<UProceduralMeshComponent> Mesh;
 
-    // Estado para Regenerate.
+    // ==== ESTADO DE LA ÚLTIMA GENERACIÓN, PARA PODER REGENERAR ====
     TWeakObjectPtr<const USpeciesData> SpeciesPtr;
-    /** true = el arbol se genero con contexto de luz gruesa del ecosistema.
-        NO se cachea el puntero al grid (struct propiedad del subsistema, no
-        reflejada): un actor cacheado que sobreviviera al subsistema lo
-        deferenciaria colgante. BuildNow() lo pide FRESCO al subsistema vivo. */
+
+    /** true si el árbol se generó con el contexto de luz gruesa del ecosistema.
+        Se guarda el hecho y no el puntero a la rejilla: es una struct propiedad del
+        subsistema, sin reflexión, y este actor puede sobrevivirle en la caché del gestor
+        de niveles de representación, con lo que un puntero cacheado quedaría colgante.
+        BuildNow() se lo pide fresco al subsistema vivo. */
     bool bUseCoarseLight = false;
+
+    /** Semilla con la que se generó el árbol. */
     uint32 GenSeed = 0;
+
+    /** Base del tronco y origen local de la malla. */
     FVector TrunkBaseWorld = FVector::ZeroVector;
 
-    // Buffers de trabajo (tambien alimentan el debug draw).
+    // ==== BUFFERS DE TRABAJO: SALIDA DE LA GENERACIÓN Y FUENTE DEL DIBUJO DE DEPURACIÓN ====
     FTreeSkeleton Skeleton;
     FTreeLightGridFine FineLight;
     FAttractorCloud Attractors;

@@ -1,3 +1,17 @@
+/**
+ * @file Field2D.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de FField2D: inicialización, muestreo bilineal y normalización.
+ *
+ * Contiene las operaciones de la rejilla que no son ni triviales ni plantilla:
+ * la reserva del almacenamiento con las guardas de geometría, el muestreo
+ * bilineal con extensión de bordes, el barrido min-max y la escritura
+ * normalizada en paralelo por filas. Los accesos inline y el bake genérico
+ * GenerateNormalized viven en la cabecera.
+ *
+ * @ingroup eco_terrain
+ */
+
 #include "Terrain/Field2D.h"
 #include "Async/ParallelFor.h"
 
@@ -6,15 +20,14 @@ void FField2D::Init(int32 InWidth, int32 InHeight, double InCellSize,
 {
     Width = FMath::Max(2, InWidth);
     Height = FMath::Max(2, InHeight);
-    // CellSize es divisor en WorldToGrid (y por tanto en todos los Sample*): un
-    // 0 llegado de config (el ClampMin del UPROPERTY es solo restriccion de UI)
-    // produciria NaN en todas las posiciones. Misma guarda que FSpatialHash,
-    // FAttractorCloud y FTreeLightGridFine.
+    // CellSize es el divisor de WorldToGrid y por tanto de todo el muestreo: un
+    // cero llegado de configuración daría NaN en cualquier posición. El ClampMin
+    // del UPROPERTY solo restringe la UI, no la asignación desde código.
     CellSize = FMath::Max(InCellSize, static_cast<double>(KINDA_SMALL_NUMBER));
     Origin = InOrigin;
 
-    // Fast path: si el valor inicial es 0, SetNumZeroed hace un memset en
-    // lugar de reservar sin inicializar y luego recorrer celda a celda.
+    // Con valor inicial 0 basta un memset; en otro caso hay que reservar sin
+    // inicializar y recorrer las celdas.
     if (InitialValue == 0.f)
     {
         Data.SetNumZeroed(Width * Height);

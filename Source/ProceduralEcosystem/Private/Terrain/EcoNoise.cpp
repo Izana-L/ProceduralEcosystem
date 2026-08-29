@@ -1,9 +1,26 @@
+/**
+ * @file EcoNoise.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de la síntesis fractal de relieve del namespace EcoNoise.
+ *
+ * Define el envoltorio del ruido de gradiente de Unreal, la derivación de
+ * offsets por semilla y sal, el recorte de octavas al límite de Nyquist y los
+ * tres fractales que dan forma al terreno: fBm, hybrid multifractal y ridged
+ * multifractal, más su composición con domain warp en TerrainSample. Las
+ * constantes internas de los multifractales (offset y ganancia) viven aquí y no
+ * se exponen: fijan el carácter del relieve y no son parámetros de usuario.
+ *
+ * @ingroup eco_terrain
+ * @see @ref bib_musgrave1989
+ * @see @ref bib_quilezdomainwarp
+ */
+
 #include "Terrain/EcoNoise.h"
 #include "Core/EcoCore.h"
 
 namespace
 {
-    /** PerlinNoise2D de UE reescalado a [-1, 1] (su rango real es ~+-0.707). */
+    /** PerlinNoise2D de UE llevado al rango [-1, 1] nominal; ver EcoNoise::PerlinAmplitude2D. */
     FORCEINLINE float Noise11(const FVector2D& PosCm, const FVector2D& Offset, double Freq)
     {
         const FVector2D P(PosCm.X * Freq + Offset.X, PosCm.Y * Freq + Offset.Y);
@@ -13,8 +30,8 @@ namespace
 
 FVector2D EcoNoise::SeedOffset(uint32 Seed, uint32 Salt)
 {
-    // La conversion hash -> offset esta en OffsetFromHash (copia unica: la
-    // comparte el campo de nutrientes, que deriva sus dos sales por su cuenta).
+    // La segunda coordenada mezcla una sal secundaria fija para que X e Y no
+    // queden correlacionadas al derivarse del mismo par (Seed, Salt).
     return FVector2D(
         OffsetFromHash(EcoRand::Hash32(Seed ^ Salt)),
         OffsetFromHash(EcoRand::Hash32(Seed ^ Salt ^ 0x9E3779B9u)));
@@ -57,8 +74,8 @@ float EcoNoise::Fbm(const FVector2D& PosCm, const FVector2D& Offset,
 float EcoNoise::HybridMultifractal(const FVector2D& PosCm, const FVector2D& Offset,
     double BaseWavelengthCm, double Persistence, double Lacunarity, int32 Octaves)
 {
-    // "Offset" de Musgrave: desplaza el ruido a mayormente-positivo para que
-    // la realimentacion (weight *= signal) tenga sentido como "altitud".
+    // Desplaza el ruido a mayormente positivo para que la señal acumulada, que
+    // es la que realimenta el peso, funcione como un proxy de altitud.
     constexpr double kOffset = 0.7;
 
     double Freq = 1.0 / FMath::Max(BaseWavelengthCm, 1.0);
@@ -75,11 +92,11 @@ float EcoNoise::HybridMultifractal(const FVector2D& PosCm, const FVector2D& Offs
         Amp *= Persistence;
         Freq *= Lacunarity;
 
-        // El peso es la senal acumulada saturada a 1: en zonas bajas tiende a 0
-        // y apaga el detalle fino (valles lisos). A diferencia del Musgrave
-        // literal, el peso se realimenta con el ruido SIN el factor de
-        // amplitud: con persistencias bajas (0.5) el original atenua doble
-        // (amplitud y peso) y mata todo el detalle medio.
+        // El peso es la señal acumulada saturada a 1: en las zonas bajas tiende a
+        // 0 y apaga el detalle fino (valles lisos). Se realimenta con el ruido
+        // desplazado SIN el factor de amplitud, a diferencia de la formulación
+        // canónica: con persistencias bajas (0.5) atenuar a la vez por amplitud y
+        // por peso suprime el detalle de las octavas intermedias.
         Weight = FMath::Clamp(Weight, 0.0, 1.0);
         const double N = Noise11(PosCm, Offset, Freq) + kOffset;
         Signal = N * Amp;
@@ -89,16 +106,17 @@ float EcoNoise::HybridMultifractal(const FVector2D& PosCm, const FVector2D& Offs
         Norm += (1.0 + kOffset) * Amp;
     }
 
-    // Normaliza por el maximo teorico: el resultado queda aprox en [0, 1]
-    // (puede asomar un poco fuera; FillNormalizedFrom lo reajusta despues).
+    // Normaliza por el máximo teórico de la suma, de modo que el resultado queda
+    // aproximadamente en [0, 1]; puede asomar algo fuera y la normalización del
+    // campo lo reajusta después.
     return static_cast<float>(Result / FMath::Max(Norm, (double)KINDA_SMALL_NUMBER));
 }
 
 float EcoNoise::RidgedMultifractal(const FVector2D& PosCm, const FVector2D& Offset,
     double BaseWavelengthCm, double Persistence, double Lacunarity, int32 Octaves)
 {
-    constexpr double kOffset = 1.0; // (1 - |n|)^2: crestas donde el ruido cruza 0
-    constexpr double kGain = 2.0;   // realimentacion: crestas nitidas, bajos lisos
+    constexpr double kOffset = 1.0; // (1 - |n|)^2: cresta donde el ruido cruza cero
+    constexpr double kGain = 2.0;   // realimentación: crestas nítidas, bajos lisos
 
     double Freq = 1.0 / FMath::Max(BaseWavelengthCm, 1.0);
     double Amp = 1.0;
@@ -124,9 +142,10 @@ float EcoNoise::TerrainSample(double Xcm, double Ycm, const FTerrainNoiseParams&
 {
     FVector2D Pos(Xcm, Ycm);
 
-    // 1) Domain warp (Quilez): evalua el fractal en coordenadas distorsionadas
-    //    por OTRO fBm. Rompe la uniformidad "de manchas" del Perlin puro y
-    //    curva valles y laderas de forma organica.
+    // 1) Domain warp: el fractal se evalúa en coordenadas desplazadas por OTRO
+    //    fBm, con offsets propios y persistencia y lacunaridad fijas. Rompe la
+    //    uniformidad de manchas del ruido puro y curva valles y laderas. La
+    //    amplitud va en cm de mundo para que sea ajustable en unidades físicas.
     if (P.WarpStrengthCm > 0.0)
     {
         const float Wx = Fbm(Pos, P.WarpOffsetA, P.WarpWavelengthCm, 0.5, 2.0, P.WarpOctaves);
@@ -135,7 +154,7 @@ float EcoNoise::TerrainSample(double Xcm, double Ycm, const FTerrainNoiseParams&
         Pos.Y += P.WarpStrengthCm * Wy;
     }
 
-    // 2) Base: hybrid multifractal (valles lisos, cumbres con detalle).
+    // 2) Base del relieve: hybrid multifractal (valles lisos, cumbres con detalle).
     const float Base = HybridMultifractal(Pos, P.BaseOffset,
         P.BaseWavelengthCm, P.Persistence, P.Lacunarity, P.Octaves);
 
@@ -144,12 +163,12 @@ float EcoNoise::TerrainSample(double Xcm, double Ycm, const FTerrainNoiseParams&
         return Base;
     }
 
-    // 3) Crestas: ridged multifractal mezclado SOLO en las zonas altas de la
-    //    base (mascara suave por altitud): los valles conservan la forma
-    //    suave y las cimas ganan aristas de cordillera.
-    // La banda de la mascara esta calibrada sobre la distribucion REAL del
-    // hybrid con los parametros por defecto (mediana ~0.27, p95 ~0.42): las
-    // crestas entran desde la mitad alta del relieve y dominan en las cimas.
+    // 3) Crestas: el ridged se mezcla solo en las zonas altas de la base, con una
+    //    máscara suave de altitud; los valles conservan la forma redondeada y las
+    //    cimas ganan aristas de cordillera. La banda [0.27, 0.42] corresponde a
+    //    la mediana y el percentil 95 de la distribución del hybrid con los
+    //    parámetros por defecto, de modo que las crestas entran en la mitad alta
+    //    del relieve y dominan en las cumbres.
     const float Ridge = RidgedMultifractal(Pos, P.RidgeOffset,
         P.BaseWavelengthCm, P.Persistence, P.Lacunarity, P.Octaves);
     const float Mask = FMath::SmoothStep(0.27f, 0.42f, Base);

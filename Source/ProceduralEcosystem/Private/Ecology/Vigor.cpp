@@ -1,3 +1,22 @@
+/**
+ * @file Vigor.cpp
+ * @author Juan Luque Roldán
+ * @brief Construcción de las curvas de respuesta por especie y bake del campo de idoneidad.
+ *
+ * Contiene lo único de EcoVigor que no es inline. Los Make*Response traducen el asset
+ * de especie a curvas evaluables: resuelven las fracciones de [0,1] que guarda el
+ * USpeciesData contra los máximos de salida de los campos y aplican el coste de la
+ * tolerancia a la sombra al techo de asimilación. BakeSuitabilityField recorre en
+ * paralelo la rejilla del relieve —una fila por tarea, celdas de salida disjuntas, sin
+ * locks y determinista— evaluando el vigor a ras de suelo. Aloja también
+ * ResolveExcessWidth, copia única de la decisión sobre la rama de exceso de la campana
+ * de nicho, que agua y nutrientes tienen que tomar igual.
+ *
+ * @ingroup eco_ecology
+ * @see @ref bib_nichounimodal
+ * @see @ref bib_toleranciasombra
+ */
+
 #include "Ecology/Vigor.h"
 
 #include "Terrain/Field2D.h"
@@ -15,14 +34,12 @@ namespace EcoVigor
     namespace
     {
         /**
-         * Anchura de la rama de EXCESO a partir de la de deficit y del flag de la
-         * especie. Copia unica: agua y nutrientes tienen que decidirlo igual, y
-         * hasta ahora cada Make*Response se limitaba a copiar su booleano.
+         * Anchura de la rama de exceso a partir de la de déficit y del flag de la
+         * especie. Copia única: agua y nutrientes tienen que decidirlo igual.
          *
-         * Con penalizacion: campana simetrica. Sin ella: rama derecha ANCHA en vez
-         * de recortada, para que la respuesta siga siendo unimodal (ver
-         * UEcosystemSettings::NicheExcessWidthScale). Escala 0 = saturar en 1, el
-         * comportamiento anterior.
+         * Con penalización del exceso, campana simétrica. Sin ella, rama derecha ancha
+         * (UEcosystemSettings::NicheExcessWidthScale) para que la respuesta siga siendo
+         * unimodal; con escala 0 la rama satura en 1 y la curva se vuelve monótona.
          */
         float ResolveExcessWidth(float DeficitWidthAbs, bool bPenalizeExcess, float ExcessScale)
         {
@@ -91,8 +108,8 @@ namespace EcoVigor
             return;
         }
 
-        // Misma geometria que el relieve: el TArray resultante encaja tal cual en
-        // el UFieldVisualizer y en el resto de campos.
+        // Misma geometría que el relieve: el TArray resultante encaja tal cual en el
+        // UFieldVisualizer y junto al resto de campos.
         OutSuitability.Init(Ref.Width, Ref.Height, Ref.CellSize, Ref.Origin, 0.f);
         if (OutLimiter)
         {
@@ -102,26 +119,25 @@ namespace EcoVigor
         const int32 W = Ref.Width;
         const int32 H = Ref.Height;
 
-        // Las respuestas llegan ya construidas (POD por valor): ni una lectura del
-        // UObject dentro del ParallelFor, y ademas garantiza que el heatmap evalua
-        // literalmente la misma curva que el tick.
+        // Las respuestas llegan ya construidas (POD por valor): ni una lectura de UObject
+        // dentro del ParallelFor, y el heatmap evalúa la misma curva que el tick.
         const FSpeciesResponses Resp = Responses;
 
-        // Fase 6: copia local de los parametros de CO2 (o desactivado). Se saca
-        // del puntero fuera del ParallelFor por el mismo motivo.
+        // Copia local de los parámetros de CO2, o desactivado si no se pasan: el puntero
+        // se resuelve fuera del ParallelFor por el mismo motivo.
         EcoCarbon::FCO2Params CO2Local;
         CO2Local.bEnabled = false;
         if (CO2) { CO2Local = *CO2; }
 
-        // Una fila por tarea: cada fila escribe celdas disjuntas -> determinista y
-        // seguro sin locks (mismo patron que FNutrientField / FWaterField).
+        // Una fila por tarea: cada fila escribe celdas disjuntas, así que es seguro sin
+        // locks y determinista (mismo patrón que FNutrientField y FWaterField).
         ParallelFor(H, [&](int32 y)
             {
                 for (int32 x = 0; x < W; ++x)
                 {
                     const int32 i = y * W + x;
 
-                    // Nodo -> mundo (convencion de FField2D: el valor vive en el nodo).
+                    // Nodo a mundo (convención de FField2D: el valor vive en el nodo).
                     const double Xcm = Ref.NodeWorldX(x);
                     const double Ycm = Ref.NodeWorldY(y);
                     const double Zcm = Height.SampleHeight(Xcm, Ycm); // luz a ras de suelo
@@ -135,9 +151,8 @@ namespace EcoVigor
                     EEcoLimiter Lim;
                     float V = EvaluateVigor(Q, Wv, Nv, Resp, CombineMode, Lim);
 
-                    // Fase 6: el heatmap tiene que representar EL MISMO numero que
-                    // consume el tick, o dejaria de servir para explicar por que el
-                    // bosque crece donde crece.
+                    // El heatmap tiene que representar el mismo número que consume el
+                    // tick, o deja de explicar por qué el bosque crece donde crece.
                     V *= EcoCarbon::CO2Factor(Q, /*CanopyHeightCm*/ 0.f, CO2Local);
 
                     OutSuitability.Data[i] = V;

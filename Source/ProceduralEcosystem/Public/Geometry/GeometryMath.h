@@ -1,20 +1,39 @@
+/**
+ * @file GeometryMath.h
+ * @author Juan Luque Roldán
+ * @brief Perpendicular estable a una dirección, en el namespace EcoGeom.
+ *
+ * Declara EcoGeom::AnyPerpendicular, la primitiva con la que se siembra un marco de
+ * sección alrededor de un eje: dada una tangente, devuelve siempre la misma
+ * perpendicular unitaria. Vive en cabecera, y no en el namespace anónimo de un `.cpp`,
+ * porque UnrealBuildTool compila el módulo en unity build: al concatenarse varias
+ * unidades de traducción en una sola, dos namespaces anónimos con una función homónima
+ * dejan de ser independientes y el compilador la ve redefinida.
+ *
+ * @note Ninguna unidad de traducción incluye esta cabecera. La perpendicular que
+ *       consumen el crecimiento de ramas, el mallador y el follaje es la de
+ *       `Core/EcoGeometry.h`, que parametriza además las direcciones de referencia.
+ *
+ * @ingroup eco_geometry
+ * @see EcoGeometry::AnyPerpendicular
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 
-/**
- * Helpers geometricos compartidos por los generadores de esqueleto y de malla.
- *
- * Viven aqui, y no en el namespace anonimo de cada .cpp, por una razon muy
- * concreta: UBT compila el modulo en UNITY BUILD, o sea, concatena varios .cpp
- * en UNA sola unidad de traduccion. Al fusionarse, dos namespaces anonimos con
- * una funcion del mismo nombre dejan de ser independientes y el compilador la
- * ve REDEFINIDA. Una unica copia en cabecera evita la colision y, de paso, la
- * duplicacion: el criterio de EcoGrid/EcoRand aplicado a la geometria.
- */
+/** @brief Geometría vectorial auxiliar del generador de árboles. */
 namespace EcoGeom
 {
-    /** Una perpendicular cualquiera y estable a T (T debe venir normalizado). */
+    /**
+     * Perpendicular unitaria a T, estable: función pura de T, sin estado ni azar.
+     *
+     * Cruza T con el eje Y de mundo y recurre al eje X cuando ambos son paralelos, de
+     * modo que nunca devuelve el vector nulo.
+     *
+     * @param T Dirección de referencia; debe venir normalizada.
+     * @return Vector unitario ortogonal a T.
+     */
     FORCEINLINE FVector AnyPerpendicular(const FVector& T)
     {
         FVector P = FVector::CrossProduct(T, FVector::RightVector);

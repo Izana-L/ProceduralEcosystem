@@ -1,3 +1,20 @@
+/**
+ * @file Field2D.h
+ * @author Juan Luque Roldán
+ * @brief Rejilla escalar 2D con geometría de mundo, base común de todos los campos.
+ *
+ * Declara FField2D, la estructura sobre la que se construyen el agua, los
+ * nutrientes, la descomposición, la idoneidad y los pools de recursos: Width x
+ * Height nodos separados CellSize centímetros a partir de Origin, más un
+ * TArray<float> plano en orden fila-mayor. Aporta el muestreo bilineal, la
+ * normalización lineal min-max y el patrón de bake «buffer crudo -> ParallelFor
+ * por filas -> normalización», que fija el contrato de determinismo del módulo:
+ * partición siempre por filas y función generadora pura, de modo que el
+ * resultado es idéntico sea cual sea el número de hilos.
+ *
+ * @ingroup eco_terrain
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -6,44 +23,58 @@
 #include "Core/GridMath.h"
 
 /**
- * Rejilla escalar 2D generica: "un TArray<float> con forma de mundo".
+ * Rejilla escalar 2D genérica: «un TArray<float> con forma de mundo».
  *
- * No sabe que representa (agua, nutrientes, luz...); solo almacena y
- * muestrea. Cada campo concreto (FWaterField, FNutrientField, ...) se
- * construye ENCIMA de esta clase en vez de reimplementar la rejilla.
+ * No sabe qué magnitud representa (agua, nutrientes, luz...); solo almacena y
+ * muestrea. Cada campo concreto (FWaterField, FNutrientField, FResourcePool...)
+ * se compone de una de éstas en vez de reimplementar la rejilla.
  *
- * Convencion: el valor de una celda vive EN EL NODO Origin + (Ix,Iy)*CellSize
- * (no en el centro de celda). El muestreo bilineal interpola entre nodos.
- * El grid de luz 3D, en cambio, muestrea en centros de voxel: tenerlo en
- * cuenta al combinar ambos en la funcion de vigor (medio celda de desfase,
- * inocuo a estas resoluciones).
+ * Convención de muestreo: el valor vive EN EL NODO Origin + (Ix,Iy)*CellSize, no
+ * en el centro de celda, y SampleBilinear interpola entre nodos. La rejilla de luz
+ * gruesa, en cambio, muestrea en centros de vóxel: media celda de desfase,
+ * inocuo a estas resoluciones pero a tener en cuenta al combinar ambos en la
+ * función de vigor.
  *
- * Unidades: coordenadas de mundo en cm (unidades de Unreal).
+ * @note Coordenadas de mundo en cm (unidades de Unreal).
  */
 struct PROCEDURALECOSYSTEM_API FField2D
 {
-    int32     Width = 0;
-    int32     Height = 0;
-    double    CellSize = 100.0;
-    FVector2D Origin = FVector2D::ZeroVector;
-    TArray<float> Data;
+    int32     Width = 0;                       ///< Nodos en X.
+    int32     Height = 0;                      ///< Nodos en Y.
+    double    CellSize = 100.0;                ///< Separación entre nodos contiguos, en cm.
+    FVector2D Origin = FVector2D::ZeroVector;  ///< Posición de mundo (cm) del nodo (0,0).
+    TArray<float> Data;                        ///< Valores fila-mayor: índice Iy*Width + Ix.
 
+    /** Cierto si la geometría es utilizable (>= 2x2 nodos) y Data tiene el tamaño que le toca. */
     bool IsValid() const { return Width > 1 && Height > 1 && Data.Num() == Width * Height; }
 
-    /** Numero de celdas (= Width*Height cuando IsValid()). */
+    /** Número de celdas (= Width*Height cuando IsValid()). */
     FORCEINLINE int32 Num() const { return Data.Num(); }
 
-    /** Reserva memoria y fija la geometria de la rejilla. Rellena con InitialValue. */
+    /**
+     * Fija la geometría de la rejilla, reserva el almacenamiento y lo rellena
+     * con InitialValue.
+     *
+     * @note Width y Height se acotan a un mínimo de 2, y CellSize a un valor
+     *       estrictamente positivo: es el divisor de WorldToGrid y por tanto de
+     *       todo el muestreo.
+     */
     void Init(int32 InWidth, int32 InHeight, double InCellSize,
         const FVector2D& InOrigin, float InitialValue = 0.f);
 
-    /** Pone todas las celdas al mismo valor (no cambia geometria). */
+    /** Pone todas las celdas al mismo valor; no toca la geometría. */
     void Fill(float Value);
 
-    /** Valor en mundo (Xcm, Ycm) con interpolacion bilineal. */
+    /**
+     * Valor del campo en la posición de mundo (Xcm, Ycm), interpolado
+     * bilinealmente entre los cuatro nodos que la rodean.
+     *
+     * @return El valor interpolado, o 0 si el campo no es válido.
+     * @note Fuera de la rejilla el valor del borde se extiende (no se envuelve).
+     */
     float SampleBilinear(double Xcm, double Ycm) const;
 
-    /** Acceso directo por indice de rejilla, con clamp a los bordes. */
+    /** Valor del nodo (Ix, Iy); los índices fuera de rango se acotan al borde. */
     FORCEINLINE float GetAt(int32 Ix, int32 Iy) const
     {
         Ix = FMath::Clamp(Ix, 0, Width - 1);
@@ -51,13 +82,10 @@ struct PROCEDURALECOSYSTEM_API FField2D
         return Data[Iy * Width + Ix];
     }
 
-    /** Extension en mundo (cm) que cubre la rejilla. */
+    /** Extensión en mundo (cm) que cubre la rejilla, del nodo (0,0) al último. */
     FBox2D GetWorldBounds() const;
 
-    /** Coordenada de mundo (cm) del NODO (Ix, Iy). Es la convencion del campo
-        -el valor vive en el nodo, no en el centro de celda- y estaba reescrita a
-        mano en el bake de idoneidad, en el heatmap de luz y en la exportacion de
-        heightmap. */
+    /** Coordenada de mundo (cm) del NODO (Ix, Iy), la posición donde vive su valor. */
     FORCEINLINE double NodeWorldX(int32 Ix) const { return Origin.X + Ix * CellSize; }
     FORCEINLINE double NodeWorldY(int32 Iy) const { return Origin.Y + Iy * CellSize; }
 
@@ -68,32 +96,44 @@ struct PROCEDURALECOSYSTEM_API FField2D
         OutGy = EcoGrid::ToGridCoord(Ycm, Origin.Y, CellSize);
     }
 
-    /** Min y max de un buffer de valores (barrido serial O(N)). UNICA copia del
-        patron que antes reimplementaban los tres generadores de campo, el
-        visualizador y el log de rangos. Con Values vacio deja min > max. */
+    /**
+     * Mínimo y máximo de un buffer de valores, en un barrido serial O(N).
+     *
+     * Es la rutina de rango que comparten los generadores de campo, el
+     * visualizador de heatmaps y el volcado de heightmap.
+     *
+     * @warning Con Values vacío devuelve OutMin > OutMax; el llamante decide qué
+     *          hacer con ese caso.
+     */
     static void MinMax(const TArray<float>& Values, float& OutMin, float& OutMax);
 
     /**
-     * Escribe en Data la normalizacion lineal de Raw a [0, OutputMax]:
-     * t = (v - min) / (max - min), Data[i] = t * OutputMax. Paralelo por filas
-     * (cada fila escribe celdas disjuntas -> determinista). Raw debe tener el
-     * mismo numero de celdas que la rejilla.
+     * Escribe en Data la normalización lineal de Raw a [0, OutputMax]:
+     * @f$ t = (v - min)/(max - min) @f$ y @f$ Data[i] = t \cdot OutputMax @f$.
+     *
+     * @param Raw       Buffer crudo; debe tener tantas celdas como la rejilla o
+     *                  la llamada no hace nada.
+     * @param OutputMax Valor que toma la celda de valor máximo.
+     * @note Se escribe en ParallelFor por filas: cada fila toca celdas disjuntas,
+     *       así que el resultado no depende del número de hilos.
      */
     void FillNormalizedFrom(const TArray<float>& Raw, float OutputMax);
 
     /**
-     * Genera el campo entero desde una funcion de rejilla y lo normaliza a
-     * [0, OutputMax]: Gen(x, y) -> valor crudo.
+     * Genera el campo entero a partir de una función de rejilla y lo normaliza a
+     * [0, OutputMax].
      *
-     * Es el patron "buffer crudo -> ParallelFor por filas -> FillNormalizedFrom"
-     * que estaba copiado literalmente en FHeightField::Generate y en
-     * FNutrientField::GeneratePatchyBase (y que cualquier campo nuevo volveria a
-     * copiar). Aqui vive una sola vez, con la MISMA particion por filas: cada
-     * fila escribe celdas disjuntas y Gen debe ser pura, asi que el resultado no
-     * depende del numero de hilos -> determinista, como exige la Fase 0.
+     * Encadena el patrón de bake del módulo: buffer crudo evaluado en ParallelFor
+     * por filas y después FillNormalizedFrom. Cada fila escribe celdas disjuntas,
+     * de modo que el resultado es idéntico sea cual sea el número de hilos.
      *
-     * Es plantilla (no TFunctionRef) a proposito: Gen se inlinea dentro del
-     * bucle, que es lo que se quiere en un bake de cientos de miles de celdas.
+     * Es plantilla y no TFunctionRef para que Gen se inline dentro del bucle, que
+     * es lo que interesa en un bake de cientos de miles de celdas.
+     *
+     * @param Gen       Invocable Gen(int32 x, int32 y) -> float con el valor crudo
+     *                  del nodo. Debe ser PURA: de ello depende el determinismo.
+     * @param OutputMax Valor que toma el nodo de valor crudo máximo.
+     * @pre El campo tiene que estar inicializado (IsValid()); si no, no hace nada.
      */
     template <typename FGen>
     void GenerateNormalized(FGen&& Gen, float OutputMax)

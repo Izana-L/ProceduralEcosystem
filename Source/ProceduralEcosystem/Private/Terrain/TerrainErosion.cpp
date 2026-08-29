@@ -1,3 +1,23 @@
+/**
+ * @file TerrainErosion.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de las dos pasadas de erosión del relieve.
+ *
+ * Define TerrainErosion::ThermalErode, escrita como gather de dos pasadas sobre
+ * doble buffer para poder paralelizarla sin atómicas, y
+ * TerrainErosion::HydraulicErode, el modelo lagrangiano de gotas que simula sobre
+ * una copia normalizada del campo. Aloja también los dos auxiliares comunes: el
+ * recorrido de la vecindad de Moore que comparten las dos pasadas térmicas y el
+ * muestreo bilineal sobre un buffer suelto con el que avanza la gota. La ley de
+ * capacidad de transporte procede de Mei et al., con la caída en un paso de una
+ * celda como proxy barato de la pendiente.
+ *
+ * @ingroup eco_terrain
+ * @see @ref bib_olsen2004
+ * @see @ref bib_beyer2015
+ * @see @ref bib_mei2007
+ */
+
 #include "Terrain/TerrainErosion.h"
 #include "Terrain/Field2D.h"
 #include "Core/EcoCore.h"
@@ -7,19 +27,18 @@ namespace
 {
     /**
      * Recorre los 8 vecinos de Moore de (x, y) que caen dentro de la rejilla e
-     * invoca Fn(k, nx, ny) con k = indice del offset.
+     * invoca Fn(k, nx, ny), con k el índice del offset.
      *
-     * Las dos pasadas de ThermalErode -la que mide el exceso sobre el talud y la
-     * que recoge el reparto- llevaban el MISMO bucle con el mismo test de
-     * limites copiado. Y no es cosmetico: el reparto solo cuadra si emisor y
-     * receptor recorren los vecinos en el mismo orden y con las mismas
-     * distancias; tenerlo escrito una sola vez lo garantiza por construccion.
+     * Copia única del recorrido de vecindad de la erosión térmica: el reparto de
+     * material solo cuadra si emisor y receptor visitan los vecinos en el mismo
+     * orden y con las mismas distancias, y tenerlo escrito una sola vez lo
+     * garantiza por construcción.
      */
     template <typename FNeighborFn>
     FORCEINLINE void ForEachMooreNeighbor(int32 x, int32 y, int32 W, int32 H, FNeighborFn&& Fn)
     {
-        // Vecindad de Moore. Las distancias son simetricas (mismo |offset| visto
-        // desde ambos lados), asi que emisor y receptor calculan el MISMO exceso.
+        // Vecindad de Moore. Los offsets son simétricos (mismo |offset| visto
+        // desde ambos lados), así que emisor y receptor calculan el MISMO exceso.
         static constexpr int32 DX[8] = { 1, -1,  0,  0,  1,  1, -1, -1 };
         static constexpr int32 DY[8] = { 0,  0,  1, -1,  1, -1,  1, -1 };
 
@@ -35,8 +54,13 @@ namespace
         }
     }
 
-    /** Bilinear sobre un buffer suelto (la gota trabaja en coordenadas de
-        rejilla fraccionales; el llamador garantiza 0 <= x < W-1, idem y). */
+    /**
+     * Interpolación bilineal sobre un buffer suelto de alturas, en coordenadas de
+     * rejilla fraccionales (las que maneja la gota).
+     *
+     * @pre 0 <= X < W-1 y 0 <= Y < H-1: no comprueba límites, lo garantiza el
+     *      llamador antes de mover la gota.
+     */
     FORCEINLINE float SampleGrid(const TArray<float>& Hgt, int32 W, float X, float Y)
     {
         const int32 Ix = (int32)X;
@@ -63,20 +87,20 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
     const int32 N = W * H;
     const float Cell = static_cast<float>(HeightCm.CellSize);
     const float TalusTan = FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(P.TalusAngleDeg, 1.f, 89.f)));
-    // Tope 0.8: por encima, varias celdas vertiendo a la vez sobre un fondo de
-    // valle pueden sobrepasarlo y hacer oscilar el maximo (medido en el arnes:
-    // con 1.0 el pico crece; con <=0.8 converge siempre hacia el talud).
+    // Tope 0.8: por encima, varias celdas vertiendo a la vez sobre un mismo fondo
+    // de valle pueden sobrepasarlo y hacer oscilar el máximo en vez de converger
+    // hacia el talud.
     const float Strength = FMath::Clamp(P.Strength, 0.f, 0.8f);
 
-    // Los offsets de la vecindad viven en ForEachMooreNeighbor; aqui solo las
-    // distancias, que dependen del tamano de celda de ESTE relieve.
+    // Los offsets de la vecindad viven en ForEachMooreNeighbor; aquí solo las
+    // distancias, que dependen del tamaño de celda de ESTE relieve.
     const float Diag = Cell * 1.41421356f;
     const float Dist[8] = { Cell, Cell, Cell, Cell, Diag, Diag, Diag, Diag };
 
-    // Por celda: material total que vierte esta iteracion (cm) y suma de
-    // excesos sobre el talud (para repartirlo proporcionalmente, Olsen 2004).
-    // Verter TODO al vecino mas bajo concentra el material y oscila en los
-    // fondos de valle; el reparto proporcional es estable.
+    // Por celda: material que vierte en esta iteración (cm) y suma de excesos
+    // sobre el talud, denominador del reparto proporcional. Verter todo el
+    // material al vecino más bajo lo concentra y hace oscilar los fondos de
+    // valle; repartirlo en proporción al exceso de cada vecino es estable.
     TArray<float> MoveM;   MoveM.SetNumUninitialized(N);
     TArray<float> TotalEx; TotalEx.SetNumUninitialized(N);
     TArray<float> Next;    Next.SetNumUninitialized(N);
@@ -85,10 +109,10 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
 
     for (int32 It = 0; It < P.Iterations; ++It)
     {
-        // Paso 1 (paralelo): cada celda mide cuanto exceso sobre el talud
-        // tiene con cada vecino mas bajo. Mueve 0.5*Strength del MAYOR exceso:
-        // con Strength=1, el par mas empinado queda exactamente en el talud
-        // (no se pasa de frenada aunque haya varios receptores).
+        // Pasada 1 (paralela): cada celda mide cuánto exceso sobre el talud tiene
+        // con cada vecino más bajo y mueve 0.5*Strength del MAYOR de ellos. Ese
+        // factor 0.5 hace que con Strength=1 el par más empinado quede exactamente
+        // en el talud, sin pasarse aunque haya varios receptores.
         ParallelFor(H, [&](int32 y)
             {
                 for (int32 x = 0; x < W; ++x)
@@ -112,11 +136,11 @@ void TerrainErosion::ThermalErode(FField2D& HeightCm, const FThermalParams& P)
                 }
             });
 
-        // Paso 2 (paralelo, gather): cada celda resta su vertido y recoge su
-        // parte proporcional del de cada vecino. El receptor reconstruye el
-        // exceso emisor->receptor con las MISMAS alturas y distancias que uso
-        // el emisor, asi que el reparto cuadra sin atomics y es determinista
-        // (nadie escribe fuera de su celda).
+        // Pasada 2 (paralela, gather): cada celda resta su vertido y recoge su
+        // parte proporcional del de cada vecino. El receptor reconstruye el exceso
+        // emisor->receptor con las MISMAS alturas y distancias que usó el emisor,
+        // así que el reparto cuadra sin atómicas y es determinista: nadie escribe
+        // fuera de su celda.
         ParallelFor(H, [&](int32 y)
             {
                 for (int32 x = 0; x < W; ++x)
@@ -154,10 +178,10 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
     const int32 H = HeightCm.Height;
     const int32 N = W * H;
 
-    // El modelo de gotas esta calibrado para alturas en [0,1] y XY en celdas
-    // (Beyer 2015): se erosiona una copia normalizada y se vuelve a cm con el
-    // MISMO factor. No se re-normaliza al final: la erosion rebaja picos y
-    // rellena valles, y ese encogimiento del rango ES el resultado fisico.
+    // El modelo de gotas está calibrado para alturas en [0,1] y XY en celdas: se
+    // erosiona una copia normalizada y se vuelve a cm con el MISMO factor. No se
+    // re-normaliza al final; la erosión rebaja picos y rellena valles, y ese
+    // encogimiento del rango ES el resultado físico.
     float Mn, Mx;
     FField2D::MinMax(HeightCm.Data, Mn, Mx);
     const float Range = Mx - Mn;
@@ -174,8 +198,8 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
     }
 
     // Pincel de arranque: disco de radio BrushRadius con peso (1 - d/r)
-    // normalizado. Repartir el arranque evita los pozos de 1 celda que deja
-    // erosionar solo el nodo mas cercano.
+    // normalizado a suma 1. Repartir el arranque sobre el disco evita los pozos de
+    // una celda que deja erosionar solo el nodo más cercano.
     struct FBrushCell { int32 Dx; int32 Dy; float Weight; };
     TArray<FBrushCell> Brush;
     {
@@ -205,7 +229,7 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
 
     for (int32 d = 0; d < P.Droplets; ++d)
     {
-        // NextUnit < 1 garantiza celda entera valida (indice <= W-2 / H-2).
+        // NextUnit < 1 garantiza celda entera válida (índice <= W-2 / H-2).
         float Px = EcoRand::NextUnit(Rng) * (W - 1);
         float Py = EcoRand::NextUnit(Rng) * (H - 1);
         float DirX = 0.f, DirY = 0.f;
@@ -221,7 +245,7 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
             const float U = Px - Ix;
             const float V = Py - Iy;
 
-            // Gradiente y altura por interpolacion bilineal de los 4 nodos.
+            // Gradiente y altura por interpolación bilineal de los 4 nodos.
             const float H00 = Hgt[I];
             const float H10 = Hgt[I + 1];
             const float H01 = Hgt[I + W];
@@ -231,13 +255,14 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
             const float HOld = H00 * (1.f - U) * (1.f - V) + H10 * U * (1.f - V)
                 + H01 * (1.f - U) * V + H11 * U * V;
 
-            // Direccion: mezcla de inercia y gradiente cuesta abajo.
+            // Dirección: mezcla de inercia y gradiente cuesta abajo.
             DirX = DirX * P.Inertia - GradX * (1.f - P.Inertia);
             DirY = DirY * P.Inertia - GradY * (1.f - P.Inertia);
             const float Len = FMath::Sqrt(DirX * DirX + DirY * DirY);
             if (Len <= KINDA_SMALL_NUMBER)
             {
-                // Llano perfecto: rumbo aleatorio del MISMO stream (determinista).
+                // Llano perfecto: rumbo aleatorio del MISMO stream, para no meter
+                // una fuente de aleatoriedad fuera del contrato de determinismo.
                 const float Ang = EcoRand::NextRange(Rng, 0.f, 2.f * PI);
                 DirX = FMath::Cos(Ang);
                 DirY = FMath::Sin(Ang);
@@ -258,20 +283,22 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
             const float HNew = SampleGrid(Hgt, W, Px, Py);
             const float DeltaH = HNew - HOld;
 
-            // Capacidad de transporte ~ pendiente * velocidad * agua.
+            // Capacidad de transporte ~ pendiente * velocidad * agua, con la caída
+            // en un paso (-DeltaH) como proxy de la pendiente y un mínimo para que
+            // el llano no quede a capacidad cero.
             const float Capacity = FMath::Max(-DeltaH, P.MinSedimentCapacity)
                 * Speed * Water * P.SedimentCapacityFactor;
 
             if (Sediment > Capacity || DeltaH > 0.f)
             {
                 // Deposita: cuesta arriba rellena el hoyo (como mucho DeltaH);
-                // si va sobrecargada, suelta una fraccion del excedente.
+                // si va sobrecargada, suelta una fracción del excedente.
                 const float Amt = (DeltaH > 0.f)
                     ? FMath::Min(DeltaH, Sediment)
                     : (Sediment - Capacity) * P.DepositSpeed;
                 Sediment -= Amt;
 
-                // Deposito bilineal en los 4 nodos de la celda de PARTIDA.
+                // Depósito bilineal en los 4 nodos de la celda de PARTIDA.
                 Hgt[I] += Amt * (1.f - U) * (1.f - V);
                 Hgt[I + 1] += Amt * U * (1.f - V);
                 Hgt[I + W] += Amt * (1.f - U) * V;
@@ -279,8 +306,8 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
             }
             else
             {
-                // Erosiona: nunca mas que el propio desnivel (cavar por encima
-                // de eso dejaria hoyos delante de la gota).
+                // Erosiona: nunca más que el propio desnivel, porque cavar por
+                // encima de eso dejaría hoyos por delante de la gota.
                 const float Amt = FMath::Min((Capacity - Sediment) * ErodeK, -DeltaH);
                 float Taken = 0.f;
                 for (const FBrushCell& B : Brush)
@@ -299,7 +326,7 @@ void TerrainErosion::HydraulicErode(FField2D& HeightCm, uint32 Seed, const FHydr
                 Sediment += Taken;
             }
 
-            // Energia: v'^2 = v^2 - dh*g (cuesta abajo dh<0 -> acelera).
+            // Energía: v'^2 = v^2 - dh*g (cuesta abajo dh<0 -> acelera).
             Speed = FMath::Sqrt(FMath::Max(0.f, Speed * Speed - DeltaH * P.Gravity));
             Water *= (1.f - P.EvaporateSpeed);
         }

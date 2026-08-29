@@ -1,3 +1,19 @@
+/**
+ * @file TreeSkeleton.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del contenedor de nodos: alta de la raíz y de los hijos, y las
+ *        dos pasadas topológicas compartidas.
+ *
+ * Contiene la gestión del array de FTreeSkeleton —creación de la raíz, alta de hijos con
+ * derivación de la profundidad y normalización defensiva de la dirección— y las dos
+ * pasadas @f$O(N)@f$ que explotan la invariante `Parent` < índice: el número de hijos de
+ * cada nodo y la longitud de arco acumulada desde la raíz. Viven aquí, y no en cada
+ * consumidor, para que el mallador, el follaje y los datos de viento no las
+ * reimplementen.
+ *
+ * @ingroup eco_geometry
+ */
+
 #include "Geometry/TreeSkeleton.h"
 
 void FTreeSkeleton::Reset()
@@ -21,16 +37,15 @@ int32 FTreeSkeleton::InitRoot(const FVector& TrunkBaseWorld, const FVector& Init
     Root.Dir = InitialDir.GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
     Root.Radius = 0.f;
     Root.PipeRadius = 0.f;
-    Root.Flags = BNF_Axis; // la raiz es, por definicion, el pie del eje principal
+    Root.Flags = BNF_Axis; // la raíz es, por definición, el pie del eje principal
 
     return Nodes.Add(Root); // siempre 0: Nodes se acaba de vaciar
 }
 
 int32 FTreeSkeleton::AddChild(int32 ParentIndex, const FVector& Pos, const FVector& Dir, uint8 InFlags)
 {
-    // La invariante Parent < indice exige que el padre ya exista. Si no,
-    // devolvemos -1 en vez de corromper el esqueleto (el SCA nunca deberia
-    // llegar aqui con un indice invalido).
+    // La invariante Parent < índice exige que el padre ya exista: con un índice inválido
+    // se devuelve INDEX_NONE en vez de corromper el esqueleto.
     if (!Nodes.IsValidIndex(ParentIndex))
     {
         return INDEX_NONE;
@@ -68,6 +83,8 @@ void FTreeSkeleton::ComputeAlongLengths(TArray<float>& OutAlongLen) const
     const int32 N = Nodes.Num();
     OutAlongLen.Reset();
     OutAlongLen.SetNumZeroed(N);
+    // Índice creciente: con la invariante Parent < índice, el acumulado del padre ya
+    // está resuelto cuando se lee. El clamp solo acota un Parent corrupto al array.
     for (int32 i = 1; i < N; ++i)
     {
         const int32 P = FMath::Clamp(Nodes[i].Parent, 0, N - 1);

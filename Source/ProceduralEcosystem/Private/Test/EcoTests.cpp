@@ -1,26 +1,59 @@
+/**
+ * @file EcoTests.cpp
+ * @author Juan Luque Roldán
+ * @brief Batería de automatización que fija por escrito las invariantes del simulador:
+ *        determinismo, fórmulas puras y propiedades ecológicas.
+ *
+ * Única unidad de traducción del módulo de pruebas y hoja del grafo de dependencias: consume
+ * las cabeceras públicas del proyecto y no exporta nada. Los casos se auto-registran en el
+ * Automation Framework bajo la jerarquía `Eco.*` y cubren las tres familias de riesgo que
+ * ninguna otra parte vigila: determinismo bit a bit, corrección numérica de las fórmulas puras
+ * con sus casos degenerados, y las propiedades ecológicas cualitativas que, de perderse, no
+ * rompen la compilación pero vacían el modelo. Como un simulador procedural no tiene oráculo,
+ * casi todo se verifica como relación entre ejecuciones -equivalencia entre dos
+ * implementaciones, invariancia, monotonía, misma semilla misma salida- con semillas fijas
+ * para que un fallo sea siempre reproducible. Ningún test monta un mundo ni un subsistema.
+ *
+ * @ingroup eco_test
+ * @see @ref bib_testingmetamorfico
+ */
+
 #include "Misc/AutomationTest.h"
 #include "Core/EcoCore.h"
 #include "Ecology/EcologyRules.h"
 #include "Ecology/TreePopulation.h"
 #include "Ecology/TickScratch.h"
-#include "Ecology/CarbonModel.h"      // Fase 6
+#include "Ecology/CarbonModel.h"
 #include "Terrain/Field2D.h"
-#include "Terrain/HeightField.h"   // relieve realista (ruido + erosion)
+#include "Terrain/HeightField.h"        // relieve: ruido reparametrizado + erosión
 #include "Terrain/LightFieldCoarse.h"
 #include "Render/TreeArchetype.h"
-#include "Geometry/TreeSkeleton.h"    // Fase 6
-#include "Geometry/TreeWindData.h"    // Fase 6
+#include "Geometry/TreeSkeleton.h"
+#include "Geometry/TreeWindData.h"
 #include "Geometry/SpaceColonization.h"
 #include "Geometry/AttractorCloud.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Geometry/TreeMeshBuilder.h"
-#include "Geometry/TrunkDeformer.h"   // deformacion de tronco por arbol
-#include "Render/TreeLibrary.h"       // VariantDeformSeed (identidad de curvatura)
-#include "Species/SpeciesData.h"      // Fase 6
+#include "Geometry/TrunkDeformer.h"     // deformación de tronco por árbol
+#include "Render/TreeLibrary.h"         // VariantDeformSeed (identidad de curvatura)
+#include "Species/SpeciesData.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
+/** Flags comunes a los 31 casos: corren en el proceso del editor y aparecen bajo el filtro
+    «Engine» del Session Frontend. */
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
 
+/**
+ * Cimiento del determinismo: dos estados xorshift32 con la misma semilla avanzan en
+ * lockstep durante 100.000 extracciones, con igualdad EXACTA sobre el float y con el
+ * rango semiabierto [0,1) comprobado en cada paso.
+ *
+ * El caso patológico se prueba aparte: el 0 es punto absorbente del xorshift 13/17/5, así
+ * que la guarda que lo sustituye por la razón áurea es lo único que impide que un flujo
+ * mal sembrado devuelva ceros para siempre.
+ *
+ * @see @ref bib_marsaglia2003
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoRng, "Eco.Rng.Determinismo", EcoTestFlags)
 bool FEcoRng::RunTest(const FString&) {
     uint32 a = 12345, b = 12345;
@@ -34,6 +67,14 @@ bool FEcoRng::RunTest(const FString&) {
 }
 
 
+/**
+ * Los dos puntos que caracterizan las fórmulas del vigor: la saturante de Monod vale
+ * exactamente 0,5 cuando el recurso iguala la demanda de la especie, y la combinación es
+ * literalmente el mínimo de Liebig, no un promedio.
+ *
+ * @see @ref bib_monod1949
+ * @see @ref bib_liebig1840
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoVigor, "Eco.Vigor.Formulas", EcoTestFlags)
 bool FEcoVigor::RunTest(const FString&) {
     TestTrue(TEXT("Monod=0.5"), FMath::IsNearlyEqual(EcologyRules::DemandFactor(1.f, 1.f), 0.5f, 1e-4f));
@@ -42,6 +83,13 @@ bool FEcoVigor::RunTest(const FString&) {
 }
 
 
+/**
+ * Denominadores degenerados: con biomasa máxima 0, el término logístico (1 - B/Bmax) y la
+ * alometría de la altura darían 0/0. Solo se exige finitud, porque un único NaN se
+ * propagaría por todos los arrays de la población en el tick siguiente.
+ *
+ * @see @ref bib_verhulst1838
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoNaN, "Eco.Robustez.NoNaN", EcoTestFlags)
 bool FEcoNaN::RunTest(const FString&) {
     const float B = EcologyRules::GrowBiomassLogistic(0.f, 0.5f, 0.25f, 0.f, 1.f);
@@ -50,6 +98,14 @@ bool FEcoNaN::RunTest(const FString&) {
     return true;
 }
 
+/**
+ * Contrato de la compactación de muertos: los once arrays paralelos siguen alineados y, sobre
+ * todo, el orden relativo de los vivos SE PRESERVA. La aserción sobre `Position[1].X` es la
+ * que prohíbe el intercambio con el último elemento, más rápido pero que reordenaría la
+ * población y rompería la correspondencia estable entre índice y orden de nacimiento.
+ *
+ * @see @ref bib_acton2014
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSoA, "Eco.Poblacion.CompactDead", EcoTestFlags)
 bool FEcoSoA::RunTest(const FString&) {
     FTreePopulation P;
@@ -62,6 +118,12 @@ bool FEcoSoA::RunTest(const FString&) {
     return true;
 }
 
+/**
+ * Barrido de dominio sobre la probabilidad de muerte: edades de 0 a 400 años -el doble de la
+ * longevidad nominal- por tres pesos de estrés. El canal de edad crece como la cuarta potencia
+ * de la edad relativa y a 400 años vale 16 antes del recorte, así que lo que se comprueba es
+ * que los dos recortes y la composición como riesgos independientes dejan el resultado en [0,1].
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoMort, "Eco.Mortalidad.Rango", EcoTestFlags)
 bool FEcoMort::RunTest(const FString&) {
     for (float age = 0.f; age <= 400.f; age += 25.f)
@@ -71,10 +133,18 @@ bool FEcoMort::RunTest(const FString&) {
         }
     return true;
 }
+/**
+ * Continuidad de escala del bucket de LOD. La malla de un arquetipo se hornea al BORDE
+ * SUPERIOR de su bucket, así que la altura en pantalla solo es continua al cambiar de bucket
+ * si @f$Escala(r,b) \cdot BordeSuperior(b) = r@f$ para todo punto interior. Se comprueba esa
+ * igualdad y la coherencia del bucket elegido en cada uno de los cinco intervalos.
+ *
+ * @see @ref bib_clarkjh1976
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodBucket, "Eco.LOD.BucketEscala", EcoTestFlags)
 bool FEcoLodBucket::RunTest(const FString&) {
     const int32 N = 5;
-    // Invariante del doc 4.2: escala_en_bucket * borde_superior == fraccion de altura.
+    // Invariante: escala_en_bucket * borde_superior == fracción de altura adulta.
     for (int32 b = 0; b < N; ++b) {
         const float upper = TreeArchetype::BucketUpperRatio(b, N);
         const float r = upper - 0.01f; // dentro del bucket b, sin tocar el clamp inferior
@@ -85,10 +155,19 @@ bool FEcoLodBucket::RunTest(const FString&) {
     return true;
 }
 
+/**
+ * Banda de histéresis del cambio de bucket. Un árbol parado justo en una frontera oscilaría
+ * de bucket tick a tick, y cada oscilación es una baja y un alta de instancia entre dos
+ * componentes HISM. La banda efectiva es @f$H/N@f$ sobre el borde, y se comprueba a los dos
+ * lados. De paso se barre la variante morfológica, que es un módulo de hash estable y no
+ * puede salirse del número de variantes disponibles.
+ *
+ * @see @ref bib_schmitt1938
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodHysteresis, "Eco.LOD.Histeresis", EcoTestFlags)
 bool FEcoLodHysteresis::RunTest(const FString&) {
     const int32 N = 5; const float H = 0.15f;
-    // Borde 3/5=0.6; banda = H/N = 0.03. En 0.61 NO cruza; en 0.64 (>0.63) si.
+    // Borde 3/5 = 0.6 y banda H/N = 0.03: en 0.61 no cruza; en 0.64 (> 0.63) sí.
     TestEqual(TEXT("no cruza dentro de la banda"), TreeArchetype::BucketWithHysteresis(0.61f, 2, N, H), 2);
     TestEqual(TEXT("cruza superada la banda"), TreeArchetype::BucketWithHysteresis(0.64f, 2, N, H), 3);
     for (uint32 id = 1; id < 50; ++id)
@@ -96,10 +175,17 @@ bool FEcoLodHysteresis::RunTest(const FString&) {
     return true;
 }
 
+/**
+ * Re-mapeo instancia -> árbol tras un borrado por lotes. `RemoveInstances` desplaza hacia
+ * abajo los índices superiores, de modo que sin este bookkeeping, a partir de la primera
+ * muerte cada árbol movería la instancia de otro. El test reproduce esa semántica con un
+ * oráculo escrito a mano y verifica tanto el mapeo resultante como las notificaciones de
+ * reubicación que recibe el llamador.
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLodRemap, "Eco.LOD.RemapInstancias", EcoTestFlags)
 bool FEcoLodRemap::RunTest(const FString&) {
-    // Mapping instancia->id = [10,11,12,13,14]; borro instancias 1 y 3.
-    // UE desplaza hacia abajo -> queda [10,12,14] y se reubican 2->1 y 4->2.
+    // Mapping instancia->id = [10,11,12,13,14]; se borran las instancias 1 y 3.
+    // El desplazamiento hacia abajo deja [10,12,14], con 12 en 1 y 14 en 2.
     TArray<uint32> Mapping = { 10, 11, 12, 13, 14 };
     TArray<int32>  Removed = { 1, 3 };
     TMap<uint32, int32> NewIndexOf;
@@ -115,12 +201,23 @@ bool FEcoLodRemap::RunTest(const FString&) {
 }
 
 // =============================================================================
-//  Fase 5 (correccion B14): la fase se subio sin un solo test. Estos cubren las
-//  tres piezas que de verdad tenian logica sutil -y donde estaban los bugs-:
-//  la senescencia, el anillo de muertes y el kernel disperso de la Fase C1.
+//  Declive del individuo, eventos de muerte y depósito en los campos de recursos
 // =============================================================================
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSenescence, "Eco.Fase5.Senescencia", EcoTestFlags)
+/**
+ * Los dos declives del árbol son mecanismos distintos y el test los separa.
+ *
+ * La senescencia por edad es IRREVERSIBLE y depende solo de la fracción de longevidad
+ * alcanzada; la supresión por estrés es REVERSIBLE y tiene histéresis de dos umbrales, de
+ * modo que se entra al superar el umbral de la especie y no se sale hasta bajar de una
+ * fracción de él. Mezclarlas dejaría marcada de por vida a una plántula suprimida unos años
+ * y haría imposible el banco de plántulas. Se cierran también los bordes de los dos
+ * multiplicadores: el crecimiento escalado, la mortalidad saturada en 1 y el recorte que
+ * impide que un multiplicador menor que 1 REDUZCA el riesgo.
+ *
+ * @see @ref bib_dinamicadeclaros
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSenescence, "Eco.Mortalidad.Senescencia", EcoTestFlags)
 bool FEcoSenescence::RunTest(const FString&) {
     const float Longevity = 200.f, AgeFrac = 0.75f, StressThr = 0.85f, ExitFrac = 0.4f;
 
@@ -130,28 +227,24 @@ bool FEcoSenescence::RunTest(const FString&) {
     TestTrue(TEXT("pasada la fraccion de longevidad: senescente"),
         EcologyRules::IsSenescentByAge(150.f, Longevity, AgeFrac));
 
-    // El estres ya NO entra aqui: tiene su propio estado, reversible. Si volviera
-    // a mezclarse, una plantula suprimida unos anos quedaria marcada de por vida y
-    // el banco de plantulas -el mecanismo de coexistencia de un bosque climacico-
-    // seria imposible.
+    // El estrés no entra en el criterio de edad: tiene su propio estado, reversible.
     TestFalse(TEXT("estres alto NO produce senescencia por edad"),
         EcologyRules::IsSenescentByAge(10.f, Longevity, AgeFrac));
 
-    // --- Supresion por ESTRES: reversible, con histeresis ------------------
+    // --- Supresión por ESTRÉS: reversible, con histéresis ------------------
     TestTrue(TEXT("sano que cruza el umbral: entra en supresion"),
         EcologyRules::UpdateSuppression(false, 0.9f, StressThr, ExitFrac));
     TestFalse(TEXT("sano por debajo del umbral: no entra"),
         EcologyRules::UpdateSuppression(false, 0.5f, StressThr, ExitFrac));
 
-    // HISTERESIS: con un solo umbral el estado parpadearia tick a tick. Un
-    // suprimido a 0.5 sigue suprimido (0.5 > 0.85*0.4 = 0.34) aunque a 0.5 no
-    // habria entrado.
+    // Histéresis: con un solo umbral el estado parpadearía tick a tick. Un suprimido a
+    // 0.5 sigue suprimido (0.5 > 0.85*0.4 = 0.34) aunque a 0.5 no habría entrado.
     TestTrue(TEXT("suprimido a estres medio: NO sale todavia"),
         EcologyRules::UpdateSuppression(true, 0.5f, StressThr, ExitFrac));
     TestFalse(TEXT("suprimido que se recupera del todo: sale"),
         EcologyRules::UpdateSuppression(true, 0.2f, StressThr, ExitFrac));
 
-    // El crecimiento se frena y la mortalidad se multiplica, ambos acotados.
+    // En declive el crecimiento se frena y la mortalidad se multiplica, ambos acotados.
     TestEqual(TEXT("sano: crecimiento x1"), EcologyRules::DeclineGrowthFactor(false, 0.1f), 1.f);
     TestEqual(TEXT("en declive: crecimiento x escala"), EcologyRules::DeclineGrowthFactor(true, 0.1f), 0.1f);
     TestEqual(TEXT("sano: pDeath intacta"), EcologyRules::ApplySenescentMortality(0.2f, false, 3.f), 0.2f);
@@ -164,15 +257,21 @@ bool FEcoSenescence::RunTest(const FString&) {
 }
 
 /**
- * Anillo de muertes: reproduce la logica de RecordDeathEvent /
- * CollectNewDeathEvents con la capacidad FIJA de la correccion A9. Lo importante
- * es el WRAP-AROUND: es la parte con indices modulares y era donde el escritor y
- * el lector podian desincronizarse.
+ * Aritmética del anillo de eventos de muerte: buffer circular CON PÉRDIDA, de capacidad fija,
+ * con contador global monótono en el escritor y cursor propio en el lector.
+ *
+ * Lo que se verifica es el wrap-around, que es donde escritor y lector pueden
+ * desincronizarse: el rango legible arranca en @f$\max(Cursor,\,Contador-Capacidad)@f$, de
+ * modo que un consumidor retrasado pierde los eventos antiguos por diseño pero NUNCA lee una
+ * ranura ya pisada. Se cubren llenado parcial, consumo en vacío, sobreescritura y cursor al día.
+ *
+ * @note El test reimplementa el escritor y el lector con dos lambdas locales en vez de llamar
+ *       al anillo de la simulación: valida el razonamiento modular, no la implementación.
  */
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeathRing, "Eco.Fase5.AnilloDeMuertes", EcoTestFlags)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeathRing, "Eco.Muertes.AnilloDeEventos", EcoTestFlags)
 bool FEcoDeathRing::RunTest(const FString&) {
     const int32 Cap = 8;
-    TArray<int64> Ring; Ring.SetNumZeroed(Cap); // guardamos el id global de cada evento
+    TArray<int64> Ring; Ring.SetNumZeroed(Cap); // ranura -> id global del evento
     int64 Counter = 0;
 
     auto Record = [&](int64 Id) { Ring[static_cast<int32>(Counter % Cap)] = Id; ++Counter; };
@@ -183,7 +282,7 @@ bool FEcoDeathRing::RunTest(const FString&) {
             Cursor = Counter;
         };
 
-    // 1) Fase de llenado: el consumidor ve exactamente lo que se escribio.
+    // 1) Llenado parcial: el consumidor ve exactamente lo que se escribió.
     int64 Cursor = 0;
     for (int64 i = 0; i < 5; ++i) { Record(i); }
     TArray<int64> Out;
@@ -191,12 +290,12 @@ bool FEcoDeathRing::RunTest(const FString&) {
     TestEqual(TEXT("llenado: 5 eventos"), Out.Num(), 5);
     for (int32 k = 0; k < Out.Num(); ++k) { TestEqual(TEXT("llenado: en orden"), Out[k], (int64)k); }
 
-    // 2) Nada nuevo -> nada que entregar (el cursor ya esta al dia).
+    // 2) Nada nuevo: nada que entregar, el cursor ya está al día.
     Out.Reset(); Collect(Cursor, Out);
     TestEqual(TEXT("sin muertes nuevas: 0 eventos"), Out.Num(), 0);
 
-    // 3) WRAP-AROUND: se escriben mas de Cap eventos sin consumir. Solo deben
-    //    entregarse los ultimos Cap, y en orden.
+    // 3) Wrap-around: se escriben más de Cap eventos sin consumir. Solo deben
+    //    entregarse los últimos Cap, y en orden.
     for (int64 i = 5; i < 30; ++i) { Record(i); }
     Out.Reset(); Collect(Cursor, Out);
     TestEqual(TEXT("wrap: solo caben Cap eventos"), Out.Num(), Cap);
@@ -207,17 +306,25 @@ bool FEcoDeathRing::RunTest(const FString&) {
         TestEqual(TEXT("wrap: consecutivos"), Out[k], Out[k - 1] + 1);
     }
 
-    // 4) El cursor queda al dia tras consumir.
+    // 4) El cursor queda al día tras consumir.
     TestEqual(TEXT("cursor al dia"), Cursor, Counter);
     return true;
 }
 
 /**
- * Kernel disperso (optimizacion C1): debe repartir EXACTAMENTE la misma cantidad
- * que la version densa, celda a celda. Si esto pasa, la reduccion nueva produce
- * el mismo campo que la vieja salvo por el orden de suma en punto flotante.
+ * Equivalencia entre los dos caminos del kernel de depósito: el denso, que escribe un campo
+ * completo desde código serial, y el disperso, que emite pares (celda, cantidad) apendables
+ * desde dentro de un bucle paralelo. Se comparan celda a celda tras re-aplicar los deltas.
+ *
+ * La segunda mitad verifica la conservación de masa: el peso radial se normaliza en dos
+ * pasadas, así que la suma de lo depositado es exactamente la cantidad pedida pese al redondeo
+ * a celdas. Radio o cantidad nulos no emiten ningún delta.
+ *
+ * @note La igualdad se comprueba con tolerancia, no bit a bit: los dos caminos suman en orden
+ *       distinto y la suma en coma flotante no es asociativa.
+ * @see @ref bib_goldberg1991
  */
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSparseKernel, "Eco.Fase5.KernelDisperso", EcoTestFlags)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSparseKernel, "Eco.Recursos.KernelDisperso", EcoTestFlags)
 bool FEcoSparseKernel::RunTest(const FString&) {
     FField2D Geometry;
     Geometry.Init(16, 16, /*CellSize*/ 100.0, FVector2D::ZeroVector, 0.f);
@@ -226,11 +333,12 @@ bool FEcoSparseKernel::RunTest(const FString&) {
     const float Radius = 350.f;
     const float Amount = -12.5f;
 
-    // Denso
+    // Camino denso: escribe el campo entero.
     TArray<float> Dense; Dense.SetNumZeroed(Geometry.Num());
     EcologyRules::DepositKernel(Geometry, Dense, Pos, Radius, Amount);
 
-    // Disperso -> aplicado sobre un campo equivalente
+    // Camino disperso: deltas re-aplicados sobre un campo equivalente, que es lo que
+    // hace la reducción serial del tick.
     TArray<FCellDelta> Sparse;
     EcologyRules::DepositKernelSparse(Geometry, Sparse, Pos, Radius, Amount);
     TArray<float> FromSparse; FromSparse.SetNumZeroed(Geometry.Num());
@@ -247,13 +355,13 @@ bool FEcoSparseKernel::RunTest(const FString&) {
             FMath::IsNearlyEqual(Dense[c], FromSparse[c], 1e-4f));
     }
 
-    // Conservacion de masa: el kernel esta normalizado, asi que la suma de lo
-    // depositado es exactamente TotalAmount (esa es la razon de las dos pasadas).
+    // Conservación de masa: el kernel está normalizado por la suma de pesos, así que lo
+    // repartido suma exactamente la cantidad pedida.
     float Total = 0.f;
     for (const FCellDelta& D : Sparse) { Total += D.Amount; }
     TestTrue(TEXT("se deposita exactamente TotalAmount"), FMath::IsNearlyEqual(Total, Amount, 1e-3f));
 
-    // Radio 0 o cantidad 0: no se emite nada (y no se peta).
+    // Casos degenerados: radio o cantidad nulos no emiten ningún delta.
     Sparse.Reset();
     EcologyRules::DepositKernelSparse(Geometry, Sparse, Pos, 0.f, Amount);
     TestEqual(TEXT("radio 0 -> sin deltas"), Sparse.Num(), 0);
@@ -263,11 +371,17 @@ bool FEcoSparseKernel::RunTest(const FString&) {
 }
 
 /**
- * Rejilla de luz relativa al terreno (optimizacion C2): dos columnas con cotas
- * muy distintas deben comportarse IGUAL para la misma altura sobre el suelo. Es
- * justo lo que la version absoluta no hacia.
+ * Invariancia por traslación vertical de la rejilla de luz relativa al terreno: dos copas
+ * idénticas plantadas a la misma altura SOBRE EL SUELO, una en un valle y otra en una cresta
+ * 100 m más alta, tienen que dar exactamente la misma luz bajo ellas.
+ *
+ * Se comprueba además que la conmutación absoluta -> relativa depende de que se hayan
+ * entregado las cotas de suelo, y cuatro guardas ecológicas sobre el perfil resultante: el
+ * suelo bajo una copa adulta queda claramente sombreado, la luz crece hacia la copa, el piso
+ * difuso impide el cero absoluto y lejos de toda copa se recupera la luz plena. La última
+ * aserción acota el número de capas, que es lo que hace barata esta rejilla.
  */
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLightTerrainRelative, "Eco.Fase5.LuzRelativaAlTerreno", EcoTestFlags)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLightTerrainRelative, "Eco.Luz.RelativaAlTerreno", EcoTestFlags)
 bool FEcoLightTerrainRelative::RunTest(const FString&) {
     FLightFieldCoarse Light;
     const int32 W = 8, H = 8, L = 10;
@@ -275,7 +389,7 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
     Light.Init(W, H, L, Cell, Cell, FVector2D::ZeroVector, /*BaseZ*/ -400.0);
     TestFalse(TEXT("sin GroundZ es absoluta"), Light.IsTerrainRelative());
 
-    // Columna 1 en un valle (z=0), columna 6 en una cresta (z=10.000 cm).
+    // Mitad izquierda en un valle (z = 0), mitad derecha en una cresta (z = 10.000 cm).
     TArray<float> Ground; Ground.SetNumZeroed(W * H);
     for (int32 y = 0; y < H; ++y)
         for (int32 x = 0; x < W; ++x)
@@ -287,51 +401,51 @@ bool FEcoLightTerrainRelative::RunTest(const FString&) {
     TestEqual(TEXT("sin sombra = luz plena"),
         Light.SampleLight(FVector(600.0, 600.0, 300.0)), FLightFieldCoarse::FullSunlight);
 
-    // Dos copas identicas, una en cada altiplano, a la MISMA altura sobre el suelo.
-    // Copa ANCHA a proposito: con un radio menor que el voxel el area foliar se
-    // reparte sobre una huella mucho mayor que la copa y la sombra sale debil, que
-    // es justamente lo que debe pasar.
+    // Dos copas idénticas, una en cada altiplano, a la MISMA altura sobre el suelo. La copa
+    // es ancha a propósito: con un radio menor que el vóxel, el área foliar se reparte sobre
+    // una huella mucho mayor que la copa y la sombra sale débil, que es lo correcto.
     const float CanopyR = 1200.f, CanopyDepth = 1200.f, CanopyLai = 4.f;
     Light.DepositCanopyLeafArea(FVector(600.0, 600.0, 0.0 + 2000.0), CanopyR, CanopyDepth, CanopyLai);
     Light.DepositCanopyLeafArea(FVector(2200.0, 600.0, 10000.0 + 2000.0), CanopyR, CanopyDepth, CanopyLai);
     Light.AccumulateExtinction();
 
-    // A ras de suelo, bajo cada copa, la luz debe ser la MISMA pese a los 100 m
-    // de diferencia de cota.
+    // A ras de suelo, bajo cada copa, la luz es la MISMA pese a los 100 m de diferencia de cota.
     const float ValleyQ = Light.SampleLight(FVector(600.0, 600.0, 0.0 + 50.0));
     const float RidgeQ = Light.SampleLight(FVector(2200.0, 600.0, 10000.0 + 50.0));
     TestTrue(TEXT("misma altura sobre el suelo -> misma luz"),
         FMath::IsNearlyEqual(ValleyQ, RidgeQ, 1e-4f));
 
-    // UMBRAL ECOLOGICO, no "< luz plena". La asercion anterior pasaba con una
-    // sombra de tres centesimas, que es exactamente el bug que dejaba el
-    // sotobosque a plena luz sin que ningun test se enterara.
+    // Umbral ecológico, no un simple «< luz plena»: una sombra de tres centésimas dejaría el
+    // sotobosque a plena luz y aun así pasaría la comparación laxa.
     TestTrue(TEXT("bajo una copa adulta el suelo esta claramente sombreado"), ValleyQ < 0.6f);
 
-    // Y la sombra tiene que CRECER hacia abajo: es la firma de un dosel real, y
-    // la de la version anterior era la contraria (oscuro arriba, claro abajo).
+    // La sombra crece hacia abajo, que es la firma de un dosel real.
     const float CanopyQ = Light.SampleLight(FVector(600.0, 600.0, 0.0 + 1800.0));
     TestTrue(TEXT("perfil correcto: mas oscuro abajo que en la copa"), ValleyQ < CanopyQ);
 
-    // El piso difuso impide el cero absoluto, que igualaria a todas las especies
-    // justo donde la tolerancia debe decidir.
+    // El piso difuso impide el cero absoluto, que igualaría a todas las especies justo donde
+    // la tolerancia a la sombra debe decidir.
     TestTrue(TEXT("nunca se llega a oscuridad total"), ValleyQ >= Light.DiffuseFloor);
 
-    // Y una copa NO puede sombrear la otra columna (estan lejos en XY).
+    // Una copa no sombrea columnas alejadas en XY.
     const float FarQ = Light.SampleLight(FVector(3400.0, 2600.0, 10000.0 + 50.0));
     TestEqual(TEXT("lejos de toda copa = luz plena"), FarQ, FLightFieldCoarse::FullSunlight);
 
-    // La rejilla es pequena: es el objetivo de la optimizacion.
+    // Medir las capas la reduce a métrica: es lo que abarata la rejilla relativa al terreno.
     TestTrue(TEXT("la rejilla cabe en pocas capas"), Light.Layers <= 16);
     return true;
 }
 
 /**
- * ESTRATIFICACION VERTICAL: el arbol alto tiene que recibir MAS luz que el bajo
- * que tiene debajo. Es la propiedad que convierte la competencia por luz en
- * asimetrica -el que llega arriba intercepta y el de abajo paga- y sin ella no
- * existen ni el dosel, ni el banco de plantulas, ni la sucesion. Antes fallaba por
- * construccion: todos los arboles muestreaban la luz en la cota del suelo.
+ * Estratificación vertical: bajo un único dominante, la luz decrece monótonamente hacia el
+ * suelo. Es la propiedad que hace ASIMÉTRICA la competencia por luz -el que llega arriba
+ * intercepta y el de abajo paga- y sin ella no hay dosel, ni banco de plántulas, ni sucesión.
+ *
+ * Las dos cotas extremas fijan los dos extremos de la extinción acumulada: el techo de la copa
+ * queda casi a pleno sol porque solo se come media capa propia (el muestreo es en el centro
+ * del vóxel, y de ahí la autoexclusión), y el suelo queda en penumbra.
+ *
+ * @see @ref bib_monsisaeki1953
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLightStratification, "Eco.Luz.EstratificacionVertical", EcoTestFlags)
 bool FEcoLightStratification::RunTest(const FString&) {
@@ -340,7 +454,7 @@ bool FEcoLightStratification::RunTest(const FString&) {
     Light.Init(8, 8, 12, Cell, Cell, FVector2D::ZeroVector, /*BaseZ*/ -400.0);
     Light.SetExtinctionParams(0.5f, 0.04f);
 
-    // Un dominante de 20 m con copa en su tercio superior.
+    // Un dominante de 20 m con la copa en su tercio superior.
     const double ApexZ = 2000.0;
     Light.DepositCanopyLeafArea(FVector(600.0, 600.0, ApexZ), 1200.f, 600.f, 4.f);
     Light.AccumulateExtinction();
@@ -357,10 +471,18 @@ bool FEcoLightStratification::RunTest(const FString&) {
 }
 
 /**
- * COSTE DE LA TOLERANCIA A LA SOMBRA: las curvas de la pionera y de la tolerante
- * tienen que CRUZARSE. Sin cruce, ShadeTolerance es una ventaja monotona gratuita
- * -mejor a pleno sol Y bajo el dosel- y la especie mas tolerante gana en todas las
- * celdas a la vez, que es exclusion competitiva por construccion.
+ * Coste de la tolerancia a la sombra: las curvas de respuesta a la luz de la pionera y de la
+ * climácica tienen que CRUZARSE. La pionera rinde más a pleno sol y la tolerante rinde más
+ * bajo el dosel, de modo que ninguna gana en todo el gradiente.
+ *
+ * El compromiso se impone bajando el techo de asimilación con la tolerancia,
+ * @f$A_{max}(s) = 1 - c\,s@f$, mientras la tolerancia baja la semisaturación. El control
+ * negativo -una climácica con el techo intacto- demuestra por qué el término de coste no es
+ * opcional: sin él la tolerancia sería un eje monótono gratuito y habría exclusión competitiva
+ * por construcción, no por ecología.
+ *
+ * @see @ref bib_toleranciasombra
+ * @see @ref bib_exclusioncompetitiva
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoShadeToleranceTradeoff, "Eco.Luz.CosteDeLaTolerancia", EcoTestFlags)
 bool FEcoShadeToleranceTradeoff::RunTest(const FString&) {
@@ -386,7 +508,7 @@ bool FEcoShadeToleranceTradeoff::RunTest(const FString&) {
     TestTrue(TEXT("a pleno sol gana la pionera"), SunPioneer > SunClimax);
     TestTrue(TEXT("bajo el dosel gana la tolerante"), ShadeClimax > ShadePioneer);
 
-    // Sin coste el cruce desaparece: la tolerante ganaria tambien a pleno sol.
+    // Control negativo: sin coste, la tolerante gana también a pleno sol y el cruce desaparece.
     const EcoVigor::FLightResponse FreeClimax = [KlMax]()
         {
             EcoVigor::FLightResponse R; R.KlMax = KlMax; R.ShadeTolerance = 0.65f; R.MaxAssimilation = 1.f; return R;
@@ -397,17 +519,23 @@ bool FEcoShadeToleranceTradeoff::RunTest(const FString&) {
 }
 
 /**
- * EL ESTRES TIENE QUE SER UNA RAMPA, NO UN ESCALON. Sin termino de decaimiento el
- * punto fijo es binario -0 exacto por encima del umbral, 1 por debajo-, con lo que
- * dos sitios de calidad muy distinta dan la misma demografia y dos especies
- * separadas por centesimas de vigor quedan separadas por una diferencia de
- * mortalidad infinita.
+ * El acumulador de estrés tiene que ser una rampa continua, no un escalón. Es el término de
+ * decaimiento el que le da un punto fijo interior,
+ * @f$S^{*} = (Umbral - Vigor)\cdot Acumulacion / Decaimiento@f$, y el test lo alcanza por
+ * iteración para tres vigores: dos por debajo del umbral, que deben dar valores distintos y
+ * ninguno saturado, y uno por encima, que debe llevar el estrés a cero.
+ *
+ * Sin decaimiento el punto fijo sería binario y dos sitios de calidad muy distinta darían la
+ * misma demografía. La segunda mitad comprueba el acoplamiento longevidad-estrés,
+ * @f$w = w_{0}(L_{ref}/L)^{e}@f$: la especie longeva paga el mismo impuesto anual durante
+ * muchos más años, así que la longevidad tiene que comprar resistencia al estrés crónico para
+ * que la estrategia lenta sea viable. Con exponente 0 el acoplamiento se desactiva exactamente.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoStressRamp, "Eco.Estres.RampaContinua", EcoTestFlags)
 bool FEcoStressRamp::RunTest(const FString&) {
     const float Thr = 0.45f, Acc = 1.f, Rec = 0.5f, Decay = 0.2f, Dt = 1.f;
 
-    // Punto fijo por iteracion, para dos vigores por debajo del umbral.
+    // Equilibrio alcanzado por iteración, con dt constante.
     auto FixedPoint = [&](float Vigor)
         {
             float S = 0.f;
@@ -424,8 +552,7 @@ bool FEcoStressRamp::RunTest(const FString&) {
     TestTrue(TEXT("por encima del umbral el estres se va a cero"),
         FixedPoint(0.9f) < KINDA_SMALL_NUMBER);
 
-    // Y la longevidad tiene que comprar resistencia, o la estrategia lenta no
-    // puede existir: paga el mismo impuesto anual durante muchos mas anos.
+    // Acoplamiento longevidad-estrés: la especie longeva resiste mejor el estrés crónico.
     const float WLong = EcologyRules::EffectiveStressMortalityWeight(0.2f, 600.f, 300.f, 0.5f);
     const float WShort = EcologyRules::EffectiveStressMortalityWeight(0.2f, 150.f, 300.f, 0.5f);
     TestTrue(TEXT("la especie longeva resiste mejor el estres cronico"), WLong < WShort);
@@ -435,16 +562,23 @@ bool FEcoStressRamp::RunTest(const FString&) {
 }
 
 // =============================================================================
-//  FASE 6 � realismo y optimizacion final
+//  Multiplicador de CO2 y datos de viento del árbol
 // =============================================================================
 
 /**
- * CO2 (doc. 6.3). Lo importante que hay que garantizar es que la capa sea
- * INOFENSIVA: acotada, sin discontinuidades, y con un "off" que devuelve 1.0
- * EXACTO -sin ese exacto, la ablacion de la Fase 7 no seria comparable bit a
- * bit con las corridas anteriores-.
+ * El multiplicador de CO2 tiene que ser una capa INOFENSIVA: acotada en
+ * @f$[1-MaxReduction,\,1]@f$, monótona no decreciente en la luz, continua entre sus dos
+ * extremos y finita ante entradas absurdas. Se verifican los cuatro puntos de esquina de
+ * @f$f = 1 - MaxReduction \cdot Sombra \cdot (1 - Mezcla)@f$ y después un barrido completo en
+ * luz.
+ *
+ * La parte crítica es la ablación: apagar la capa, o poner su reducción máxima a cero, devuelve
+ * 1.0f EXACTO -comparado con igualdad, no con tolerancia-, que es lo que permite comparar bit a
+ * bit una corrida con la capa y otra sin ella.
+ *
+ * @see @ref bib_co2dosel
  */
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoCO2, "Eco.Fase6.CO2", EcoTestFlags)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoCO2, "Eco.Vigor.CO2", EcoTestFlags)
 bool FEcoCO2::RunTest(const FString&) {
     EcoCarbon::FCO2Params P;
     P.bEnabled = true;
@@ -452,23 +586,24 @@ bool FEcoCO2::RunTest(const FString&) {
     P.FullMixingHeightCm = 2500.f;
     P.FullSunlight = 1.f;
 
-    // A pleno sol no hay penalizacion, este el arbol a la altura que este.
+    // A pleno sol no hay penalización, esté el árbol a la altura que esté.
     TestTrue(TEXT("pleno sol -> factor 1"),
         FMath::IsNearlyEqual(EcoCarbon::CO2Factor(1.f, 0.f, P), 1.f, 1e-5f));
     TestTrue(TEXT("pleno sol, arbol alto -> factor 1"),
         FMath::IsNearlyEqual(EcoCarbon::CO2Factor(1.f, 3000.f, P), 1.f, 1e-5f));
 
     // Peor caso: oscuridad total a ras de suelo -> exactamente 1 - MaxReduction.
+    // Es el tope del efecto, y por diseño es leve.
     TestTrue(TEXT("dosel cerrado a ras de suelo -> 1 - MaxReduction"),
         FMath::IsNearlyEqual(EcoCarbon::CO2Factor(0.f, 0.f, P), 1.f - P.MaxReduction, 1e-5f));
 
-    // La altura recupera el factor: por encima de FullMixingHeightCm no penaliza.
+    // La altura recupera el factor: por encima del dosel el aire está bien mezclado.
     TestTrue(TEXT("por encima del dosel no hay penalizacion"),
         FMath::IsNearlyEqual(EcoCarbon::CO2Factor(0.f, P.FullMixingHeightCm, P), 1.f, 1e-5f));
     TestTrue(TEXT("a media altura la penalizacion es intermedia"),
         EcoCarbon::CO2Factor(0.f, P.FullMixingHeightCm * 0.5f, P) > EcoCarbon::CO2Factor(0.f, 0.f, P));
 
-    // Monotono en la luz y acotado en TODO el dominio (incluidos valores absurdos).
+    // Monótono en la luz y acotado en todo el dominio, incluidas entradas fuera de rango.
     float Prev = -1.f;
     for (float Q = 0.f; Q <= 1.001f; Q += 0.05f)
     {
@@ -480,8 +615,7 @@ bool FEcoCO2::RunTest(const FString&) {
     TestTrue(TEXT("Q negativo no rompe"), FMath::IsFinite(EcoCarbon::CO2Factor(-5.f, 0.f, P)));
     TestTrue(TEXT("altura negativa no rompe"), FMath::IsFinite(EcoCarbon::CO2Factor(0.5f, -100.f, P)));
 
-    // ABLACION: apagado devuelve 1.0 EXACTO (no "casi 1"), que es lo que permite
-    // reproducir bit a bit los resultados anteriores a la Fase 6.
+    // Ablación: apagada, la capa devuelve su elemento neutro EXACTO, no «casi 1».
     P.bEnabled = false;
     TestEqual(TEXT("desactivado -> 1.0 exacto"), EcoCarbon::CO2Factor(0.f, 0.f, P), 1.f);
     P.bEnabled = true; P.MaxReduction = 0.f;
@@ -490,27 +624,33 @@ bool FEcoCO2::RunTest(const FString&) {
 }
 
 /**
- * Datos de viento (doc. 6.1). Se construye un esqueleto minimo con UNA
- * bifurcacion y se comprueban las cuatro propiedades de las que depende que el
- * balanceo se vea bien:
- *   1. La base del tronco NO se mueve (esta empotrada en el suelo).
- *   2. El movimiento crece hacia las puntas.
- *   3. Los nodos de una MISMA rama comparten pivote y desfase (si no, el tubo se
- *      retuerce en vez de balancearse).
- *   4. Ramas distintas tienen desfases distintos (si no, el arbol entero se mueve
- *      como una sola pieza).
+ * Esqueleto sintético con una sola bifurcación para validar los datos de viento por nodo.
+ *
+ * Los radios se rellenan a mano de modo que en la horquilla un hijo salga más grueso que el
+ * otro, que es lo que decide cuál continúa la rama del padre. Lo comprobado:
+ *
+ * @li la base empotrada no se balancea, el balanceo crece hacia las puntas y tanto él como el
+ *     desfase quedan dentro de rango;
+ * @li los nodos de una misma rama comparten pivote y desfase, porque un desfase por nodo
+ *     retorcería el tubo en lugar de balancearlo;
+ * @li en una bifurcación el hijo más grueso hereda pivote y nivel del padre y solo el más fino
+ *     abre rama nueva, cuyo pivote es la HORQUILLA y no su primer nodo;
+ * @li misma semilla, mismos datos; y más rigidez de especie, menos balanceo.
  */
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoWindData, "Eco.Fase6.DatosDeViento", EcoTestFlags)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoWindData, "Eco.Viento.Datos", EcoTestFlags)
 bool FEcoWindData::RunTest(const FString&) {
     USpeciesData* Sp = NewObject<USpeciesData>(GetTransientPackage());
     if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
-    Sp->WindStiffness = 0.f;      // maxima flexibilidad: aisla la forma de la curva
+    Sp->WindStiffness = 0.f;      // máxima flexibilidad: aísla la forma de la curva
     Sp->LeafFlutterScale = 1.f;
 
-    // Tronco de 4 nodos y, en el ultimo, una bifurcacion en dos ramas de 2 nodos.
-    //        5   6      <- rama B
+    // Tronco de cuatro nodos y bifurcación en el último:
+    //
+    //          5          <- A1
+    //         /
+    //        4   6        <- A0 (más grueso: continúa el tronco) y B0 (abre rama)
     //         \ /
-    //  0-1-2-3-4        <- tronco (rama A) ... 4 abre las dos hijas
+    //  0-1-2-3            <- tronco; el nodo 3 es la horquilla
     FTreeSkeleton Sk;
     Sk.InitRoot(FVector::ZeroVector, FVector::UpVector);
     int32 Prev = 0;
@@ -523,9 +663,8 @@ bool FEcoWindData::RunTest(const FString&) {
     const int32 A1 = Sk.AddChild(A0, FVector(160, 0, 440.0), FVector(1, 0, 0.4).GetSafeNormal());
     const int32 B0 = Sk.AddChild(Fork, FVector(-80, 0, 380.0), FVector(-1, 0, 0.5).GetSafeNormal());
 
-    // Radios como los dejaria el pipe model: gruesos abajo, finos arriba.
-    // A0 (indice 4) queda mas GRUESO que B0 (indice 6): eso hace de A la rama
-    // que continua el tronco y de B la lateral, que es justo lo que se testea.
+    // Radios como los dejaría el pipe model: gruesos abajo, finos arriba. A0 queda más
+    // GRUESO que B0, así que A continúa el tronco y B es la lateral.
     for (int32 i = 0; i < Sk.Num(); ++i)
     {
         const float R = FMath::Lerp(10.f, 1.f, (float)i / FMath::Max(1, Sk.Num() - 1));
@@ -538,10 +677,10 @@ bool FEcoWindData::RunTest(const FString&) {
 
     TestTrue(TEXT("un dato por nodo"), Wind.IsValidFor(Sk));
 
-    // 1) La base no se mueve.
+    // 1) La base está empotrada en el suelo.
     TestTrue(TEXT("la base del tronco no se balancea"), Wind.Nodes[0].SwayWeight <= KINDA_SMALL_NUMBER);
 
-    // 2) El balanceo crece hacia la punta.
+    // 2) El balanceo crece hacia la punta y queda acotado.
     TestTrue(TEXT("la punta se balancea mas que el tronco"),
         Wind.Nodes[A1].SwayWeight > Wind.Nodes[0].SwayWeight);
     TestTrue(TEXT("el balanceo crece a lo largo de la rama"),
@@ -553,24 +692,22 @@ bool FEcoWindData::RunTest(const FString&) {
         TestTrue(TEXT("AO neutro sin rejilla de luz"), FMath::IsNearlyEqual(N.CanopyAO, 1.f, 1e-4f));
     }
 
-    // 3) Nodos de la MISMA rama: mismo pivote y mismo desfase.
+    // 3) Nodos de la MISMA rama: mismo pivote y mismo desfase, o el tubo se retuerce.
     TestTrue(TEXT("misma rama -> mismo pivote"),
         Wind.Nodes[A0].PivotLocalCm.Equals(Wind.Nodes[A1].PivotLocalCm, 0.01));
     TestEqual(TEXT("misma rama -> mismo desfase"), Wind.Nodes[A0].Phase01, Wind.Nodes[A1].Phase01);
 
-    // El tronco es la rama 0 y su pivote es la base.
+    // El tronco es la rama de nivel 0 y su pivote es la base del árbol.
     TestTrue(TEXT("el pivote del tronco es su base"),
         Wind.Nodes[2].PivotLocalCm.Equals(FVector::ZeroVector, 0.01));
     TestTrue(TEXT("el tronco es el nivel 0"), FMath::IsNearlyEqual(Wind.Nodes[2].BranchLevel01, 0.f, 1e-4f));
 
-    // 4) En una bifurcacion, el hijo MAS GRUESO continua la rama del padre y
-    //    solo los mas finos abren rama nueva.
-    //
-    //    No es un detalle cosmetico: con un eje principal que atraviesa la copa,
-    //    el eje bifurca en CADA insercion lateral. Con la regla ingenua ("el
-    //    padre bifurco -> los dos hijos abren rama") el propio tronco se
-    //    contaria como rama nueva a media altura, su pivote se reiniciaria ahi y
-    //    el fuste se balancearia como una ramita colgada del punto equivocado.
+    // 4) En una bifurcación, el hijo MÁS GRUESO continúa la rama del padre y solo los más
+    //    finos abren rama nueva. Con un eje que atraviesa la copa, el eje bifurca en CADA
+    //    inserción lateral: con la regla ingenua -«el padre bifurcó, los dos hijos abren
+    //    rama»- el propio tronco contaría como rama nueva a media altura, su pivote se
+    //    reiniciaría ahí y el fuste se balancearía como una ramita colgada del punto
+    //    equivocado.
     TestTrue(TEXT("el hijo mas grueso continua la rama del tronco"),
         Wind.Nodes[A0].PivotLocalCm.Equals(FVector::ZeroVector, 0.01));
     TestTrue(TEXT("el hijo mas grueso conserva el nivel del tronco"),
@@ -582,7 +719,7 @@ bool FEcoWindData::RunTest(const FString&) {
     TestTrue(TEXT("continuacion y rama nueva -> desfases distintos"),
         !FMath::IsNearlyEqual(Wind.Nodes[A0].Phase01, Wind.Nodes[B0].Phase01, 1e-5f));
 
-    // 5) DETERMINISMO: misma semilla, mismos datos; semilla distinta, desfases distintos.
+    // 5) Determinismo: misma semilla, mismos datos; semilla distinta, desfases distintos.
     FTreeWindData Again;
     Again.Build(Sk, *Sp, nullptr, 12345u);
     for (int32 i = 0; i < Wind.Nodes.Num(); ++i)
@@ -607,11 +744,21 @@ bool FEcoWindData::RunTest(const FString&) {
 
 
 // ---------------------------------------------------------------------------
-// Troncos organicos y reparto de ramas
+// Geometría del árbol: perfil de tronco, inserción de ramas y mallado
 // ---------------------------------------------------------------------------
 
-/** Especie de prueba coherente (cumple d_k < D < d_i) y pequena, para que el
-    SCA termine rapido dentro de la bateria de tests. */
+/**
+ * Fixture de especie para los tests de geometría: copa cónica pequeña con los tres parámetros
+ * de la colonización del espacio en la relación que el algoritmo exige, @f$d_k < D < d_i@f$.
+ *
+ * Es deliberadamente modesta -250 atractores y 40 iteraciones- para que un árbol completo quepa
+ * dentro del presupuesto de la batería, y crece con la autopoda por luz desactivada, de modo
+ * que los tests midan geometría y no el efecto de la sombra.
+ *
+ * @param Outer Propietario del asset transitorio.
+ * @return Especie recién creada, o `nullptr` si el motor no pudo construirla.
+ * @see @ref bib_runions2007
+ */
 static USpeciesData* EcoTestSpecies(UObject* Outer)
 {
     USpeciesData* Sp = NewObject<USpeciesData>(Outer);
@@ -627,7 +774,7 @@ static USpeciesData* EcoTestSpecies(UObject* Outer)
     Sp->InfluenceRadiusDi = 200.f;
     Sp->KillRadiusDk = 30.f;
     Sp->MaxIter = 40;
-    Sp->LightEvery = 0;              // sin autopoda: aisla la geometria
+    Sp->LightEvery = 0;              // sin autopoda: aísla la geometría
     Sp->FineVoxelSizeCm = 35.f;
 
     Sp->TipRadiusCm = 1.5f;
@@ -639,9 +786,17 @@ static USpeciesData* EcoTestSpecies(UObject* Outer)
 /**
  * El perfil de tronco convierte el cilindro del pipe model en un fuste.
  *
- * El esqueleto es una CADENA sin bifurcaciones a proposito: es el caso donde el
- * pipe model da r_padre = r_hijo exactamente y de donde salia el cilindro
- * perfecto. Si el perfil no lo arregla aqui, no lo arregla en ningun sitio.
+ * El esqueleto es una CADENA sin bifurcaciones a propósito: es el caso donde
+ * @f$r_{padre}^{n} = \sum r_{hijo}^{n}@f$ degenera en @f$r_{padre} = r_{hijo}@f$ y sale un
+ * cilindro perfecto. La primera aserción documenta ese cilindro como diagnóstico y el resto
+ * verifica lo que el perfil añade encima: ensanche de pie, afilado con la altura y una pasada
+ * de monotonía que evita el estrangulamiento en cono invertido bajo la copa.
+ *
+ * Las dos últimas comprobaciones protegen la separación entre los dos radios: el perfil vive
+ * solo en el radio de mallado y no toca el estructural, que es la referencia de rigidez del
+ * viento; y con el perfil desactivado los dos vuelven a coincidir.
+ *
+ * @see @ref bib_shinozaki1964
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTrunkProfile, "Eco.Arbol.PerfilDeTronco", EcoTestFlags)
 bool FEcoTrunkProfile::RunTest(const FString&) {
@@ -663,24 +818,22 @@ bool FEcoTrunkProfile::RunTest(const FString&) {
 
     SpaceColonization::ComputeRadii(Sk, *Sp);
 
-    // 1) Punto de partida: el pipe model, en una cadena, es un CILINDRO.
-    //    (Es el diagnostico del problema, escrito como test.)
+    // 1) Punto de partida: en una cadena, el pipe model da un CILINDRO.
     TestTrue(TEXT("el pipe model da radio constante en una cadena"),
         FMath::IsNearlyEqual(Sk.Nodes[0].PipeRadius, Sk.Nodes[N / 2].PipeRadius, 1e-4f));
 
     SpaceColonization::ApplyTrunkProfile(Sk, *Sp);
 
-    // 2) El pie es claramente mas ancho que el fuste a media altura.
+    // 2) El pie es claramente más ancho que el fuste a media altura.
     TestTrue(TEXT("la base es mas ancha que el fuste"),
         Sk.Nodes[0].Radius > Sk.Nodes[N / 2].Radius * 1.2f);
 
-    // 3) ... y el fuste afila hacia arriba.
+    // 3) ... y el fuste afila hacia arriba sobre la longitud de arco acumulada.
     TestTrue(TEXT("el eje afila con la altura"),
         Sk.Nodes[N / 2].Radius > Sk.Nodes[N - 1].Radius);
 
-    // 4) MONOTONIA: ningun nodo mas fino que su hijo. Sin esta pasada el
-    //    afilado deja el eje mas fino que el primer nodo de copa y aparece un
-    //    estrangulamiento en cono invertido, que es muy visible.
+    // 4) Monotonía: ningún nodo más fino que su hijo. Sin esta pasada el afilado deja el eje
+    //    más fino que el primer nodo de copa y aparece un cono invertido muy visible.
     for (int32 i = 1; i < N; ++i)
     {
         const int32 P = Sk.Nodes[i].Parent;
@@ -688,14 +841,14 @@ bool FEcoTrunkProfile::RunTest(const FString&) {
             Sk.Nodes[P].Radius >= Sk.Nodes[i].Radius - KINDA_SMALL_NUMBER);
     }
 
-    // 5) El radio ESTRUCTURAL no se toca: es la referencia del viento y llevarle
-    //    el ensanche de raiz haria que todo el arbol se balancease de mas.
+    // 5) El radio estructural no se toca: el ensanche de pie puede duplicar el radio de
+    //    mallado sin hacer al árbol un gramo más rígido.
     TestTrue(TEXT("el perfil no contamina PipeRadius"),
         FMath::IsNearlyEqual(Sk.Nodes[0].PipeRadius, Sk.Nodes[N / 2].PipeRadius, 1e-4f));
     TestTrue(TEXT("el ensanche solo esta en Radius"),
         Sk.Nodes[0].Radius > Sk.Nodes[0].PipeRadius);
 
-    // 6) Con el perfil desactivado, Radius vuelve a ser exactamente el del pipe model.
+    // 6) Control: con el perfil desactivado, el radio de mallado vuelve al del pipe model.
     Sp->TrunkFlareStrength = 0.f;
     Sp->TrunkTopTaper = 1.f;
     FTreeSkeleton Plain;
@@ -713,14 +866,22 @@ bool FEcoTrunkProfile::RunTest(const FString&) {
     return true;
 }
 
-/** El angulo de insercion separa la rama lateral de su padre, y ni un grado mas. */
+/**
+ * El ángulo mínimo de inserción separa la rama lateral de su padre, y ni un grado más.
+ *
+ * Una dirección casi paralela se abre hasta el mínimo EXACTO y con el giro más corto posible,
+ * comprobado exigiendo que la salida siga en el plano que formaban padre y dirección; una que
+ * ya se separaba lo suficiente se devuelve intacta. Los dos casos frontera son una dirección
+ * idéntica a la del padre -no hay plano que preservar, pero la salida tiene que ser unitaria y
+ * separada, nunca NaN- y el ángulo cero como desactivación.
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoBranchAngle, "Eco.Arbol.AnguloDeInsercion", EcoTestFlags)
 bool FEcoBranchAngle::RunTest(const FString&) {
     const FVector Parent = FVector::UpVector;
     const float MinDeg = 45.f;
     const float CosMin = FMath::Cos(FMath::DegreesToRadians(MinDeg));
 
-    // 1) Una direccion casi paralela al padre se abre hasta el minimo exacto.
+    // 1) Una dirección casi paralela al padre se abre hasta el mínimo exacto.
     {
         const FVector Almost = FVector(0.05f, 0.f, 1.f).GetSafeNormal();
         const FVector Out = SpaceColonization::ApplyBranchAngle(Almost, Parent, MinDeg);
@@ -728,21 +889,21 @@ bool FEcoBranchAngle::RunTest(const FString&) {
             FMath::IsNearlyEqual((float)FVector::DotProduct(Out, Parent), CosMin, 1e-3f));
         TestTrue(TEXT("sigue siendo unitaria"), FMath::IsNearlyEqual((float)Out.Size(), 1.f, 1e-3f));
 
-        // El giro es MINIMO: se queda en el plano que formaban padre y direccion.
+        // El giro es MÍNIMO: se queda en el plano que formaban padre y dirección.
         const FVector PlaneN = FVector::CrossProduct(Parent, Almost).GetSafeNormal();
         TestTrue(TEXT("el giro se queda en el plano padre-direccion"),
             FMath::Abs((float)FVector::DotProduct(Out, PlaneN)) < 1e-3f);
     }
 
-    // 2) Una direccion que YA se separa lo suficiente no se toca.
+    // 2) Una dirección que YA se separa lo suficiente no se toca.
     {
         const FVector Wide = FVector(1.f, 0.f, 0.2f).GetSafeNormal();
         const FVector Out = SpaceColonization::ApplyBranchAngle(Wide, Parent, MinDeg);
         TestTrue(TEXT("no toca lo que ya se separaba"), Out.Equals(Wide, 1e-4));
     }
 
-    // 3) Caso degenerado: direccion IDENTICA al padre. No hay plano que
-    //    preservar, pero tiene que salir algo unitario y separado, no un NaN.
+    // 3) Caso degenerado: dirección IDÉNTICA a la del padre. No hay plano que preservar,
+    //    pero la salida sigue siendo unitaria y separada, no un NaN.
     {
         const FVector Out = SpaceColonization::ApplyBranchAngle(Parent, Parent, MinDeg);
         TestTrue(TEXT("caso paralelo: unitaria"), FMath::IsNearlyEqual((float)Out.Size(), 1.f, 1e-3f));
@@ -750,7 +911,7 @@ bool FEcoBranchAngle::RunTest(const FString&) {
             (float)FVector::DotProduct(Out, Parent) <= CosMin + 1e-3f);
     }
 
-    // 4) Angulo 0 = desactivado.
+    // 4) Ángulo 0: desactivación, la identidad.
     {
         const FVector Almost = FVector(0.05f, 0.f, 1.f).GetSafeNormal();
         TestTrue(TEXT("0 grados = desactivado"),
@@ -761,13 +922,20 @@ bool FEcoBranchAngle::RunTest(const FString&) {
 }
 
 /**
- * Seccion no circular SIN abrir la costura del tubo.
+ * Sección de tronco no circular SIN abrir la costura del tubo.
  *
- * Los vertices k = 0 y k = K de cada anillo son el MISMO punto, duplicado solo
- * para cerrar la UV en u = 1. Cualquier deformacion que no sea exactamente
- * periodica en el angulo los separa y abre una raja a lo largo de todo el
- * tronco. Es el fallo mas facil de introducir aqui y el mas dificil de
- * diagnosticar mirando la malla, asi que va como test y no como comentario.
+ * Los vértices @f$k = 0@f$ y @f$k = K@f$ de cada anillo son el MISMO punto, duplicado solo
+ * para cerrar la UV en @f$u = 1@f$. La deformación angular de la sección únicamente cierra si
+ * es exactamente periódica en el ángulo: cualquier término que no lo sea separa esos dos
+ * vértices y abre una raja a lo largo de todo el tronco.
+ *
+ * Sobre un árbol crecido y mallado de verdad se comprueban cinco cosas: costura cerrada bit a
+ * bit en posición y con la misma normal a los dos lados, sección que ya no es una
+ * circunferencia, normales recalculadas sobre la superficie deformada -y no solo la silueta-,
+ * ausencia de vértices degenerados y determinismo del par crecer-mallar.
+ *
+ * @note La costura se compara con igualdad exacta: una tolerancia la absorbería el
+ *       desplazamiento que el material de viento aplica después sobre esos mismos vértices.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoSectionSeam, "Eco.Arbol.SeccionYCostura", EcoTestFlags)
 bool FEcoSectionSeam::RunTest(const FString&) {
@@ -776,7 +944,7 @@ bool FEcoSectionSeam::RunTest(const FString&) {
     Sp->SectionLobeAmount = 0.15f;
     Sp->SectionLobeCount = 3;
     Sp->BarkReliefAmount = 0.06f;
-    Sp->RingSegments = 12;           // >= 8: el mallador no tiene que subirlo
+    Sp->RingSegments = 12;           // >= 8: el mallador no lo eleva por su cuenta
 
     uint32 Rng = 4242u;
     FTreeSkeleton Sk;
@@ -801,8 +969,7 @@ bool FEcoSectionSeam::RunTest(const FString&) {
         return false;
     }
 
-    // 1) COSTURA cerrada, bit a bit. No vale "casi igual": la tolerancia se la
-    //    come el desplazamiento del material al aplicar el viento.
+    // 1) Costura cerrada, bit a bit, en posición y en normal.
     for (int32 i = 0; i < N; ++i)
     {
         const int32 A = i * RingVerts;
@@ -820,7 +987,7 @@ bool FEcoSectionSeam::RunTest(const FString&) {
         }
     }
 
-    // 2) La seccion del tronco YA NO es una circunferencia.
+    // 2) La sección del tronco ya no es una circunferencia: se mide sobre el anillo del pie.
     {
         float MinR = TNumericLimits<float>::Max();
         float MaxR = 0.f;
@@ -833,9 +1000,8 @@ bool FEcoSectionSeam::RunTest(const FString&) {
         TestTrue(TEXT("la seccion del tronco no es circular"), MaxR > MinR * 1.02f);
     }
 
-    // 3) Las normales dejan de ser radiales puras: si no, el sombreado seguiria
-    //    leyendose como un cilindro liso y la deformacion solo estaria en la
-    //    silueta.
+    // 3) Las normales dejan de ser radiales puras: si lo fuesen, el sombreado seguiría
+    //    leyéndose como un cilindro liso y la deformación viviría solo en la silueta.
     {
         bool bAnyNonRadial = false;
         for (int32 k = 0; k < K && !bAnyNonRadial; ++k)
@@ -849,7 +1015,7 @@ bool FEcoSectionSeam::RunTest(const FString&) {
         TestTrue(TEXT("las normales se recalculan sobre la superficie deformada"), bAnyNonRadial);
     }
 
-    // 4) Ningun vertice degenerado (el clamp del radio tiene que sostenerse).
+    // 4) Ningún vértice degenerado: el recorte inferior del radio tiene que sostenerse.
     for (int32 v = 0; v < W.Vertices.Num(); ++v)
     {
         if (W.Vertices[v].ContainsNaN())
@@ -859,7 +1025,7 @@ bool FEcoSectionSeam::RunTest(const FString&) {
         }
     }
 
-    // 5) DETERMINISMO: misma semilla, misma malla exacta.
+    // 5) Determinismo: misma semilla, misma malla exacta.
     {
         uint32 Rng2 = 4242u;
         FTreeSkeleton Sk2; FTreeLightGridFine L2; FAttractorCloud C2;
@@ -881,20 +1047,25 @@ bool FEcoSectionSeam::RunTest(const FString&) {
 }
 
 /**
- * El eje atraviesa la copa y las ramas se reparten por el fuste.
+ * Arquitectura excurrente: el eje atraviesa la copa y las inserciones de rama se reparten en
+ * altura en vez de amontonarse a una sola cota.
  *
- * Es el test de la queja original: en copa conica el radio de la envolvente es
- * MAXIMO justo en la base de la copa, que era donde moria el tronco, asi que su
- * punta veia todos los atractores gordos y se los llevaba -> silueta de
- * paraguas. Con el lider recorriendo la copa, las inserciones tienen que
- * repartirse en altura.
+ * En una copa cónica el radio de la envolvente es MÁXIMO justo en la base de la copa. Si el eje
+ * muriese ahí, su punta se llevaría de golpe los atractores de la banda más ancha y todas las
+ * ramas nacerían a la misma altura: la silueta de paraguas. Con el líder recorriendo la copa,
+ * el detector mide qué fracción de las inserciones cuelga de la mitad baja y falla con el
+ * porcentaje medido si es demasiado pequeña.
+ *
+ * Las otras cuatro comprobaciones cierran la geometría resultante: el eje llega arriba y tiene
+ * varios nodos, la falda de sub-copa siembra atractores por debajo de la base de copa, el eje
+ * afila con la altura y ningún nodo se dispara muy por encima del ápice.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLeaderSpread, "Eco.Arbol.EjeYRepartoDeRamas", EcoTestFlags)
 bool FEcoLeaderSpread::RunTest(const FString&) {
     USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
     if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
     Sp->CrownShape = ECrownShape::Conical;
-    Sp->LeaderFraction = 1.f;        // conifera excurrente: el eje llega al apice
+    Sp->LeaderFraction = 1.f;        // conífera excurrente: el eje llega al ápice
     Sp->SubCrownFraction = 0.15f;
     Sp->EnvelopeNoise = 0.25f;
     Sp->BranchAngleDeg = 60.f;
@@ -909,12 +1080,13 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
     const int32 N = Sk.Num();
     if (N < 8) { AddError(TEXT("El SCA no produjo suficiente esqueleto.")); return false; }
 
+    // Cotas de referencia derivadas de los rasgos de la especie: base de copa y ápice.
     const float CrownH = Sp->CrownHeightCm;
     const float TrunkH = CrownH * Sp->TrunkFraction / (1.f - Sp->TrunkFraction);
     const float CrownBaseZ = TrunkH;
     const float ApexZ = CrownBaseZ + CrownH;
 
-    // 1) El eje llega ARRIBA, no muere en la base de la copa.
+    // 1) El eje llega arriba, no muere en la base de la copa.
     float AxisTopZ = 0.f;
     int32 AxisNodes = 0;
     for (int32 i = 0; i < N; ++i)
@@ -928,8 +1100,8 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
     TestTrue(TEXT("el eje atraviesa la copa"), AxisTopZ > CrownBaseZ + CrownH * 0.6f);
     TestTrue(TEXT("el eje tiene varios nodos"), AxisNodes >= 4);
 
-    // 2) Las INSERCIONES de rama (nodos no-eje colgados del eje) se reparten en
-    //    altura en vez de amontonarse en la punta del fuste.
+    // 2) Las inserciones -nodos no-eje colgados del eje- se reparten en altura en vez de
+    //    amontonarse en la punta del fuste.
     int32 TotalInsertions = 0;
     int32 LowInsertions = 0;              // por debajo de la mitad de la copa
     const float MidZ = CrownBaseZ + CrownH * 0.5f;
@@ -954,7 +1126,7 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
         }
     }
 
-    // 3) La falda de sub-copa siembra atractores POR DEBAJO de la base de copa.
+    // 3) La falda de sub-copa siembra atractores por debajo de la base de copa.
     {
         int32 BelowCrown = 0;
         for (const FAttractor& A : Cloud.Attractors)
@@ -964,8 +1136,8 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
         TestTrue(TEXT("la falda siembra bajo la base de copa"), BelowCrown > 0);
     }
 
-    // 4) El eje afila con la altura: es el "cuanto mas alto, menos grueso" que
-    //    sale del pipe model en cuanto hay ramas laterales repartidas.
+    // 4) El eje afila con la altura, que es lo que da el pipe model en cuanto hay ramas
+    //    laterales repartidas a lo largo del fuste.
     {
         int32 LowAxis = INDEX_NONE, HighAxis = INDEX_NONE;
         for (int32 i = 0; i < N; ++i)
@@ -981,7 +1153,7 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
         }
     }
 
-    // 5) La copa no se sale de la envolvente por arriba (el eje no se dispara).
+    // 5) La copa no se sale de la envolvente por arriba: ni el eje ni el SCA se disparan.
     for (int32 i = 0; i < N; ++i)
     {
         if (Sk.Nodes[i].Pos.Z > ApexZ + CrownH * 0.5f)
@@ -996,11 +1168,19 @@ bool FEcoLeaderSpread::RunTest(const FString&) {
 
 
 // ---------------------------------------------------------------------------
-// Deformacion de tronco por arbol (arqueado / torcido)
+// Deformación de tronco por árbol (arqueado y torcido)
 // ---------------------------------------------------------------------------
 
-/** Crece un arbol de prueba y devuelve el esqueleto. Centraliza el boilerplate
-    de los tests de deformacion (que crecen el mismo arbol muchas veces). */
+/**
+ * Crece un árbol de prueba completo y devuelve su esqueleto. Concentra el andamiaje que
+ * comparten los tests de deformación, que crecen el mismo árbol muchas veces.
+ *
+ * @param Seed               Semilla del flujo de CRECIMIENTO, distinta de la de curvatura.
+ * @param DeformSeedOverride Identidad de curvatura impuesta desde fuera; -1 la deja derivarse
+ *                           del propio árbol.
+ * @param OutFinalRng        Si no es nulo, recibe el estado del flujo tras crecer, con el que
+ *                           se comprueba que una capa de deformación no lo desplaza.
+ */
 static void EcoGrowTestTree(const USpeciesData& Sp, uint32 Seed, FTreeSkeleton& OutSk,
     int64 DeformSeedOverride = -1, uint32* OutFinalRng = nullptr)
 {
@@ -1013,7 +1193,8 @@ static void EcoGrowTestTree(const USpeciesData& Sp, uint32 Seed, FTreeSkeleton& 
     if (OutFinalRng) { *OutFinalRng = Rng; }
 }
 
-/** Anade una capa de deformacion al asset de prueba. */
+/** Añade una capa de deformación al asset de especie de prueba, con su puerta de probabilidad
+    y su rango de ángulo en grados. */
 static void EcoAddDeformLayer(USpeciesData& Sp, ETrunkDeformType Type, float Probability,
     float MinDeg, float MaxDeg, float ShapeParam)
 {
@@ -1026,8 +1207,13 @@ static void EcoAddDeformLayer(USpeciesData& Sp, ETrunkDeformType Type, float Pro
     Sp.TrunkDeformLayers.Add(L);
 }
 
-/** Desplazamiento horizontal de la punta del arbol respecto a la base, en
-    fraccion de su altura. Es la medida de "cuanto se ha doblado". */
+/**
+ * Desvío de punta: desplazamiento horizontal del nodo más alto respecto a la base, en fracción
+ * de la altura alcanzada. Es la única magnitud escalar con la que los cuatro tests de
+ * deformación comparan formas de árbol.
+ *
+ * @return Razón adimensional, o 0 si el árbol es degenerado y no levanta del suelo.
+ */
 static float EcoTipLeanRatio(const FTreeSkeleton& Sk)
 {
     int32 Top = INDEX_NONE;
@@ -1043,14 +1229,14 @@ static float EcoTipLeanRatio(const FTreeSkeleton& Sk)
 }
 
 /**
- * SIN capas: el arbol tiene que salir BIT A BIT como salia antes de que este
- * sistema existiera, y el stream RNG principal tiene que quedar en el mismo
- * sitio.
+ * Aislamiento del flujo de deformación. Una especie con una capa presente pero IMPOSIBLE
+ * -probabilidad 0- tiene que dar el mismo árbol, bit a bit, que la especie sin capas, y dejar
+ * el flujo principal exactamente donde lo dejaría ésta.
  *
- * Lo segundo es lo que de verdad se esta probando: el deformador consume un
- * sub-stream derivado por hash, no RngState. Si algun dia alguien lo "simplifica"
- * tirando del stream principal, la copa de TODOS los arboles cambiaria al anadir
- * una capa a UNA especie, y este test es el unico sitio donde eso se ve.
+ * Lo segundo es lo que de verdad se prueba: el deformador extrae siempre sus muestras de un
+ * sub-flujo derivado por hash y no del estado vivo del árbol. Si tirase del flujo principal,
+ * añadir una capa a UNA especie desplazaría la secuencia y cambiaría la copa de todos los
+ * árboles del bosque.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformNoOp, "Eco.Arbol.DeformNoOp", EcoTestFlags)
 bool FEcoDeformNoOp::RunTest(const FString&) {
@@ -1058,8 +1244,8 @@ bool FEcoDeformNoOp::RunTest(const FString&) {
     USpeciesData* WithLayers = EcoTestSpecies(GetTransientPackage());
     if (!Base || !WithLayers) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
 
-    // Capa presente pero IMPOSIBLE: sigue consumiendo sus 4 muestras del
-    // sub-stream, que es justo lo que no debe notarse fuera.
+    // La capa sigue consumiendo sus cuatro muestras del sub-flujo aunque nunca se active:
+    // ese gasto fijo es parte del contrato y no debe notarse desde fuera.
     EcoAddDeformLayer(*WithLayers, ETrunkDeformType::Arc, /*Probability*/ 0.f, 10.f, 30.f, 1.5f);
 
     FTreeSkeleton A, B;
@@ -1080,13 +1266,20 @@ bool FEcoDeformNoOp::RunTest(const FString&) {
 }
 
 /**
- * La deformacion es una ISOMETRIA: dobla el arbol sin estirarlo.
+ * La deformación es una ISOMETRÍA: dobla el árbol sin estirarlo. El re-encadenado rota el
+ * vector al padre nodo a nodo, de modo que la curvatura se acumula a lo largo del fuste y cada
+ * longitud de internodo se conserva.
  *
- * Es la propiedad de la que cuelga todo lo demas. Si las longitudes de internodo
- * cambiasen, la longitud de arco cambiaria con ellas, y con ella el ensanche del
- * pie y el afilado del fuste (ApplyTrunkProfile trabaja sobre AlongLen) y las UV
- * de la corteza: un arbol arqueado tendria el pie de otro tamano que su gemelo
- * recto, cuando el punto entero es que sea el MISMO arbol doblado.
+ * Es la propiedad de la que cuelga el resto de la geometría. El perfil de tronco trabaja sobre
+ * la longitud de arco acumulada y las UV de la corteza también: si las longitudes cambiasen al
+ * doblar, un árbol arqueado tendría el pie de otro tamaño que su gemelo recto, cuando debe ser
+ * el MISMO árbol doblado. De ahí que el doblado se aplique antes que el perfil, y que el test
+ * cierre comprobando que el radio del pie es el mismo en los dos.
+ *
+ * Se exige además que la topología no cambie -la deformación solo mueve nodos-, que la raíz
+ * siga plantada donde estaba y que ningún nodo salga con NaN ni con dirección no unitaria.
+ *
+ * @see @ref bib_barr1984
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformIsometry, "Eco.Arbol.DeformIsometria", EcoTestFlags)
 bool FEcoDeformIsometry::RunTest(const FString&) {
@@ -1094,12 +1287,12 @@ bool FEcoDeformIsometry::RunTest(const FString&) {
     if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
     Sp->LeaderFraction = 1.f;
 
-    // Arbol de referencia SIN deformar.
+    // Árbol de referencia sin deformar.
     FTreeSkeleton Straight;
     EcoGrowTestTree(*Sp, 31337u, Straight);
     if (Straight.Num() < 8) { AddError(TEXT("El SCA no produjo esqueleto.")); return false; }
 
-    // El MISMO arbol (misma semilla de crecimiento) con una capa segura.
+    // El MISMO árbol -misma semilla de crecimiento- con una capa determinista de 25 grados.
     EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, /*Probability*/ 1.f, 25.f, 25.f, 1.f);
     FTreeSkeleton Bent;
     EcoGrowTestTree(*Sp, 31337u, Bent);
@@ -1135,12 +1328,12 @@ bool FEcoDeformIsometry::RunTest(const FString&) {
     TestTrue(FString::Printf(TEXT("las longitudes de internodo se conservan (peor error %.4f cm)"), WorstError),
         WorstError < 0.05f);
 
-    // La raiz no se mueve: el arbol sigue plantado donde estaba.
+    // La raíz no se mueve: el árbol sigue plantado donde estaba.
     TestTrue(TEXT("la base del tronco no se mueve"),
         Bent.Nodes[0].Pos.Equals(Straight.Nodes[0].Pos, 1e-3));
 
-    // Y el perfil de tronco sale IGUAL, porque depende de la longitud de arco:
-    // esa es la razon de aplicar el doblado antes de ApplyTrunkProfile.
+    // Corolario de la isometría: el perfil de tronco sale igual porque la longitud de arco
+    // sobre la que se calcula es invariante.
     TestTrue(TEXT("el radio del pie es el mismo doblado que recto"),
         FMath::IsNearlyEqual(Bent.Nodes[0].Radius, Straight.Nodes[0].Radius, 0.05f));
 
@@ -1148,13 +1341,17 @@ bool FEcoDeformIsometry::RunTest(const FString&) {
 }
 
 /**
- * Arc arquea de verdad, y mas angulo = mas arqueo (monotonia).
+ * La capa de arco arquea de verdad, y más ángulo da más arqueo. Se comparan tres árboles con
+ * la misma semilla de crecimiento -sin capa, 15 grados y 30 grados- por su desvío de punta.
  *
- * El umbral se calibra desde la propia formula del deformador y no a ojo: con
- * alfa(t) = Angle * t^k, el desplazamiento de la punta es
- * aproximadamente H*Angle/(k+1). Con Angle = 30 grados (0.524 rad) y k = 1 sale
- * ~0.26*H si el eje llegase al apice; se pide bastante menos para dejar margen a
- * que la punta mas alta sea una rama de copa y no el propio eje.
+ * Los umbrales se derivan de la fórmula del deformador y no se ajustan a ojo: con
+ * @f$\alpha(t) = \theta t^{k}@f$, el desplazamiento de la punta es del orden de
+ * @f$H\theta/(k+1)@f$, o sea @f$\approx 0{,}26H@f$ con 30 grados y @f$k = 1@f$ si el eje
+ * llegase al ápice. Se pide bastante menos, porque el nodo más alto puede ser una rama de copa
+ * y no el propio eje.
+ *
+ * @note La sinuosidad base del tronco se anula en la especie de prueba para que lo medido sea
+ *       solo la capa.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformArcs, "Eco.Arbol.DeformArquea", EcoTestFlags)
 bool FEcoDeformArcs::RunTest(const FString&) {
@@ -1162,8 +1359,8 @@ bool FEcoDeformArcs::RunTest(const FString&) {
         {
             USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
             if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
-            Sp->LeaderFraction = 1.f;   // el eje llega al apice: el arqueo se lee entero
-            Sp->TrunkSweepDeg = 0.f;    // aisla la deformacion de la sinuosidad base
+            Sp->LeaderFraction = 1.f;   // el eje llega al ápice: el arqueo se lee entero
+            Sp->TrunkSweepDeg = 0.f;    // aísla la deformación de la sinuosidad base
             Sp->TrunkWobbleDeg = 0.f;
             if (AngleDeg > 0.f)
             {
@@ -1192,14 +1389,18 @@ bool FEcoDeformArcs::RunTest(const FString&) {
 }
 
 /**
- * La probabilidad se respeta: con p = 0.5 se doblan aproximadamente la mitad de
- * los arboles, y CADA UNO de forma distinta.
+ * Validación estadística de la puerta de probabilidad: con @f$p = 0{,}5@f$ se dobla
+ * aproximadamente la mitad de los árboles, cada ángulo cae dentro del rango declarado en el
+ * asset y los ángulos sorteados son mayoritariamente distintos entre sí, no una única forma
+ * repetida.
  *
- * Es lo que pedia el diseño ("cada arbol tiene una probabilidad de crecer
- * arqueado"), y el unico test que lo comprueba como distribucion y no como caso
- * particular. Se mide sobre el muestreo (TrunkDeformer::Sample) y no creciendo
- * 200 arboles: el SCA completo x200 dentro de la bateria de tests es carisimo, y
- * la puerta de probabilidad vive entera en Sample.
+ * La segunda mitad prueba el contrato de muestreo por capas. Dos especies que solo difieren en
+ * la probabilidad de su PRIMERA capa tienen que producir exactamente el mismo azimut en la
+ * última: cada capa extrae siempre el mismo número de valores y la puerta se aplica después, de
+ * modo que recalibrar una capa no re-reparte las formas de todo el bosque.
+ *
+ * @note Se mide sobre el muestreo y no creciendo doscientos árboles: la puerta de probabilidad
+ *       vive entera ahí y un SCA completo por muestra no cabe en el presupuesto de la batería.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformProbability, "Eco.Arbol.DeformProbabilidad", EcoTestFlags)
 bool FEcoDeformProbability::RunTest(const FString&) {
@@ -1233,9 +1434,7 @@ bool FEcoDeformProbability::RunTest(const FString&) {
         Frac > 0.45f && Frac < 0.55f);
     TestTrue(TEXT("cada arbol doblado recibe su propio angulo"), DistinctAngles.Num() > Bent / 2);
 
-    // Editar la Probability de una capa NO puede desplazar las muestras de las
-    // siguientes: es el contrato de muestreo de TrunkDeformer y lo que permite
-    // recalibrar un asset sin re-repartir formas por todo el bosque.
+    // Editar la probabilidad de una capa no puede desplazar las muestras de las siguientes.
     {
         USpeciesData* Two = EcoTestSpecies(GetTransientPackage());
         USpeciesData* TwoEdited = EcoTestSpecies(GetTransientPackage());
@@ -1244,7 +1443,7 @@ bool FEcoDeformProbability::RunTest(const FString&) {
         EcoAddDeformLayer(*Two, ETrunkDeformType::Lean, 0.5f, 5.f, 8.f, 1.f);
         EcoAddDeformLayer(*Two, ETrunkDeformType::Arc, 1.f, 20.f, 20.f, 1.f);
 
-        EcoAddDeformLayer(*TwoEdited, ETrunkDeformType::Lean, 0.9f, 5.f, 8.f, 1.f); // <- solo cambia esto
+        EcoAddDeformLayer(*TwoEdited, ETrunkDeformType::Lean, 0.9f, 5.f, 8.f, 1.f); // única diferencia
         EcoAddDeformLayer(*TwoEdited, ETrunkDeformType::Arc, 1.f, 20.f, 20.f, 1.f);
 
         bool bStable = true;
@@ -1254,7 +1453,7 @@ bool FEcoDeformProbability::RunTest(const FString&) {
             const TrunkDeformer::FTrunkDeformState A = TrunkDeformer::Sample(*Two, Seed);
             const TrunkDeformer::FTrunkDeformState B = TrunkDeformer::Sample(*TwoEdited, Seed);
 
-            // La capa Arc (p=1) esta siempre; es la ULTIMA de cada estado.
+            // La capa de arco tiene probabilidad 1: está siempre y es la ÚLTIMA de cada estado.
             bStable = !A.IsIdentity() && !B.IsIdentity()
                 && FMath::IsNearlyEqual(A.Layers.Last().AzimuthRad, B.Layers.Last().AzimuthRad, 1e-6f);
         }
@@ -1265,11 +1464,17 @@ bool FEcoDeformProbability::RunTest(const FString&) {
 }
 
 /**
- * La IDENTIDAD de la deformacion viaja aparte de la semilla de crecimiento.
+ * La identidad de curvatura viaja aparte de la semilla de crecimiento. Es el mecanismo del que
+ * dependen las dos cosas que no pueden fallar en el render instanciado: que un árbol no se
+ * enderece al cruzar de bucket de edad, y que no se enderece al promocionar a hero tree delante
+ * del jugador.
  *
- * Es el mecanismo del que dependen las dos cosas que no pueden fallar en el
- * render instanciado: que un arbol no se enderece al cruzar de bucket de edad, y
- * que no se enderece al promocionar a hero delante del jugador.
+ * El primer bloque comprueba que la semilla de deformación de una variante ignora el bucket de
+ * edad -y sí distingue variantes y especies-, pasando por las claves de arquetipo reales para
+ * atrapar el fallo de que el bucket acabe entrando en la fórmula. El segundo hace crecer dos
+ * árboles con semillas de crecimiento distintas pero la misma identidad impuesta y exige que se
+ * doblen igual, que es el puente entre hero tree e instancia. El tercero cierra con determinismo
+ * puro.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformIdentity, "Eco.Arbol.DeformIdentidad", EcoTestFlags)
 bool FEcoDeformIdentity::RunTest(const FString&) {
@@ -1280,11 +1485,8 @@ bool FEcoDeformIdentity::RunTest(const FString&) {
     Sp->TrunkWobbleDeg = 0.f;
     EcoAddDeformLayer(*Sp, ETrunkDeformType::Arc, 1.f, 25.f, 25.f, 1.f);
 
-    // 1) Dos claves de arquetipo que SOLO difieren en el bucket de edad tienen
-    //    que dar la misma semilla de deformacion: es la garantia de "un arbol no
-    //    se endereza al crecer". Se comprueba pasando por las claves reales,
-    //    porque el fallo que se quiere atrapar es que alguien meta el bucket en
-    //    la formula.
+    // 1) Dos claves de arquetipo que solo difieren en el bucket de edad dan la misma semilla
+    //    de deformación: un árbol no se endereza al crecer.
     {
         const FArchetypeKey Young(/*Species*/ 1, /*AgeBucket*/ 0, /*Variant*/ 2);
         const FArchetypeKey Old(/*Species*/ 1, /*AgeBucket*/ 4, /*Variant*/ 2);
@@ -1297,8 +1499,8 @@ bool FEcoDeformIdentity::RunTest(const FString&) {
     TestNotEqual(TEXT("especies distintas reciben curvaturas distintas"),
         UTreeLibrary::VariantDeformSeed(0, 1), UTreeLibrary::VariantDeformSeed(2, 1));
 
-    // 2) Dos arboles con semillas de CRECIMIENTO distintas pero el mismo
-    //    DeformSeedOverride se doblan igual (hero <-> instancia).
+    // 2) Dos árboles con semillas de crecimiento distintas pero la misma identidad de
+    //    curvatura impuesta se doblan igual: es el puente hero tree <-> instancia.
     const int64 Override = static_cast<int64>(UTreeLibrary::VariantDeformSeed(0, 1));
     FTreeSkeleton HeroLike, InstanceLike;
     EcoGrowTestTree(*Sp, 111u, HeroLike, Override);
@@ -1309,7 +1511,7 @@ bool FEcoDeformIdentity::RunTest(const FString&) {
     TestTrue(FString::Printf(TEXT("mismo override -> misma curvatura (%.3f vs %.3f)"), LeanA, LeanB),
         FMath::Abs(LeanA - LeanB) < 0.05f);
 
-    // 3) Determinismo puro: misma semilla, misma geometria exacta.
+    // 3) Determinismo puro: misma semilla, misma geometría exacta.
     {
         FTreeSkeleton R1, R2;
         EcoGrowTestTree(*Sp, 4444u, R1);
@@ -1326,11 +1528,13 @@ bool FEcoDeformIdentity::RunTest(const FString&) {
 }
 
 /**
- * El tope de doblado acumulado se sostiene aunque el asset pida un disparate.
+ * El tope de doblado acumulado se sostiene aunque el asset pida un disparate. Cuatro capas de
+ * inclinación de 45 grados suman 180 nominales: es un error de edición, no un caso de uso, pero
+ * la salida tiene que ser un árbol raro y no NaN, geometría invertida o un tronco tumbado.
  *
- * Un asset con cuatro capas a 45 grados es un error de edicion, no un caso de
- * uso, pero tiene que salir un arbol raro y no NaN, geometria invertida o un
- * arbol tumbado en el suelo.
+ * El recorte actúa sobre la MAGNITUD del vector de doblado ya sumado y preserva su dirección,
+ * no capa a capa. El umbral del desvío de punta se deriva de ese tope -1 rad, unos 57 grados,
+ * cuya tangente vale ~1,55- más margen para las ramas de copa que salen hacia el lado del vuelco.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoDeformClamp, "Eco.Arbol.DeformTope", EcoTestFlags)
 bool FEcoDeformClamp::RunTest(const FString&) {
@@ -1355,8 +1559,7 @@ bool FEcoDeformClamp::RunTest(const FString&) {
         }
     }
 
-    // MaxTrunkBendRad = 1 rad (~57 grados): tan(57) ~ 1.55, con margen para las
-    // ramas de copa que salen hacia el lado del vuelco.
+    // Umbral derivado del tope de doblado, con margen para las ramas de copa.
     const float Lean = EcoTipLeanRatio(Sk);
     TestTrue(FString::Printf(TEXT("el tope acota el vuelco (%.2f)"), Lean), Lean < 2.5f);
     TestTrue(TEXT("el arbol sigue creciendo hacia arriba"), Sk.Nodes[Sk.Num() - 1].Pos.Z > 0.0);
@@ -1365,14 +1568,18 @@ bool FEcoDeformClamp::RunTest(const FString&) {
 
 
 // ---------------------------------------------------------------------------
-// Relieve realista (ruido reparametrizado + erosion)
+// Relieve: síntesis por ruido reparametrizado y erosión
 // ---------------------------------------------------------------------------
 
-/** Parametros compactos para los tests: la MISMA extension de ~1 km del juego
-    (misma fisica de pendientes) pero a media resolucion, y erosion abreviada,
-    para que la bateria siga siendo rapida. Ojo: encoger el mapa sin encoger
-    HeightScaleCm cambiaria la fisica (300 m de desnivel en 256 m de mapa es
-    empinado por construccion). */
+/**
+ * Parámetros de relieve reducidos para la batería: la MISMA extensión de ~1 km y la misma
+ * amplitud vertical que el mapa real, pero a media resolución y con la erosión abreviada.
+ *
+ * Lo que se baja es la resolución, nunca la extensión ni la escala de altura: encoger el mapa
+ * dejando el desnivel intacto cambiaría la física de pendientes -300 m de caída en 256 m de
+ * mapa son empinados por construcción- y los umbrales de los tests de pendiente dejarían de
+ * significar nada.
+ */
 static FTerrainGenParams EcoTestTerrainParams(uint32 Seed)
 {
     FTerrainGenParams P;
@@ -1386,7 +1593,14 @@ static FTerrainGenParams EcoTestTerrainParams(uint32 Seed)
     return P;
 }
 
-/** Pendiente |dh|/dist maxima y media entre vecinos 4-conexos. */
+/**
+ * Pendiente máxima y media del campo, medidas como @f$|\Delta h| / CellSize@f$ entre vecinos
+ * 4-conexos. Solo se miran las diferencias hacia delante, para no contar cada arista dos veces,
+ * y la suma se acumula en `double` porque son cientos de miles de aristas.
+ *
+ * @note La pendiente resultante es una TANGENTE adimensional, no un ángulo: 0,65 son unos 33
+ *       grados y 4,2 unos 76. Los umbrales de los tests de relieve están escritos en esa unidad.
+ */
 static void EcoTestSlopeStats(const FField2D& F, float& OutMax, float& OutMean)
 {
     OutMax = 0.f;
@@ -1413,10 +1627,18 @@ static void EcoTestSlopeStats(const FField2D& F, float& OutMax, float& OutMean)
     OutMean = (Count > 0) ? static_cast<float>(Sum / Count) : 0.f;
 }
 
+/**
+ * Determinismo bit a bit del relieve completo: dos mapas generados con la misma semilla se
+ * comparan elemento a elemento, sin tolerancia, y una semilla distinta debe dar un mapa
+ * distinto.
+ *
+ * Cubre la cadena entera -ruido, 8.000 gotas hidráulicas y ocho iteraciones térmicas-, y la
+ * parte hidráulica es serial por construcción: cada gota ve el resultado de las anteriores.
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainDeterminism, "Eco.Relieve.Determinismo", EcoTestFlags)
 bool FEcoTerrainDeterminism::RunTest(const FString&)
 {
-    // Pipeline COMPLETO (ruido + gotas + termica): misma semilla, mismo mapa.
+    // Cadena completa: ruido + gotas + térmica.
     FHeightField A, B;
     A.Generate(EcoTestTerrainParams(777u));
     B.Generate(EcoTestTerrainParams(777u));
@@ -1430,12 +1652,22 @@ bool FEcoTerrainDeterminism::RunTest(const FString&)
     return true;
 }
 
+/**
+ * Recorte de octavas por el límite de muestreo de la rejilla: una octava cuya longitud de onda
+ * cae por debajo del doble del tamaño de celda no es representable y solo aporta aliasing, así
+ * que se descarta antes de sumarla.
+ *
+ * Los cuatro casos están calculados a mano sobre una octava base de 700 m con lacunaridad 2, e
+ * incluyen los dos bordes del contrato: nunca se devuelve menos de una octava y nunca se
+ * añaden más de las pedidas.
+ *
+ * @see @ref bib_nyquistshannon
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainNyquist, "Eco.Relieve.Nyquist", EcoTestFlags)
 bool FEcoTerrainNyquist::RunTest(const FString&)
 {
-    // 700 m de octava base, celda de 2 m (limite 4 m): caben las octavas
-    // 700, 350, ..., 5.47 m -> 8 de 12. Con celda de 30 m (limite 60 m)
-    // caben 700, 350, 175, 87.5 m -> 4.
+    // Octava base de 700 m. Con celda de 2 m el límite es 4 m y caben 8 de las 12 octavas;
+    // con celda de 30 m el límite es 60 m y solo caben las cuatro más largas.
     TestEqual(TEXT("celda 2 m -> 8 octavas"),
         EcoNoise::ClampOctavesToNyquist(12, 70000.0, 2.0, 200.0), 8);
     TestEqual(TEXT("celda 30 m -> 4 octavas"),
@@ -1447,14 +1679,23 @@ bool FEcoTerrainNyquist::RunTest(const FString&)
     return true;
 }
 
+/**
+ * Estadística de pendientes del ruido puro, con la erosión desactivada para medir solo la
+ * síntesis: la pendiente media debe quedar en valores de relieve y no de agujas, y no debe
+ * haber paredes verticales.
+ *
+ * La última aserción detecta aliasing con independencia de la amplitud del mapa: el salto entre
+ * dos celdas vecinas no puede pasar de una cuarta parte de la amplitud total, cota que un
+ * campo con picos de un vértice de ancho no cumple.
+ *
+ * @note Los umbrales llevan margen deliberado sobre los valores medidos, porque el resultado
+ *       varía entre semillas y la implementación de Perlin puede diferir entre plataformas.
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainSlopes, "Eco.Relieve.PendientesRealistas", EcoTestFlags)
 bool FEcoTerrainSlopes::RunTest(const FString&)
 {
-    // Solo el RUIDO (sin erosion): con la reparametrizacion (formas de cientos
-    // de metros, recorte de Nyquist) las pendientes ya deben ser de relieve,
-    // no de agujas. El generador antiguo daba pendientes medias de ~83 grados;
-    // el nuevo, ~17 (medido: media 0.314, max 2.62; umbrales con margen para
-    // la diferencia entre semillas y el Perlin de cada plataforma).
+    // Solo el ruido: formas de cientos de metros y octavas recortadas a Nyquist.
+    // Valores medidos con estos parámetros: media 0.314, máximo 2.62.
     FTerrainGenParams P = EcoTestTerrainParams(12345u);
     P.bErosion = false;
     FHeightField HF;
@@ -1465,8 +1706,7 @@ bool FEcoTerrainSlopes::RunTest(const FString&)
     TestTrue(TEXT("pendiente media < 33 grados"), MeanSlope < 0.65f);
     TestTrue(TEXT("sin paredes verticales (max < 76 grados)"), MaxSlope < 4.2f);
 
-    // Sin aliasing: el salto entre celdas vecinas es una fraccion pequena de
-    // la amplitud total (con pinchos por vertice llegaba a ~la amplitud).
+    // El salto entre celdas vecinas es una fracción pequeña de la amplitud total del mapa.
     float Mn, Mx;
     FField2D::MinMax(HF.Field.Data, Mn, Mx);
     const float Amplitude = Mx - Mn;
@@ -1475,6 +1715,20 @@ bool FEcoTerrainSlopes::RunTest(const FString&)
     return true;
 }
 
+/**
+ * Estabilidad de las dos erosiones, medidas por separado.
+ *
+ * La cadena completa -hidráulica más térmica- debe dejar todas las alturas finitas y el rango
+ * acotado respecto al original con un margen del 5 % de la amplitud: la erosión no crea
+ * material de la nada ni cava por debajo del mínimo previo. Deliberadamente NO se exige
+ * suavizado, porque la hidráulica talla barrancos y puede subir la pendiente media, y eso es
+ * relieve, no un defecto.
+ *
+ * La térmica sola, con parámetros agresivos, sí tiene que recortar la pendiente máxima hacia el
+ * ángulo de talud sin empinar el terreno en media, y sobre todo CONSERVAR LA MASA: la suma de
+ * alturas antes y después difiere menos de una diezmilésima relativa. Es la firma de un esquema
+ * gather de dos pasadas con doble buffer, que solo redistribuye material entre vecinos.
+ */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoTerrainErosion, "Eco.Relieve.ErosionEstable", EcoTestFlags)
 bool FEcoTerrainErosion::RunTest(const FString&)
 {
@@ -1489,9 +1743,8 @@ bool FEcoTerrainErosion::RunTest(const FString&)
     FField2D::MinMax(HF.Field.Data, MnB, MxB);
     const float Amplitude = MxB - MnB;
 
-    // 1) Pipeline completo (hidraulica + termica): acotado y finito. OJO: la
-    //    pendiente MEDIA puede subir un poco (la hidraulica talla barrancos:
-    //    eso es relieve, no un bug), asi que aqui no se asserta suavizado.
+    // 1) Cadena completa (hidráulica + térmica): finita y acotada. No se comprueba suavizado,
+    //    porque la hidráulica talla barrancos y puede subir la pendiente media.
     TerrainErosion::FHydraulicParams Hyd; Hyd.Droplets = 8000;
     TerrainErosion::FThermalParams Th;   Th.Iterations = 8;
     TerrainErosion::HydraulicErode(HF.Field, 99u, Hyd);
@@ -1506,9 +1759,8 @@ bool FEcoTerrainErosion::RunTest(const FString&)
     TestTrue(TEXT("la erosion no crea material de la nada"), Mx <= MxB + 0.05f * Amplitude);
     TestTrue(TEXT("la erosion no cava bajo el minimo original"), Mn >= MnB - 0.05f * Amplitude);
 
-    // 2) Termica SOLA y agresiva (talud 20, 30 iters): SI debe recortar las
-    //    pendientes maximas hacia el talud sin ganar masa (medido: max
-    //    2.55 -> 1.57 con estos parametros).
+    // 2) Térmica sola y agresiva sobre un mapa fresco: recorta la pendiente máxima hacia el
+    //    ángulo de talud sin ganar masa (medido: máximo 2.55 -> 1.57).
     FTerrainGenParams P2 = EcoTestTerrainParams(4321u);
     P2.bErosion = false;
     FHeightField HT;

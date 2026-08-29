@@ -1,8 +1,17 @@
-#include "Core/EcoStats.h"
+/**
+ * @file EcoStats.cpp
+ * @author Juan Luque Roldán
+ * @brief Definición de los contadores de stats y de la categoría CSV declarados en
+ *        EcoStats.h.
+ *
+ * Única unidad de traducción del módulo Core: aporta el símbolo de cada
+ * DECLARE_*_EXTERN, sin el cual el enlazado falla, y define la categoría Eco del CSV
+ * profiler. No contiene lógica.
+ *
+ * @ingroup eco_core
+ */
 
-// Definicion (una sola unidad de traduccion) de los contadores declarados en
-// EcoStats.h. Sin este .cpp los DECLARE_*_EXTERN quedan sin simbolo y el
-// enlazado falla.
+#include "Core/EcoStats.h"
 
 DEFINE_STAT(STAT_EcoTickTotal);
 DEFINE_STAT(STAT_EcoHash);
@@ -23,7 +32,7 @@ DEFINE_STAT(STAT_EcoNumInstance);
 DEFINE_STAT(STAT_EcoNumImpostor);
 DEFINE_STAT(STAT_EcoNumCulled);
 
-// La categoria arranca ACTIVADA: si el usuario lanza una captura con Csv.Start
-// (o con Eco.Frame.Capture) sale con las columnas del ecosistema puestas, sin
-// tener que acordarse de `CsvCategory Eco 1`.
+// La categoria arranca ACTIVADA: una captura lanzada con Csv.Start o con
+// Eco.Frame.Capture sale ya con las columnas del ecosistema, sin tener que
+// habilitarla antes con `CsvCategory Eco 1`.
 CSV_DEFINE_CATEGORY(Eco, true);

@@ -1,25 +1,55 @@
+/**
+ * @file EcoCore.h
+ * @author Juan Luque Roldán
+ * @brief Cimiento de reproducibilidad del simulador: generador xorshift32, hashes
+ *        estables y streams de RNG derivados de una única semilla maestra.
+ *
+ * Concentra en un solo sitio todo aquello cuya duplicación rompería el determinismo
+ * del ecosistema. Ofrece dos caminos que no se mezclan: las funciones `Next*`
+ * consumen un estado explícito y son exclusivas de la simulación, con un orden de
+ * consumo que forma parte del contrato; las funciones `Hash*` son puras y sin
+ * estado, de modo que mallador, viento y render obtienen aleatoriedad estable sin
+ * desplazar la secuencia que gasta la simulación. De la semilla maestra salen, por
+ * derivación, tanto los streams por subsistema (@ref FEcosystemRng) como las
+ * semillas del terreno, del ruido y de los arquetipos.
+ *
+ * @ingroup eco_core
+ * @see @ref bib_marsaglia2003
+ * @see @ref bib_salmon2011
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "EcoCore.generated.h"
 
-// NOTA: la categoría de log LogEco NO se declara aquí. Meter
-// DECLARE_LOG_CATEGORY_EXTERN en una cabecera reflejada por UHT (con UENUM/
-// USTRUCT) hace que UHT deje de registrar los tipos siguientes. Como solo la
-// usa EcosystemSubsystem.cpp, allí se declara y define con
-// DEFINE_LOG_CATEGORY_STATIC.
+// La categoría de log LogEco NO se declara aquí: un DECLARE_LOG_CATEGORY_EXTERN en
+// una cabecera reflejada por UHT (con UENUM/USTRUCT) hace que UHT deje de registrar
+// los tipos que vengan detrás. Como solo la usa EcosystemSubsystem.cpp, allí se
+// declara y define con DEFINE_LOG_CATEGORY_STATIC.
 
 /**
- * RNG determinista y ligero (xorshift32). El estado cabe en un uint32, de modo
- * que en la Fase 2 cada árbol podrá llevar su propio stream sin coste extra.
+ * @brief Aleatoriedad reproducible del proyecto: xorshift32 con estado explícito y
+ *        valores estables derivados por hash.
  *
- * REGLA DE ORO de reproducibilidad: NUNCA uses FMath::Rand()/rand() globales
- * en la simulación. Todo lo estocástico sale de estos streams. Así una misma
- * semilla da SIEMPRE el mismo bosque, y el resultado no depende del hilo que
- * procese cada agente (clave para paralelizar en Fase 2).
+ * Regla de oro de reproducibilidad: nada estocástico sale de `FMath::Rand()` ni de
+ * `rand()`; todo pasa por un estado que aporta el llamador. Así una misma semilla da
+ * siempre el mismo bosque y el resultado no depende del hilo que procese cada agente.
+ * El estado cabe en un `uint32`, por lo que cada árbol lleva su propio stream dentro
+ * del SoA de la población sin coste de memoria apreciable.
  */
 namespace EcoRand
 {
+    /**
+     * Avanza el generador xorshift de 32 bits con la terna de desplazamientos
+     * (13, 17, 5), de periodo máximo @f$2^{32}-1@f$.
+     *
+     * @param State Estado del stream; se actualiza in situ.
+     * @return El nuevo estado, utilizable directamente como valor pseudoaleatorio.
+     * @note El cero es punto fijo del xorshift, así que se sustituye por la constante
+     *       áurea en cada llamada y no solo al sembrar: un estado corrompido o
+     *       deserializado a cero no congela la secuencia.
+     */
     FORCEINLINE uint32 NextU32(uint32& State)
     {
         uint32 x = (State != 0u) ? State : 0x9E3779B9u; // el estado 0 es absorbente
@@ -31,16 +61,20 @@ namespace EcoRand
     }
 
     /**
-     * uint32 -> float uniforme en [0, 1): usa los 24 bits altos (la mantisa de
-     * un float). UNICA copia de esta conversion: la usan NextUnit, los hashes
-     * estables de TreeArchetype y los desfases de viento de TreeWindData.
+     * Convierte 32 bits crudos en un float uniforme en @f$[0, 1)@f$.
+     *
+     * Usa los 24 bits altos, que son exactamente la mantisa de un float, y descarta
+     * los 8 bajos, los de peor calidad en un xorshift. Copia única de la conversión:
+     * la comparten NextUnit, HashUnit, los hashes estables de los arquetipos y los
+     * desfases de viento, de modo que todos los consumidores tienen la misma
+     * distribución y el mismo redondeo.
      */
     FORCEINLINE float UnitFromBits(uint32 Bits)
     {
         return static_cast<float>(Bits >> 8) * (1.0f / 16777216.0f);
     }
 
-    /** Devuelve un float en [0, 1). */
+    /** Float uniforme en [0, 1) consumiendo una extracción del stream. */
     FORCEINLINE float NextUnit(uint32& State)
     {
         return UnitFromBits(NextU32(State));
@@ -52,7 +86,11 @@ namespace EcoRand
         return Min + (Max - Min) * NextUnit(State);
     }
 
-    /** Entero en [Min, Max] (ambos inclusive). El sesgo por módulo es despreciable aquí. */
+    /**
+     * Entero en [Min, Max], ambos inclusive.
+     * @note Reduce por módulo: el sesgo es despreciable a los rangos que maneja el
+     *       modelo, muy pequeños frente a @f$2^{32}@f$.
+     */
     FORCEINLINE int32 NextRangeInt(uint32& State, int32 Min, int32 Max)
     {
         if (Max <= Min) { return Min; }
@@ -60,20 +98,25 @@ namespace EcoRand
         return Min + static_cast<int32>(NextU32(State) % Span);
     }
 
-    // --- Helpers de dominio de la Fase 2 (todos derivados de un uint32& State) ---
+    // ==== Muestreadores de dominio (todos consumen del uint32& State recibido) ====
 
     /**
-     * Nº de eventos ~ Poisson(Lambda). Lo usa ComputeSeedCount para el nº de
-     * semillas por árbol y tick.
+     * Número de eventos con distribución de Poisson de media Lambda. Alimenta la
+     * lluvia de semillas por árbol y tick y el número de claros de perturbación.
      *
-     * Dos regímenes para no pagar O(Lambda):
-     *   - Lambda pequeña: algoritmo de Knuth (multiplica uniformes). Exacto.
-     *   - Lambda grande (>= 30): aproximación normal (Box-Muller) redondeada.
-     *     Con biomasa alta y SeedRate alto, Knuth haría cientos de iteraciones
-     *     por árbol; aquí es coste constante. El sesgo de la aproximación es
-     *     despreciable a estas escalas.
+     * Dos regímenes para no pagar @f$O(\lambda)@f$ extracciones:
+     * @li Lambda < 30: método exacto de Knuth por producto de uniformes.
+     * @li Lambda >= 30: aproximación normal @f$N(\lambda, \lambda)@f$ por
+     *     Box-Muller, redondeada y acotada a cero. Con biomasa y fecundidad altas
+     *     el método exacto dispararía cientos de extracciones por árbol; aquí el
+     *     coste, y con él el avance del stream, quedan fijados en dos extracciones.
      *
-     * Determinista: sólo consume del State que se le pasa.
+     * @param Lambda Media de la distribución; los valores no positivos devuelven 0.
+     * @return Número de eventos, siempre >= 0.
+     * @note El sesgo de la aproximación normal, sin corrección de continuidad, es
+     *       despreciable a las escalas de fecundidad del modelo.
+     * @see @ref bib_knuthpoisson
+     * @see @ref bib_boxmuller1958
      */
     FORCEINLINE int32 PoissonInt(uint32& State, float Lambda)
     {
@@ -103,12 +146,19 @@ namespace EcoRand
     }
 
     /**
-     * Distancia (cm) de dispersión de una semilla dentro de un disco de radio
-     * MaxRadiusCm. Se usa r = R*sqrt(U) para que la densidad sea UNIFORME por
-     * área (sin apelmazar semillas junto al tronco, que es el artefacto de usar
-     * r = R*U directamente). Si en el futuro quieres un kernel decreciente con
-     * la distancia (más realista ecológicamente), sustituye esta línea por,
-     * p.ej., una exponencial acotada: no afecta a nada más.
+     * Distancia en centímetros de una semilla respecto a su parental, dentro de un
+     * disco de radio MaxRadiusCm.
+     *
+     * Aplica @f$r = R\sqrt{U}@f$, la inversa de la acumulada @f$F(r) = r^2/R^2@f$,
+     * con lo que la densidad resulta uniforme POR ÁREA; con @f$r = R\,U@f$ las
+     * semillas se apelmazan junto al tronco.
+     *
+     * @note El kernel de dispersión del modelo es uniforme por área y no decreciente
+     *       con la distancia, así que no reproduce la agregación junto al parental ni
+     *       las colas largas descritas en la literatura. Es el único punto que hay que
+     *       tocar para cambiarlo por un kernel decreciente.
+     * @see @ref bib_discouniforme
+     * @see @ref bib_dispersionsemillas
      */
     FORCEINLINE float SampleDispersalDistance(uint32& State, float MaxRadiusCm)
     {
@@ -116,20 +166,19 @@ namespace EcoRand
     }
 
     /**
-     * Desplazamiento XY (cm) uniforme POR AREA dentro de un disco de radio
-     * RadiusCm: angulo uniforme + radio con la correccion sqrt de arriba.
+     * Desplazamiento XY en centímetros, uniforme por área dentro de un disco de radio
+     * RadiusCm: ángulo uniforme más radio con la corrección de
+     * @ref EcoRand::SampleDispersalDistance.
      *
-     * UNICA copia del patron. Estaba escrito a mano en tres sitios que hacian
-     * exactamente lo mismo con nombres distintos -la dispersion de semillas
-     * (EcologyRules::SampleSeedOffsetCm), el scatter de hojarasca de la capa de
-     * suelo y el disco horizontal de la envolvente de copa-, de modo que
-     * cambiar el kernel de dispersion obligaba a acordarse de los tres.
+     * Copia única del patrón, compartida por la dispersión de semillas
+     * (`EcologyRules::SampleSeedOffsetCm`), el scatter de hojarasca de la capa de
+     * suelo y el disco horizontal de la envolvente de copa.
      *
-     * ORDEN DE CONSUMO DEL RNG (parte del contrato de reproducibilidad):
-     * primero el angulo, despues el radio. Quien necesite intercalar algo entre
-     * los dos -como la envolvente de copa, que perturba el radio con ruido-
-     * debe llamar a NextRange y SampleDispersalDistance por separado, en ese
-     * mismo orden.
+     * @warning El orden de consumo del RNG es parte del contrato de reproducibilidad:
+     *          primero el ángulo, después el radio. Quien necesite intercalar algo
+     *          entre los dos, como la envolvente de copa cuando perturba el radio con
+     *          ruido, debe llamar a NextRange y a SampleDispersalDistance por
+     *          separado y en ese mismo orden.
      */
     FORCEINLINE FVector2D SampleDiscOffsetCm(uint32& State, float RadiusCm)
     {
@@ -138,7 +187,19 @@ namespace EcoRand
         return FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Dist;
     }
 
-    /** Mezcla de bits (finalizer estilo Murmur3): deriva semillas hijas estables. */
+    /**
+     * Mezclador de bits de 32 bits: alterna desplazamiento-xor a la derecha y
+     * multiplicación por constante impar, y cierra con otro desplazamiento-xor.
+     *
+     * Es la primitiva de derivación de semillas de todo el proyecto: función pura, sin
+     * estado y por tanto llamable desde cualquier hilo o desde el render.
+     *
+     * @note Las constantes y los desplazamientos son los del mezclador lowbias32,
+     *       hallado por búsqueda exhaustiva y de menor sesgo que el fmix32 de
+     *       MurmurHash3, del que solo se toma la estructura.
+     * @see @ref bib_wellons2018
+     * @see @ref bib_appleby2011
+     */
     FORCEINLINE uint32 Hash32(uint32 x)
     {
         x ^= x >> 16; x *= 0x7feb352du;
@@ -148,28 +209,46 @@ namespace EcoRand
     }
 
     /**
-     * Valor estable en [0, 1) derivado de un entero (mezcla de bits + los 24
-     * bits altos). Es "aleatorio" reproducible SIN estado: no consume ningun
-     * stream, asi que se puede llamar desde el mallador o desde el render sin
-     * desplazar la secuencia que gasta la simulacion.
+     * Valor estable en [0, 1) derivado de un entero, sin consumir stream.
      *
-     * UNICA copia de un idioma que estaba repetido con cuatro nombres distintos:
-     * TreeArchetype::StableUnit, el StableUnit local de TreeWindData.cpp, el
-     * LeafUnit de TreeFoliage.cpp y cuatro usos sueltos en TreeMeshBuilder.cpp.
+     * Aleatoriedad reproducible y sin estado: el mallador, el follaje, el viento y el
+     * render la usan a partir de un identificador (árbol, rama, hoja) sin desplazar la
+     * secuencia que gasta la simulación.
+     *
+     * @param Value Identificador del que se deriva el valor.
+     * @param Salt  Constante que se combina por xor para obtener varios valores
+     *              independientes del mismo identificador.
      */
     FORCEINLINE float HashUnit(uint32 Value, uint32 Salt = 0u)
     {
         return UnitFromBits(Hash32(Value ^ Salt));
     }
 
-    /** Semilla estable por-índice: no depende del orden de proceso. */
+    /**
+     * Semilla de un elemento a partir de su índice, no del orden en que se procesa.
+     *
+     * Multiplica el índice por la constante de Knuth @f$2^{32}/\varphi@f$ para
+     * descorrelacionar índices consecutivos antes de mezclar. Es lo que permite que la
+     * semilla de un árbol recién nacido sea la misma con cualquier número de hilos.
+     *
+     * @see @ref bib_knuthhashing
+     */
     FORCEINLINE uint32 SeedForIndex(uint32 MasterSeed, int32 Index)
     {
         return Hash32(MasterSeed ^ Hash32(static_cast<uint32>(Index) * 2654435761u));
     }
 }
 
-/** Subsistemas con su propio stream de RNG (§Fase 0: reproducibilidad). */
+/**
+ * @brief Subsistemas que disponen de un stream de RNG propio dentro de FEcosystemRng.
+ *
+ * Cada uno avanza su secuencia sin desplazar la de los demás, de modo que activar o
+ * desactivar un subsistema no altera el resto del mundo generado.
+ *
+ * @warning El orden de los valores fija las semillas derivadas en
+ *          @ref FEcosystemRng::Init: insertar o reordenar entradas cambia el stream de
+ *          todas las posteriores y con él el bosque resultante.
+ */
 UENUM(BlueprintType)
 enum class EEcoRngStream : uint8
 {
@@ -177,27 +256,43 @@ enum class EEcoRngStream : uint8
     Dispersal,
     Mortality,
     Morphology,
-    Debug,   // herramientas de depuración: NO perturba los streams de la simulación
+    /** Herramientas de depuración; stream aparte para no perturbar la simulación. */
+    Debug,
 
-    /** Perturbacion (claros). Stream propio para que activar o desactivar el regimen
-        de claros no desplace los demas: asi una corrida con perturbacion y otra sin
-        ella parten del MISMO bosque y la comparacion mide solo el efecto buscado.
-        Va al final, despues de Debug, para no cambiar la semilla derivada de los
-        streams que ya existian. */
+    /** Perturbación (claros). Stream propio para que una corrida con régimen de claros
+        y otra sin él partan del MISMO bosque y la comparación mida solo su efecto. */
     Disturbance,
 
     Count UMETA(Hidden)
 };
 
 /**
- * Contenedor de un stream por subsistema, derivados de una única semilla maestra.
- * Struct plano (no reflejado): se usa dentro del subsistema de simulación.
+ * @brief Contenedor de un stream de RNG por subsistema, derivados de una única semilla
+ *        maestra.
+ *
+ * Struct plano y no reflejado, alojado en el subsistema de simulación. Al ser un bloque
+ * de enteros contiguo puede serializarse tal cual dentro de un bake, lo que permite
+ * reanudar una corrida en el punto exacto de la secuencia en que se guardó.
  */
 struct FEcosystemRng
 {
+    /** Semilla del mundo; fijarla fija el bosque entero. */
     uint32 MasterSeed = 1u;
-    uint32 State[static_cast<int32>(EEcoRngStream::Count)] = {}; // cero-inicializado por seguridad
 
+    /** Estado vivo de cada stream, indexado por EEcoRngStream. */
+    uint32 State[static_cast<int32>(EEcoRngStream::Count)] = {};
+
+    /**
+     * Deriva los streams de una semilla maestra con
+     * @f$State_i = Hash32(MasterSeed \oplus 0x01000193 \cdot (i+1))@f$.
+     *
+     * El factor es el primo de 32 bits de FNV, usado aquí solo como multiplicador que
+     * descorrelaciona índices de stream contiguos antes de la mezcla.
+     *
+     * @param InMasterSeed Semilla del mundo; el cero se sustituye por 1, porque es el
+     *                     punto fijo del generador.
+     * @see @ref bib_fnv1991
+     */
     void Init(uint32 InMasterSeed)
     {
         MasterSeed = (InMasterSeed != 0u) ? InMasterSeed : 1u;
@@ -207,29 +302,43 @@ struct FEcosystemRng
         }
     }
 
+    /** Float en [0, 1) del stream S. */
     FORCEINLINE float  Unit(EEcoRngStream S) { return EcoRand::NextUnit(State[static_cast<int32>(S)]); }
+
+    /** Entero de 32 bits del stream S. */
     FORCEINLINE uint32 U32(EEcoRngStream S) { return EcoRand::NextU32(State[static_cast<int32>(S)]); }
 
-    /** Float en [Min, Max). */
+    /** Float en [Min, Max) del stream S. */
     FORCEINLINE float  RangeF(EEcoRngStream S, float Min, float Max)
     {
         return EcoRand::NextRange(State[static_cast<int32>(S)], Min, Max);
     }
 
-    /** Entero en [Min, Max] (inclusive). */
+    /** Entero en [Min, Max], ambos inclusive, del stream S. */
     FORCEINLINE int32  RangeI(EEcoRngStream S, int32 Min, int32 Max)
     {
         return EcoRand::NextRangeInt(State[static_cast<int32>(S)], Min, Max);
     }
 };
 
-/** Agente de depuración de la Fase 0 (proto de la población de la Fase 2). */
+/**
+ * @brief Marcador esférico de depuración que el subsistema de simulación dibuja en el
+ *        mundo cuando se activa la CVar correspondiente.
+ *
+ * Es independiente de la población simulada: sirve para señalar puntos de interés
+ * (muestreos del relieve, posiciones candidatas) sin tocar el SoA de agentes.
+ */
 USTRUCT()
 struct FEcoDebugAgent
 {
     GENERATED_BODY()
 
+    /** Posición en el mundo, en centímetros. */
     UPROPERTY() FVector Position = FVector::ZeroVector;
+
+    /** Color de la esfera de depuración. */
     UPROPERTY() FColor  Color = FColor::Green;
-    UPROPERTY() float   Radius = 100.f; // cm
+
+    /** Radio de la esfera, en centímetros. */
+    UPROPERTY() float   Radius = 100.f;
 };

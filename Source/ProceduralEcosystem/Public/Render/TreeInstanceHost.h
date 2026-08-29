@@ -1,3 +1,20 @@
+/**
+ * @file TreeInstanceHost.h
+ * @author Juan Luque Roldán
+ * @brief Actor contenedor de los componentes de instancing y fábrica común de éstos.
+ *
+ * Existe por una razón de motor: un UPrimitiveComponent necesita un AActor propietario para
+ * registrarse y dibujarse, y un subsistema de mundo no lo es. El actor no tiene lógica ni
+ * tick; solo posee los componentes que le cuelgan la librería de árboles y la capa de suelo, y
+ * se sitúa siempre en la identidad para que el espacio local del componente coincida con el
+ * mundo. Declara además la fábrica estática que ambos usan para crear un componente
+ * instanciado con la configuración compartida: movilidad, colisión, navegación, sombra y
+ * canales de datos por instancia.
+ *
+ * @ingroup eco_render
+ * @see @ref bib_instancing
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -9,17 +26,12 @@ class UMaterialInterface;
 class UStaticMesh;
 
 /**
- * Actor contenedor de los componentes ISM/HISM de la libreria (Fase 4).
+ * Actor que aloja los componentes de instancing del proyecto.
  *
- * Existe por una razon puramente tecnica: en UE un UPrimitiveComponent necesita
- * un AActor propietario para registrarse y renderizarse, y un UWorldSubsystem no
- * lo es. Este actor no tiene logica: solo posee los componentes que crea
- * UTreeLibrary.
- *
- * IMPORTANTE: se coloca SIEMPRE en la identidad (origen del mundo, sin rotacion
- * ni escala). Asi el espacio local del componente coincide con el mundo y las
- * transformaciones de instancia se pueden pasar tal cual, sin conversiones ni
- * el flag bWorldSpace de AddInstances.
+ * No tiene lógica: solo es el propietario que el motor exige para registrar y dibujar un
+ * componente primitivo. Se coloca siempre en la identidad —origen del mundo, sin rotación ni
+ * escala—, de modo que el espacio local del componente coincide con el mundo y las
+ * transformaciones de instancia se pasan tal cual, sin conversiones.
  */
 UCLASS(NotPlaceable, Transient)
 class PROCEDURALECOSYSTEM_API ATreeInstanceHost : public AActor
@@ -27,36 +39,32 @@ class PROCEDURALECOSYSTEM_API ATreeInstanceHost : public AActor
     GENERATED_BODY()
 
 public:
+    /** Actor sin tick, sin colisión y con una raíz movible de la que cuelgan los componentes. */
     ATreeInstanceHost();
 
     /**
-     * Crea el actor host en la identidad y le pone etiqueta en el editor.
+     * Crea el actor en la identidad, con su componente raíz garantizado.
      *
-     * Lo hacian por su cuenta, con el mismo bloque de cinco lineas, tanto
-     * UTreeRenderSubsystem::EnsureInitialized como UTreeSoilSubsystem::
-     * EnsureInitialized. Devuelve nullptr si el mundo es nulo o el spawn falla,
-     * que es justo la condicion que ambos comprueban para no inicializarse.
+     * @param EditorLabel Etiqueta con la que aparece en el editor; ignorada en otras builds.
+     * @return El actor, o nullptr si el mundo es nulo o el spawn falla; los llamantes usan
+     *         ese nullptr como condición para no inicializar su capa.
      */
     static ATreeInstanceHost* SpawnHost(UWorld* World, const TCHAR* EditorLabel);
 
     /**
-     * Crea y registra un componente de instancing colgado de Host, con la
-     * configuracion COMUN a todo el proyecto: movible (se anaden y quitan
-     * instancias en runtime), sin colision, fuera del navmesh -si no, cada
-     * alta/baja pide un rebuild- y con la sombra que se le pida.
+     * Crea y registra un componente de instancing colgado de Host con la configuración común
+     * a todo el proyecto: movible, porque las instancias se dan de alta y de baja en runtime;
+     * sin colisión; fuera de la navegación, ya que si no cada alta o baja pediría reconstruir
+     * el navmesh; y con la sombra que se le indique.
      *
-     * Es el nucleo que compartian UTreeLibrary::GetOrCreateComponent (arboles e
-     * impostors) y UTreeSoilSubsystem::CreateISM (tocones y hojarasca): siete
-     * llamadas identicas duplicadas en dos ficheros. Lo que SI cambia entre
-     * ellos -distancias de cull, viento- lo aplica el llamador sobre el
+     * Es el núcleo compartido por la librería de árboles y por la capa de suelo. Lo que sí
+     * difiere entre ellas —distancias de cull, viento— lo aplica el llamante sobre el
      * componente devuelto.
      *
-     * NumCustomDataFloats y el material van como parametros, y no despues, a
-     * proposito: los dos llamantes los fijaban ANTES de registrar el componente,
-     * y NumCustomDataFloats en particular es una escritura directa de propiedad
-     * (dimensiona el buffer de datos por instancia) que conviene dejar puesta de
-     * entrada y no cuando el componente ya esta vivo.
-     *
+     * @param NumCustomDataFloats Canales de datos por instancia. Va como parámetro, y no como
+     *                            ajuste posterior, porque dimensiona el buffer por instancia y
+     *                            debe quedar fijado antes de registrar el componente.
+     * @param OverrideMaterial    Material que sustituye al de la ranura 0; opcional.
      * @return El componente ya registrado, o nullptr si faltan Host o Mesh.
      */
     static UHierarchicalInstancedStaticMeshComponent* CreateInstancedComponent(

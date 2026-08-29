@@ -1,56 +1,75 @@
+/**
+ * @file GridMath.h
+ * @author Juan Luque Roldán
+ * @brief Aritmética de rejilla compartida por las estructuras espaciales del proyecto:
+ *        indexado, dimensionado, índice CSR, vecindad y leyes de luz.
+ *
+ * Copia única de la aritmética que comparten `FField2D`, `FSpatialHash`,
+ * `FLightFieldCoarse`, `FTreeLightGridFine` y `FAttractorCloud`: conversión de mundo a
+ * celda con y sin clamp, índice lineal de vóxel, dimensionado defensivo desde una caja
+ * envolvente, construcción del índice espacial CSR por counting sort y recorrido del
+ * bloque de vecindad. Las estructuras solo aportan su geometría (origen, tamaño de
+ * celda y dimensiones), con lo que no pueden divergir ni en el layout de memoria ni en
+ * el orden de visita, ambos parte del contrato de determinismo. Aquí viven también las
+ * dos leyes de luz del proyecto, para que compartan el mismo techo de luz plena.
+ *
+ * @ingroup eco_core
+ * @see @ref bib_teschner2003
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 
 /**
- * Helpers de rejilla compartidos por TODAS las estructuras espaciales del
- * proyecto (FField2D, FSpatialHash, FLightFieldCoarse, FTreeLightGridFine,
- * FAttractorCloud).
+ * @brief Aritmética de rejilla uniforme: conversiones mundo-celda, indexado lineal,
+ *        índice espacial CSR, recorrido de vecindad y atenuación de la luz.
  *
- * Antes cada una reimplementaba la misma aritmetica -mundo -> celda con floor y
- * clamp, indexado lineal 3D, dimensionado desde una caja envolvente, counting
- * sort CSR- y cualquier cambio habia que replicarlo en cinco sitios. Aqui vive
- * la UNICA copia; las estructuras solo aportan su geometria (Origin, CellSize,
- * dimensiones).
+ * Todas las funciones son puras y sin estado. El índice lineal canónico es
+ * @f$(I_z \cdot Height + I_y) \cdot Width + I_x@f$, con X como eje de variación más
+ * rápida; ese layout es el que asumen el recorrido por filas y el borrado por memset.
  */
 namespace EcoGrid
 {
-    /** Luz plena normalizada (cielo despejado). La comparten los dos grids de
-        sombra por voxel (coarse y fine): un solo valor, imposible que diverjan. */
+    /** Luz plena normalizada (cielo despejado). Techo común de las dos rejillas de luz,
+        la gruesa y la fina, para que no puedan divergir. No es una irradiancia
+        física. */
     constexpr float FullSunlight = 1.f;
 
-    /** Mundo -> coordenada de rejilla FRACCIONAL (en muestras). */
+    /** Mundo -> coordenada de rejilla fraccional, en unidades de celda; base de las
+        interpolaciones bilineal y trilineal. */
     FORCEINLINE double ToGridCoord(double Coord, double Origin, double CellSize)
     {
         return (Coord - Origin) / CellSize;
     }
 
-    /** Mundo -> indice de celda (floor), SIN clamp. */
+    /** Mundo -> índice de celda por floor, SIN clamp: el llamador decide qué hacer con
+        los puntos que caen fuera de la rejilla. */
     FORCEINLINE int32 WorldToCell(double Coord, double Origin, double CellSize)
     {
         return FMath::FloorToInt32((Coord - Origin) / CellSize);
     }
 
-    /** Mundo -> indice de celda con clamp a [0, NumCells-1]. */
+    /** Mundo -> índice de celda con clamp a [0, NumCells-1]: los puntos de fuera se
+        pegan al borde en lugar de indexar fuera de rango. */
     FORCEINLINE int32 WorldToCellClamped(double Coord, double Origin, double CellSize, int32 NumCells)
     {
         return FMath::Clamp(FMath::FloorToInt32((Coord - Origin) / CellSize), 0, NumCells - 1);
     }
 
-    /** Indice lineal de un voxel (Ix,Iy,Iz) en una rejilla Width x Height x Layers. */
+    /** Índice lineal del vóxel (Ix, Iy, Iz) en una rejilla de Width x Height celdas por
+        capa. X es el eje de variación más rápida. */
     FORCEINLINE int32 VoxelIndex(int32 Ix, int32 Iy, int32 Iz, int32 Width, int32 Height)
     {
         return (Iz * Height + Iy) * Width + Ix;
     }
 
     /**
-     * Pone a cero un buffer de floats de rejilla con un memset.
+     * Pone a cero un buffer de floats de rejilla con un único memset.
      *
-     * Los dos grids de luz tenian su propio ClearShadow y NO hacian lo mismo: el
-     * grueso ya usaba Memzero, el fino recorria el array celda a celda. Y el fino
-     * es el que se limpia MAS veces (una por refresco de luz del SCA, o sea
-     * varias por arbol horneado), asi que la version lenta estaba justo donde
-     * mas dolia. Una sola copia, la rapida, para los dos.
+     * Es el borrado que usan las dos rejillas de luz. Importa que sea el rápido porque la
+     * rejilla fina se limpia varias veces por árbol horneado, una por cada refresco de luz
+     * del SCA.
      */
     FORCEINLINE void ZeroFloats(TArray<float>& Buffer)
     {
@@ -61,13 +80,15 @@ namespace EcoGrid
     }
 
     /**
-     * Luz disponible tras la sombra acumulada: Q = clamp(FullSun - Sombra, 0).
+     * Luz disponible tras la sombra acumulada, por resta lineal con tope duro:
+     * @f$Q = \max(FullSun - Shadow, 0)@f$.
      *
-     * Resta LINEAL con tope duro. La sigue usando el grid FINO (local a un hero
-     * tree), donde "sombra" es una oclusion geometrica acotada por construccion y
-     * lo que se busca es un gradiente barato para el fototropismo.
+     * Es la ley de la rejilla fina, local a un hero tree, donde la sombra es una oclusión
+     * geométrica acotada por construcción y lo que se busca es un gradiente barato para
+     * el fototropismo del SCA, no una ley física.
      *
-     * NO la uses para el dosel a escala de paisaje: ver LightFromExtinction.
+     * @warning No sirve para el dosel a escala de paisaje: satura en cero exacto.
+     *          Ahí se usa @ref EcoGrid::LightFromExtinction.
      */
     FORCEINLINE float LightFromShadow(float Shadow, float FullSun)
     {
@@ -75,26 +96,27 @@ namespace EcoGrid
     }
 
     /**
-     * Ley de Beer-Lambert: Q = DiffuseFloor + (FullSun - DiffuseFloor) * exp(-k * LAI).
+     * Luz bajo el dosel por la ley de Beer-Lambert con suelo difuso:
+     * @f$Q = Floor + (FullSun - Floor)\,e^{-k\,LAI}@f$. Es la ley de la rejilla gruesa, a
+     * escala de paisaje.
      *
-     * POR QUE NO VALE LA RESTA LINEAL PARA EL DOSEL. Con Q = max(FullSun - S, 0),
-     * en cuanto la sombra acumulada supera FullSun la luz se clava en CERO exacto
-     * y se queda ahi. Y con Q = 0 el factor de luz de todas las especies vale
-     * tambien 0 (f_L = 0/(0+Kl)), o sea que la tolerante a la sombra pierde su
-     * ventaja PRECISAMENTE en la sombra profunda, que es el unico sitio donde
-     * deberia ganar. El unico eje de sucesion del modelo se apaga justo donde
-     * tiene que actuar.
+     * La resta lineal no sirve aquí: en cuanto la sombra acumulada supera la luz plena,
+     * @f$Q@f$ se clava en cero exacto, y con @f$Q = 0@f$ el factor de luz se anula para
+     * TODAS las especies (@ref EcoVigor::LightFactor), así que la tolerante a la sombra
+     * perdería su ventaja precisamente en la sombra profunda, el único sitio donde debe
+     * ganar, y el eje de sucesión del modelo se apagaría donde tiene que actuar. La
+     * exponencial es asintótica, nunca alcanza el cero, y conserva el orden entre
+     * especies a cualquier densidad de dosel.
      *
-     * La exponencial es asintotica: nunca llega a 0, asi que el ORDEN entre
-     * especies se conserva a cualquier densidad de dosel. Ademas es la ley fisica
-     * real de atenuacion a traves de un medio absorbente, con LAI (indice de area
-     * foliar acumulado por encima del punto) como espesor optico y k como
-     * coeficiente de extincion (~0.5 en hoja ancha).
-     *
-     * DiffuseFloor es la luz difusa del cielo que llega al sotobosque incluso bajo
-     * dosel cerrado (medida real: 1-5% de la luz de fuera). Sin ese suelo, un
-     * dosel muy denso volveria a producir el cero absoluto que la exponencial
-     * venia a evitar.
+     * @param LeafAreaAbove Área foliar acumulada por encima del punto, que actúa como
+     *                      espesor óptico. Los valores negativos se tratan como 0.
+     * @param ExtinctionK   Coeficiente de extinción del follaje; ~0.5 en hoja ancha.
+     * @param DiffuseFloor  Luz difusa que llega al sotobosque bajo dosel cerrado, del 1
+     *                      al 5% de la de fuera; se acota a [0, FullSun]. Sin ese suelo
+     *                      un dosel muy denso reproduce el cero que la exponencial
+     *                      viene a evitar.
+     * @see @ref bib_monsisaeki1953
+     * @see @ref bib_gapmodels
      */
     FORCEINLINE float LightFromExtinction(float LeafAreaAbove, float FullSun, float ExtinctionK, float DiffuseFloor)
     {
@@ -104,9 +126,12 @@ namespace EcoGrid
     }
 
     /**
-     * Dimensiona una rejilla 3D que cubra Bounds con celdas de CellSize, con al
-     * menos 1 celda por eje y un tope defensivo MaxPerAxis (evita reservar gigas
-     * si llega una caja degenerada o enorme).
+     * Dimensiona una rejilla 3D que cubra Bounds con celdas de lado CellSize.
+     *
+     * @param MaxPerAxis Tope de celdas por eje. Es una salvaguarda de memoria: sin él,
+     *                   una caja enorme o corrupta reservaría gigas.
+     * @param OutW,OutH,OutD Dimensiones resultantes, siempre >= 1, de modo que una caja
+     *                   plana o degenerada sigue produciendo una rejilla válida.
      */
     FORCEINLINE void DimensionsFromBounds(const FBox& Bounds, double CellSize, int32 MaxPerAxis,
         int32& OutW, int32& OutH, int32& OutD)
@@ -118,24 +143,18 @@ namespace EcoGrid
     }
 
     /**
-     * Recorre las celdas de un bloque de (2R+1)^3 centrado en (Cx,Cy,Cz),
-     * RECORTADO a la rejilla WxHxD, e invoca Fn(int32 CellIndex) en cada una.
+     * Recorre las celdas del bloque de @f$(2R+1)^3@f$ centrado en (Cx, Cy, Cz),
+     * recortado a la rejilla Width x Height x Depth, e invoca `Fn(int32 CellIndex)` en
+     * cada una.
      *
-     * UNICA copia del triple bucle clampado que antes estaba escrito -con
-     * nombres distintos y una dimension de diferencia- en FSpatialHash::
-     * ForEachNeighbor (2D) y FAttractorCloud::ForEachInRange (3D). Sirve para
-     * las dos: una rejilla 2D es este mismo recorrido con D = 1 y Cz = 0, y en
-     * ese caso el bucle de Z da exactamente una vuelta.
+     * Sirve igual para 2D y para 3D: una rejilla 2D es este mismo recorrido con
+     * Depth = 1 y Cz = 0, y entonces el bucle de Z da una sola vuelta. Los límites se
+     * recortan una vez por eje, así que el cuerpo del bucle no comprueba nada y el
+     * índice de fila se calcula una vez por fila.
      *
-     * De paso es MAS RAPIDO que las dos versiones que sustituye: aquellas
-     * iteraban -R..R en cada eje y descartaban dentro con un `if` por celda; aqui
-     * los limites se recortan UNA vez por eje y el cuerpo del bucle no vuelve a
-     * comprobar nada.
-     *
-     * ORDEN DE VISITA: z, luego y, luego x, todos ascendentes -el mismo de
-     * antes-. Importa: las consultas de vecindad alimentan decisiones de la
-     * simulacion y del SCA, y el orden fijo es parte del contrato de
-     * determinismo.
+     * @note El orden de visita es z, luego y, luego x, todos ascendentes. Es parte del
+     *       contrato de determinismo: estas consultas alimentan decisiones de la
+     *       simulación y del SCA.
      */
     template <typename FCellFn>
     void ForEachCellInBox(int32 Cx, int32 Cy, int32 Cz, int32 R,
@@ -159,14 +178,16 @@ namespace EcoGrid
     }
 
     /**
-     * Igual, pero desenrollando ya el indice CSR: invoca Fn(int32 ItemIndex) por
-     * cada item guardado en esas celdas. Es literalmente el cuerpo que tenian
-     * FSpatialHash::ForEachNeighbor y FAttractorCloud::ForEachInRange, y ahora
-     * las dos se reducen a calcular su celda central y llamar aqui.
+     * Igual que @ref EcoGrid::ForEachCellInBox, pero desenrollando el índice CSR:
+     * invoca `Fn(int32 ItemIndex)` por cada item guardado en esas celdas. Es el cuerpo
+     * de las consultas de proximidad de `FSpatialHash` y de `FAttractorCloud`, que se
+     * reducen a calcular su celda central y llamar aquí.
      *
-     * Incluye TODOS los items de las celdas tocadas (el bloque es un cubo, no
-     * una esfera): el filtrado fino por distancia real lo hace el llamador, que
-     * es lo barato.
+     * @note Recorre TODOS los items de las celdas tocadas, porque el bloque es un cubo
+     *       y no una esfera. El filtrado fino por distancia real corresponde al
+     *       llamador, que es donde resulta barato.
+     * @pre CellStart y SortedIdx provienen de @ref EcoGrid::BuildCSR sobre la misma
+     *      rejilla.
      */
     template <typename FItemFn>
     void ForEachItemInBox(const TArray<int32>& CellStart, const TArray<int32>& SortedIdx,
@@ -184,21 +205,27 @@ namespace EcoGrid
     }
 
     /**
-     * Indice espacial CSR por counting sort (contar por celda, prefijo
-     * acumulado, volcar con cursor). O(NumItems), orden fijo: recorre los items
-     * en indice creciente, asi que dentro de cada celda SortedIdx queda siempre
-     * en el mismo orden -> determinista.
+     * Construye el índice espacial CSR por counting sort en tres pasadas: contar items
+     * por celda, prefijo acumulado y volcado con cursor. Coste @f$O(NumItems)@f$ al ser
+     * la clave un entero acotado, el índice de celda.
      *
-     * CellOfItem se invoca como CellOfItem(int32 ItemIndex) -> int32 celda.
-     * Cursor es un buffer de trabajo del llamador (persistente si quiere evitar
-     * la allocation por tick, como hace FSpatialHash).
+     * @param CellOfItem Se invoca como `CellOfItem(int32 ItemIndex) -> int32 celda`.
+     * @param CellStart  Salida: NumCells+1 prefijos; los items de la celda c ocupan
+     *                   SortedIdx en [CellStart[c], CellStart[c+1]).
+     * @param SortedIdx  Salida: índices de item agrupados por celda.
+     * @param Cursor     Buffer de trabajo del llamador; conservarlo entre llamadas
+     *                   evita una reserva por tick, como hace `FSpatialHash`.
+     * @note El recorrido en índice creciente hace el volcado estable: dentro de cada
+     *       celda SortedIdx queda siempre en el mismo orden, requisito del contrato de
+     *       determinismo y no un simple detalle deseable.
+     * @see @ref bib_countingsortcsr
      */
     template <typename FCellOf>
     void BuildCSR(int32 NumCells, int32 NumItems, FCellOf&& CellOfItem,
         TArray<int32>& CellStart, TArray<int32>& SortedIdx, TArray<int32>& Cursor)
     {
-        // Reset + SetNumZeroed: SetNumZeroed solo cera los elementos NUEVOS, asi
-        // que sin el Reset conservaria los prefijos de la pasada anterior.
+        // El Reset es obligatorio: SetNumZeroed solo pone a cero los elementos NUEVOS,
+        // así que sin él se conservarían los prefijos de la pasada anterior.
         CellStart.Reset();
         CellStart.SetNumZeroed(NumCells + 1);
 

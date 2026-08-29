@@ -1,3 +1,19 @@
+/**
+ * @file EcoFrameProfiler.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del perfilador de frame: ventana circular, estadísticas, HUD,
+ *        captura a CSV y comandos de consola de la familia Eco.Frame.
+ *
+ * Contiene la ventana circular de tiempos de frame y las estadísticas que se derivan de
+ * ella, la publicación de población y milisegundos en la categoría CSV del motor, el HUD de
+ * claves fijas, la escritura de la captura a Saved/EcoProfile y el árbol de decisión que
+ * dice si el frame que se sale del presupuesto es responsabilidad de la simulación o hay que
+ * seguir buscando en las herramientas del motor.
+ *
+ * @ingroup eco_debug
+ * @see @ref bib_epicueperfilado
+ */
+
 #include "Debug/EcoFrameProfiler.h"
 
 #include "Config/EcosystemSettings.h"
@@ -15,14 +31,15 @@ DEFINE_LOG_CATEGORY_STATIC(LogEcoProfile, Log, All);
 
 namespace
 {
-    /** Tamano de la ventana movil de tiempos de frame (~4 s a 60 fps). */
+    /** Tamaño de la ventana móvil de tiempos de frame (~4 s a 60 fps). */
     constexpr int32 kFrameWindow = 240;
 
-    /** Tope de filas de una captura (~10 min a 60 fps). Evita comerse la RAM si
-        alguien lanza Eco.Frame.Capture 99999 y se va a comer. */
+    /** Tope de filas de una captura (~10 min a 60 fps): acota la memoria frente a una
+        duración desmedida en el argumento del comando. */
     constexpr int32 kMaxCaptureSamples = 36000;
 }
 
+/** Perfilador del mundo dado, o nullptr si el mundo no lo tiene. */
 static UEcoFrameProfiler* GetProfiler(UWorld* World)
 {
     return World ? World->GetSubsystem<UEcoFrameProfiler>() : nullptr;
@@ -31,7 +48,7 @@ static UEcoFrameProfiler* GetProfiler(UWorld* World)
 // ---------------------------------------------------------------------------
 //  Comandos de consola
 // ---------------------------------------------------------------------------
-static FAutoConsoleCommandWithWorld GEcoFrame(TEXT("Eco.Frame"),TEXT("Reparto del frame frente al presupuesto (doc. 6.4): ms medio/p95/max, fps y coste del ecosistema."),
+static FAutoConsoleCommandWithWorld GEcoFrame(TEXT("Eco.Frame"),TEXT("Reparto del frame frente al presupuesto: ms medio/p95/max, fps y coste del ecosistema."),
     FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* W) { if (UEcoFrameProfiler* P = GetProfiler(W)) P->LogFrameBudget(); }));
     
 
@@ -74,7 +91,7 @@ void UEcoFrameProfiler::Deinitialize()
 {
     if (bCapturing)
     {
-        FinishCapture(); // no perder una captura por cerrar el PIE
+        FinishCapture(); // cerrar el mundo no debe perder una captura ya grabada
     }
     Eco = nullptr;
     Render = nullptr;
@@ -100,6 +117,8 @@ bool UEcoFrameProfiler::EnsureInitialized()
     Eco = World->GetSubsystem<UEcosystemSubsystem>();
     Render = World->GetSubsystem<UTreeRenderSubsystem>();
 
+    // Sin ecosistema no hay nada que medir y se reintenta al frame siguiente. El
+    // subsistema de render, en cambio, es opcional: todo el fichero lo trata como tal.
     if (!Eco){ return false; }
 
     Window.SetNumZeroed(kFrameWindow);
@@ -127,19 +146,20 @@ void UEcoFrameProfiler::Tick(float DeltaTime)
 
     const float FrameMs = DeltaTime * 1000.f;
 
-    // Ventana circular: coste O(1) por frame y sin allocations.
+    // Ventana circular: coste constante por frame y sin reservas de memoria. El contador
+    // saturante permite estadísticas correctas antes de que la ventana se llene.
     Window[WindowCursor] = FrameMs;
     WindowCursor = (WindowCursor + 1) % Window.Num();
     WindowFilled = FMath::Min(WindowFilled + 1, Window.Num());
 
-    // --- Metricas al CSV profiler del motor (categoria "Eco") ---
-    // Con esto, una captura hecha con `csvprofile start` ya trae las columnas del
-    // ecosistema junto a las del motor, sin nada mas que hacer.
+    // --- Métricas a la categoría CSV del motor ---
+    // Una captura lanzada con las herramientas del motor sale con las columnas del
+    // ecosistema junto a las suyas, sin post-proceso.
     const int32 PopNow = Eco->GetLivePopulationCount();
     CSV_CUSTOM_STAT(Eco, Population, PopNow, ECsvCustomStatOp::Set);
     CSV_CUSTOM_STAT(Eco, FrameMs, FrameMs, ECsvCustomStatOp::Set);
 
-    // --- Captura propia a CSV  ---
+    // --- Captura propia a CSV ---
     if (bCapturing)
     {
         CaptureElapsed += DeltaTime;
@@ -172,7 +192,7 @@ void UEcoFrameProfiler::Tick(float DeltaTime)
 }
 
 // ---------------------------------------------------------------------------
-//  Estadisticas
+//  Estadísticas de la ventana y reparto del frame
 // ---------------------------------------------------------------------------
 float UEcoFrameProfiler::Percentile(float P) const
 {
@@ -217,7 +237,7 @@ void UEcoFrameProfiler::LogFrameBudget() const
 {
     if (!bInitialized || WindowFilled == 0)
     {
-        UE_LOG(LogEcoProfile, Warning, TEXT("[Eco/F6] Aun no hay frames medidos."));
+        UE_LOG(LogEcoProfile, Warning, TEXT("[Eco/Perfil] Aun no hay frames medidos."));
         return;
     }
 
@@ -236,7 +256,7 @@ void UEcoFrameProfiler::LogFrameBudget() const
     GetEcoCostMs(TickMs, RelevelMs);
     const float OursMs = TickMs + RelevelMs;
 
-    UE_LOG(LogEcoProfile, Log, TEXT("=== [Eco/F6] Presupuesto de frame (objetivo %.1f ms = %.0f fps) ==="), Budget, 1000.f / Budget);
+    UE_LOG(LogEcoProfile, Log, TEXT("=== [Eco/Perfil] Presupuesto de frame (objetivo %.1f ms = %.0f fps) ==="), Budget, 1000.f / Budget);
     UE_LOG(LogEcoProfile, Log, TEXT("  Frame: medio %.2f ms (%.0f fps) | p95 %.2f ms | max %.2f ms | ventana %d frames"), Avg, 1000.f / FMath::Max(Avg, 0.001f), P95, Max, WindowFilled);  
     UE_LOG(LogEcoProfile, Log, TEXT("  Ecosistema: tick %.2f ms + re-nivelado LOD %.2f ms = %.2f ms (%.1f%% del frame medio)"),TickMs, RelevelMs, OursMs, 100.f * OursMs / FMath::Max(Avg, 0.001f));   
     UE_LOG(LogEcoProfile, Log, TEXT("  Poblacion: %d arboles vivos"), Eco->GetLivePopulationCount());
@@ -248,8 +268,9 @@ void UEcoFrameProfiler::LogFrameBudget() const
         UE_LOG(LogEcoProfile, Log, TEXT("  Reparto: hero %d | instancia %d | impostor %d | fuera de rango %d"), H, I, Imp, C);
     }
 
-    // El DIAGNOSTICO, que es lo que de verdad pide el doc. 6.4 ("primero
-    // determinar si el cuello es CPU o GPU").
+    // Triaje: antes de optimizar hay que saber de quién es el frame. El umbral de 0,35
+    // separa "el ecosistema pesa lo bastante como para que valga la pena mirarlo" de "el
+    // coste está en otra parte y hay que seguir por las herramientas del motor".
     if (Avg <= Budget)
     {
         UE_LOG(LogEcoProfile, Log, TEXT("  -> Dentro de presupuesto."));
@@ -265,7 +286,7 @@ void UEcoFrameProfiler::LogFrameBudget() const
         UE_LOG(LogEcoProfile, Warning, TEXT("  -> Fuera de presupuesto PERO el ecosistema apenas cuenta (%.1f%%): "
                                             "el cuello NO es la simulacion. Sigue por `stat Unit` (game vs render vs GPU), "
                                             "`stat GPU` / ProfileGPU y `stat RHI`; lo mas probable es overdraw de follaje, "
-                                            "coste de VSM o material masked en Nanite (doc. 4.6 / 6.4)."),
+                                            "coste de VSM o material masked en Nanite."),
                                             100.f * OursMs / FMath::Max(Avg, 0.001f));
     }
 }
@@ -290,7 +311,8 @@ void UEcoFrameProfiler::DrawHUD() const
     int32 H = 0, I = 0, Imp = 0, C = 0;
     if (Render) { Render->GetTierCounts(H, I, Imp, C); }
 
-    // Claves fijas (0..3): sobrescriben el mensaje anterior en vez de acumular.
+    // Claves de mensaje fijas (0..3): cada línea sobrescribe la del frame anterior en
+    // lugar de apilarse en una lista que crece sin fin.
     GEngine->AddOnScreenDebugMessage(0, 0.f, Color,FString::Printf(TEXT("Frame %.2f ms (%.0f fps)  | objetivo %.1f ms"), Avg, 1000.f / FMath::Max(Avg, 0.001f), Budget));
         
     GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::White, FString::Printf(TEXT("Eco: tick %.2f ms + LOD %.2f ms"), TickMs, RelevelMs));
@@ -305,7 +327,7 @@ void UEcoFrameProfiler::DrawHUD() const
 }
 
 // ---------------------------------------------------------------------------
-//  Captura a CSV 
+//  Captura de escalabilidad a CSV
 // ---------------------------------------------------------------------------
 void UEcoFrameProfiler::StartCapture(float Seconds, const FString& Name)
 {
@@ -315,7 +337,7 @@ void UEcoFrameProfiler::StartCapture(float Seconds, const FString& Name)
     {
         if (bCapturing)
         {
-            UE_LOG(LogEcoProfile, Log, TEXT("[Eco/F6] Captura cancelada (%d filas descartadas)."), Samples.Num());
+            UE_LOG(LogEcoProfile, Log, TEXT("[Eco/Perfil] Captura cancelada (%d filas descartadas)."), Samples.Num());
             Samples.Reset();
             bCapturing = false;
         }
@@ -323,13 +345,15 @@ void UEcoFrameProfiler::StartCapture(float Seconds, const FString& Name)
     }
 
     Samples.Reset();
+    // 70 fps como cota optimista del ritmo de llenado: reserva de una vez en el caso
+    // normal, sin pasarse del tope de filas.
     Samples.Reserve(FMath::Min(kMaxCaptureSamples, FMath::CeilToInt(Seconds * 70.f)));
     CaptureName = Name.IsEmpty() ? TEXT("captura") : Name;
     CaptureSecondsLeft = Seconds;
     CaptureElapsed = 0.f;
     bCapturing = true;
 
-    UE_LOG(LogEcoProfile, Log, TEXT("[Eco/F6] Capturando %.1f s -> Saved/EcoProfile/%s.csv"), Seconds, *CaptureName);
+    UE_LOG(LogEcoProfile, Log, TEXT("[Eco/Perfil] Capturando %.1f s -> Saved/EcoProfile/%s.csv"), Seconds, *CaptureName);
 }
 
 void UEcoFrameProfiler::FinishCapture()
@@ -340,8 +364,10 @@ void UEcoFrameProfiler::FinishCapture()
         return;
     }
 
-    // Cabecera pensada para abrirse tal cual en una hoja de calculo o en pandas.
+    // Cabecera pensada para abrirse tal cual en una hoja de cálculo. Los fps se derivan
+    // aquí en lugar de guardarse por fila, porque son función exacta de FrameMs.
     FString Csv = TEXT("Frame,TimeSec,FrameMs,FPS,Population,TickMs,RelevelMs,Hero,Instance,Impostor,Culled\n");
+    // Reserva estimada de la cadena entera: sin ella el volcado crece de forma cuadrática.
     Csv.Reserve(Samples.Num() * 72);
 
     for (int32 i = 0; i < Samples.Num(); ++i)
@@ -358,11 +384,11 @@ void UEcoFrameProfiler::FinishCapture()
 
     if (FFileHelper::SaveStringToFile(Csv, *Path))
     {
-        UE_LOG(LogEcoProfile, Log, TEXT("[Eco/F6] Captura guardada: %s (%d frames)."), *Path, Samples.Num());
+        UE_LOG(LogEcoProfile, Log, TEXT("[Eco/Perfil] Captura guardada: %s (%d frames)."), *Path, Samples.Num());
     }
     else
     {
-        UE_LOG(LogEcoProfile, Error, TEXT("[Eco/F6] No se pudo escribir la captura: %s"), *Path);
+        UE_LOG(LogEcoProfile, Error, TEXT("[Eco/Perfil] No se pudo escribir la captura: %s"), *Path);
     }
 
     Samples.Reset();

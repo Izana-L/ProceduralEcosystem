@@ -1,8 +1,26 @@
+/**
+ * @file TreeLibrary.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de la librería: fábrica de parámetros, horneado y componentes.
+ *
+ * Contiene la fábrica de parámetros GetArchetypeSpecies, que duplica la especie base, la
+ * re-escala al bucket, comprime la copa y recorta la complejidad de los arquetipos jóvenes con
+ * curvas de potencia, les aplica el jitter estable de la variante y reimpone después las
+ * invariantes de la colonización del espacio; el horneado de un arquetipo, generado en el
+ * origen y sin luz gruesa porque es un árbol genérico que no sabe dónde acabará; la cola FIFO
+ * con cursor que reparte ese coste entre frames; la creación de los componentes de instancing
+ * con su viento y su cull por distancia; y el recuento agregado de la librería.
+ *
+ * @ingroup eco_render
+ * @see @ref bib_runions2007
+ * @see @ref bib_instancing
+ */
+
 #include "Render/TreeLibrary.h"
 #include "Render/TreeMeshBaker.h"
-#include "Render/TreeInstanceHost.h" // fabrica comun de componentes de instancing
+#include "Render/TreeInstanceHost.h" // fábrica común de componentes de instancing
 
-#include "Core/EcoStats.h" // Fase 6: instrumentacion (stat EcoRender / Insights)
+#include "Core/EcoStats.h" // contadores del grupo EcoRender
 #include "Species/SpeciesData.h"
 #include "Geometry/SpaceColonization.h"
 #include "Geometry/TreeSkeleton.h"
@@ -49,7 +67,7 @@ USpeciesData* UTreeLibrary::GetBaseSpecies(uint16 SpeciesId) const
 }
 
 // ---------------------------------------------------------------------------
-//  Fabrica de parametros: la especie "vista" por un arquetipo
+//  Fábrica de parámetros: la especie tal como la ve un arquetipo
 // ---------------------------------------------------------------------------
 const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
 {
@@ -70,19 +88,18 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
         return nullptr;
     }
 
-    // S = tamano del bucket como fraccion del adulto (borde superior del bucket).
+    // S = talla del bucket como fracción del adulto, medida en su borde superior.
     const float S = TreeArchetype::BucketUpperRatio(Key.AgeBucket, Config.NumAgeBuckets);
 
-    // Compresion adicional de la COPA en los buckets jovenes. Con la copa
-    // encogida y la fraccion de tronco subida, el bucket bajo es casi todo
-    // fuste con un penacho arriba: la silueta de un planton, no la de un adulto
-    // en miniatura. Las dos palancas se compensan en altura total, porque
-    // TotalH = CrownHeight / (1 - TrunkFraction).
+    // Compresión adicional de la copa en los buckets jóvenes. Con la copa encogida y la
+    // fracción de tronco subida, el bucket bajo es casi todo fuste con un penacho arriba: la
+    // silueta de una plántula, no la de un adulto en miniatura. Las dos palancas se compensan
+    // en altura total, porque TotalH = CrownHeight / (1 - TrunkFraction).
     const float CrownSquash = FMath::Lerp(0.30f, 1.f, S);
 
-    // --- Longitudes: escalan TODAS con S ---
-    // Escalarlas juntas preserva las dos invariantes que valida
-    // USpeciesData::IsDataValid: d_k < D < d_i y d_i > hueco de tronco.
+    // --- Longitudes: escalan todas con S ---
+    // Escalarlas juntas preserva las dos invariantes que valida USpeciesData::IsDataValid:
+    // d_k < D < d_i, y d_i mayor que el hueco de tronco.
     Sp->CrownRadiusCm = Base->CrownRadiusCm * S * CrownSquash;
     Sp->CrownHeightCm = Base->CrownHeightCm * S * CrownSquash;
     Sp->StepLengthD = Base->StepLengthD * S;
@@ -93,57 +110,52 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     Sp->MaxHeightCm = Base->MaxHeightCm * S;
     Sp->TrunkFlareHeightCm = FMath::Max(1.f, Base->TrunkFlareHeightCm * S);
 
-    // --- Perfil y relieve de tronco: NO son invariantes de escala ---
-    // Un planton no tiene contrafuertes ni corteza acostillada: eso lo construye
-    // el arbol con las decadas. Escalar el ensanche por S a secas dejaria a los
-    // buckets bajos con un pie desproporcionado, que es peor que no tenerlo.
+    // --- Perfil y relieve de tronco: no son invariantes de escala ---
+    // Una plántula no tiene contrafuertes ni corteza acostillada: eso lo construye el árbol
+    // con las décadas. Escalar el ensanche por S a secas dejaría a los buckets bajos con un pie
+    // desproporcionado, que es peor que no tenerlo.
     Sp->TrunkFlareStrength = Base->TrunkFlareStrength * FMath::Lerp(0.25f, 1.f, S);
 
-    // El relieve cae con S^2 a proposito: por debajo del umbral del mallador se
-    // apaga solo, y con el se apagan tambien los segmentos de anillo extra. Los
-    // buckets pequenos -que son los que se instancian a millares- se quedan asi
-    // en la malla barata de siempre.
+    // El relieve cae con S^2: por debajo del umbral del mallador se apaga solo, y con él se
+    // apagan también los segmentos de anillo extra. Los buckets pequeños —los que se
+    // instancian a millares— se quedan así en la malla barata.
     Sp->SectionLobeAmount = Base->SectionLobeAmount * S * S;
     Sp->BarkReliefAmount = Base->BarkReliefAmount * S * S;
 
-    // Un planton es casi todo eje con un penacho: el lider llega arriba del todo.
+    // Una plántula es casi todo eje con un penacho: el líder llega arriba del todo.
     Sp->LeaderFraction = FMath::Clamp(FMath::Lerp(0.9f, Base->LeaderFraction, S), 0.f, 1.f);
 
-    // --- Complejidad: un plantón NO es un adulto a escala ---
-    // Si escalasemos TODO por S, el SCA es invariante de escala y las 5 mallas
-    // del bucket saldrian identicas salvo tamano: no habria ganado nada por
-    // hornear 5. Reduciendo iteraciones y atractores, los buckets pequenos
-    // tienen menos orden de ramificacion (que es lo que de verdad distingue a un
-    // plantón de un adulto) y ademas mallas mas baratas: la libreria hace
-    // tambien de LOD por edad.
+    // --- Complejidad: una plántula no es un adulto a escala ---
+    // La colonización del espacio es invariante de escala, así que escalarlo todo por S daría
+    // los N buckets idénticos salvo en tamaño y no habría ganado nada por hornear N. Bajando
+    // iteraciones y atractores, los buckets pequeños tienen menos orden de ramificación —que
+    // es lo que de verdad distingue a una plántula de un adulto— y además mallas más baratas:
+    // la librería hace también de LOD por edad.
     //
-    // La curva es de POTENCIA, no lineal: un Lerp con S = 0.2 seguia dejando la
-    // mitad de los atractores en el bucket mas pequeno, y con esa densidad la
-    // copa sale ramificada igual. El suelo del Max() esta por debajo de lo que
-    // aporta la cadena de tronco desnudo, asi que ningun arquetipo puede quedar
-    // por debajo de los 2 nodos que exige el mallador.
+    // Las curvas son de potencia y no lineales porque una interpolación lineal con S = 0.2
+    // aún deja la mitad de los atractores en el bucket más pequeño, y con esa densidad la
+    // copa sale igual de ramificada. El suelo de cada Max() queda por debajo de lo que aporta
+    // la cadena de tronco desnudo, así que ningún arquetipo baja de los dos nodos que exige
+    // el mallador.
     Sp->MaxIter = FMath::Max(4, FMath::RoundToInt(Base->MaxIter * FMath::Pow(S, 0.9f)));
     Sp->NumAttractors = FMath::Max(12, FMath::RoundToInt(Base->NumAttractors * FMath::Pow(S, 2.2f)));
     Sp->RingSegments = FMath::Clamp(FMath::RoundToInt(Base->RingSegments * FMath::Lerp(0.6f, 1.f, S)), 3, 16);
     Sp->TrunkFraction = FMath::Clamp(FMath::Lerp(0.62f, Base->TrunkFraction, S), 0.f, 0.95f);
-    Sp->LeafSizeCm = Base->LeafSizeCm * FMath::Lerp(0.55f, 1.f, S);       // hoja relativamente MAYOR de joven
-    Sp->LeafSpacingCm = Base->LeafSpacingCm * FMath::Lerp(0.55f, 1.f, S); // ... y por tanto mas junta
+    // Hoja relativamente mayor de joven, y por tanto también más junta.
+    Sp->LeafSizeCm = Base->LeafSizeCm * FMath::Lerp(0.55f, 1.f, S);
+    Sp->LeafSpacingCm = Base->LeafSpacingCm * FMath::Lerp(0.55f, 1.f, S);
 
-    // --- Fase 6: un arbol joven es MAS flexible que uno adulto ---
-    // Un tronco de 2 m se dobla con el viento; uno de 20 m con 60 cm de diametro
-    // apenas. Como la rigidez se hornea en los canales UV de la malla (ver
-    // TreeWindData.h), basta con modularla aqui por bucket y cada arquetipo sale
-    // ya con el balanceo que le toca por su tamano, sin coste en runtime.
+    // --- Un árbol joven es más flexible que uno adulto ---
+    // Un tronco de 2 m se dobla con el viento; uno de 20 m con 60 cm de diámetro apenas. Como
+    // la rigidez se hornea en los canales UV de la malla, basta modularla aquí por bucket y
+    // cada arquetipo sale con el balanceo que le toca por su tamaño, sin coste en runtime.
     Sp->WindStiffness = FMath::Clamp(Base->WindStiffness * FMath::Lerp(0.45f, 1.f, S), 0.f, 1.f);
 
-    // --- Variante: perturbacion pequena y ESTABLE de la morfologia ---
-    // (doc. 4.2: "variacion parametrizada ... para que no haya dos identicos").
-    //
-    // La semilla IGNORA el bucket a proposito. Si entrase, un arbol cambiaria de
-    // radio de copa, de altura y de tropismos cada vez que cruza de bucket: no
-    // ganaria estructura con la edad, se convertiria en otro arbol. Con la
-    // semilla atada solo a (especie, variante), los 5 buckets son cinco etapas
-    // de la MISMA morfologia.
+    // --- Variante: perturbación pequeña y estable de la morfología ---
+    // La semilla ignora el bucket. Si entrase, un árbol cambiaría de radio de copa, de altura
+    // y de tropismos cada vez que cruza de bucket: no ganaría estructura con la edad, se
+    // convertiría en otro árbol. Atada solo a (especie, variante), los buckets son etapas de
+    // la misma morfología.
     uint32 VRng = EcoRand::Hash32(FArchetypeKey(Key.Species, 0, Key.Variant).Pack() * 0x9E3779B9u + 0x51ED270Bu);
     auto Jitter = [&VRng](float Value, float Amount)
         {
@@ -155,27 +167,28 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     Sp->wSCA = Jitter(Sp->wSCA, 0.15f);
     Sp->wPrev = Jitter(Sp->wPrev, 0.20f);
 
-    // Sinuosidad base del fuste: tambien varia por variante. Va AL FINAL de la
-    // lista a proposito -anadirlo en medio desplazaria las tiradas de VRng de
-    // arriba y cambiaria la copa de todos los arquetipos ya calibrados-.
+    // Sinuosidad base del fuste, también por variante. El orden de las tiradas de VRng es
+    // parte del contrato: insertar una llamada en medio desplazaría las siguientes y
+    // cambiaría la copa de todos los arquetipos ya calibrados, así que las nuevas van al
+    // final.
     //
-    // Es el complemento de las capas de TrunkDeformLayers: aquellas deciden
-    // "arqueado o recto" (binario por arbol), y esto reparte la ondulacion sutil
-    // que llevan TODOS, de modo que los "rectos" tampoco son iguales entre si.
+    // Complementa a las capas de TrunkDeformLayers: aquéllas deciden arqueado o recto, un
+    // rasgo binario por árbol, y esto reparte la ondulación sutil que llevan todos, de modo
+    // que los rectos tampoco son iguales entre sí.
     Sp->TrunkSweepDeg = Jitter(Sp->TrunkSweepDeg, 0.30f);
 
-    // --- Red de seguridad: reimponer las invariantes del SCA tras el jitter ---
-    // Sin esto, una variante desafortunada puede dar d_i <= hueco de tronco y el
-    // SCA no arranca (ningun atractor en rango del nodo base): arquetipo vacio.
+    // --- Red de seguridad: reimponer las invariantes del algoritmo tras el jitter ---
+    // Sin esto, una variante desafortunada puede dar d_i menor o igual que el hueco de
+    // tronco; entonces ningún atractor cae en rango del nodo base, el crecimiento no arranca
+    // y el arquetipo sale vacío.
     Sp->KillRadiusDk = FMath::Clamp(Sp->KillRadiusDk, 0.1f, Sp->StepLengthD * 0.9f);
     Sp->InfluenceRadiusDi = FMath::Max(Sp->InfluenceRadiusDi, Sp->StepLengthD * 1.2f);
     if (Sp->SubCrownFraction <= 0.f)
     {
-        // Sin falda de sub-copa, el atractor mas bajo esta en la base de la copa
-        // y el nodo raiz tiene que alcanzarlo o el SCA no arranca. Con falda hay
-        // atractores repartidos por el fuste, asi que esta red de seguridad
-        // sobra -y estirar d_i de mas empeora el cono de percepcion, porque cada
-        // nodo pasa a competir por atractores mucho mas lejanos.
+        // Sin falda de sub-copa, el atractor más bajo está en la base de la copa y el nodo
+        // raíz tiene que alcanzarlo. Con falda hay atractores repartidos por el fuste y esta
+        // red de seguridad sobra: estirar d_i de más empeora el cono de percepción, porque
+        // cada nodo pasa a competir por atractores mucho más lejanos.
         const float TF = FMath::Clamp(Sp->TrunkFraction, 0.f, 0.95f);
         const float TrunkGapCm = Sp->CrownHeightCm * TF / (1.f - TF);
         Sp->InfluenceRadiusDi = FMath::Max(Sp->InfluenceRadiusDi, TrunkGapCm * 1.1f + Sp->StepLengthD);
@@ -186,7 +199,7 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
 }
 
 // ---------------------------------------------------------------------------
-//  Horneado
+//  Horneado de arquetipos y cola amortizada
 // ---------------------------------------------------------------------------
 FTreeArchetypeEntry* UTreeLibrary::Find(const FArchetypeKey& Key)
 {
@@ -212,8 +225,8 @@ FTreeArchetypeEntry* UTreeLibrary::FindOrRequestBake(const FArchetypeKey& Key)
 
 int32 UTreeLibrary::ProcessBakeQueue(int32 MaxThisFrame)
 {
-    // FIFO con cursor de lectura: avanzar BakeQueueHead evita el RemoveAt(0)
-    // que desplazaba todos los elementos restantes en cada extraccion.
+    // FIFO con cursor de lectura: avanzar BakeQueueHead evita el RemoveAt(0), que desplazaría
+    // todos los elementos restantes en cada extracción.
     int32 Done = 0;
     while (BakeQueueHead < BakeQueue.Num() && Done < FMath::Max(1, MaxThisFrame))
     {
@@ -226,7 +239,7 @@ int32 UTreeLibrary::ProcessBakeQueue(int32 MaxThisFrame)
         }
     }
 
-    // Cola drenada: compactar de una vez (conserva la capacidad).
+    // Cola drenada: compactar de una vez, conservando la capacidad.
     if (BakeQueueHead >= BakeQueue.Num())
     {
         BakeQueue.Reset();
@@ -271,9 +284,9 @@ int32 UTreeLibrary::BakeAll()
 
 bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
 {
-    // Fase 6 (6.4): el horneado es EL pico de coste puntual del game thread.
-    // Marcarlo hace que salga como bloque propio en Unreal Insights y en
-    // `stat EcoRender`, que es donde se ve si MaxBakesPerFrame esta bien puesto.
+    // El horneado es el pico de coste puntual del hilo de juego. Instrumentarlo lo hace
+    // aparecer como bloque propio en el perfilado y en `stat EcoRender`, que es donde se ve
+    // si el presupuesto de horneados por frame está bien puesto.
     SCOPE_CYCLE_COUNTER(STAT_EcoBake);
     TRACE_CPUPROFILER_EVENT_SCOPE(Eco_BakeArchetype);
 
@@ -284,34 +297,31 @@ bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
         return false;
     }
 
-    // Semilla FIJA por arquetipo: la libreria es la misma en cada arranque
-    // (doc. 3.8: "para la libreria se generan K variantes con K semillas").
+    // Semilla fija por arquetipo: la librería sale idéntica en cada arranque.
     uint32 Rng = ArchetypeSeed(Key);
 
-    // El arbol de libreria se genera en el ORIGEN y SIN luz gruesa: es un arbol
-    // generico, no sabe donde acabara. El contexto real de vecinos (micro<-macro,
-    // doc. 3.5) es justo lo que distingue a un hero tree de una instancia.
+    // El árbol de librería se genera en el origen y sin luz gruesa: es un árbol genérico que
+    // no sabe dónde acabará. Recibir el contexto real de vecinos es justo lo que distingue a
+    // un hero tree de una instancia.
     FTreeSkeleton Skeleton;
     FTreeLightGridFine FineLight;
     FAttractorCloud Attractors;
 
     FSpaceColonizationConfig Cfg;
-    // La curvatura de tronco se ata a (especie, variante) IGNORANDO el bucket:
-    // los buckets de una variante son las etapas de un mismo arbol, y sin esto
-    // un individuo pasaria de recto a arqueado al cruzar de bucket de edad
-    // (mismo motivo por el que el jitter de morfologia de GetArchetypeSpecies
-    // tampoco mira el bucket). Ver UTreeLibrary::VariantDeformSeed.
+    // La curvatura del tronco se ata a (especie, variante) ignorando el bucket: los buckets
+    // de una variante son las etapas de un mismo árbol, y sin esto un individuo pasaría de
+    // recto a arqueado al crecer. Es el mismo motivo por el que el jitter de morfología de
+    // GetArchetypeSpecies tampoco mira el bucket.
     Cfg.DeformSeedOverride = static_cast<int64>(VariantDeformSeed(Key.Species, Key.Variant));
 
     SpaceColonization::GrowTree(*Sp, Rng, FVector::ZeroVector, /*CoarseLight*/ nullptr, Cfg,
         Skeleton, FineLight, Attractors);
 
-    // Fase 6 (6.2): aunque el arquetipo no conozca a sus vecinos, SI conoce su
-    // propia autosombra -la rejilla fina que dejo el SCA-, asi que el AO de copa
-    // por vertice se hornea igual. Es la parte del AO que no depende del sitio:
-    // el interior de la copa esta oscuro en cualquier arbol. La parte que SI
-    // depende del sitio (estar bajo el dosel de un vecino) viaja aparte, por
-    // instancia, en PerInstanceCustomData[2].
+    // Aunque el arquetipo no conozca a sus vecinos, sí conoce su propia autosombra —la
+    // rejilla fina que dejó el crecimiento—, así que la oclusión ambiental de copa por
+    // vértice se hornea igual. Es la parte de la oclusión que no depende del sitio: el
+    // interior de la copa está oscuro en cualquier árbol. La que sí depende del sitio, estar
+    // bajo el dosel de un vecino, viaja por instancia en PerInstanceCustomData[2].
     FTreeMeshData MeshData;
     TreeMeshBuilder::BuildMesh(Skeleton, *Sp, Rng, MeshData, &FineLight);
 
@@ -346,25 +356,20 @@ bool UTreeLibrary::BakeArchetype(const FArchetypeKey& Key)
 // ---------------------------------------------------------------------------
 
 /**
- * Fase 6 (doc. 6.1): ajustes de viento de UN componente.
+ * Ajustes de viento de un componente. Las tres llamadas acotan el coste de mover vértices en
+ * el material:
  *
- * Las tres llamadas son el caveat de rendimiento del documento hecho codigo:
+ * @li `SetEvaluateWorldPositionOffset` es el interruptor duro: con false el componente ni
+ *     siquiera ejecuta la parte de desplazamiento del vertex shader, y es lo que deja los
+ *     impostores del campo lejano completamente estáticos.
+ * @li `SetWorldPositionOffsetDisableDistance` corta el balanceo dentro del propio componente
+ *     más allá del radio dado, de modo que solo se mueven los árboles cercanos.
+ * @li `SetBoundsScale` compensa que el culling trabaja con la caja envolvente sin mover; sin
+ *     margen, un árbol en el borde del encuadre parpadea.
  *
- *   - SetEvaluateWorldPositionOffset: el interruptor duro. Con false el
- *     componente ni siquiera ejecuta la parte de WPO del vertex shader; es lo
- *     que deja los impostors del campo lejano completamente estaticos.
- *
- *   - SetWorldPositionOffsetDisableDistance: el corte por distancia dentro del
- *     propio componente. Las instancias mas alla del radio dejan de moverse
- *     solas, que es exactamente "solo se mueven los arboles cercanos".
- *
- *   - SetBoundsScale: el precio de mover vertices en el material es que el
- *     culling trabaja con la caja SIN mover. Sin margen, un arbol en el borde de
- *     la pantalla parpadea.
- *
- * NOTA DE COMPATIBILIDAD: SetWorldPositionOffsetDisableDistance existe desde
- * UE 5.1. Si compilas contra una version anterior, borra esa linea (perderas el
- * corte por distancia, no el resto).
+ * @note `SetWorldPositionOffsetDisableDistance` existe desde UE 5.1. Contra una versión
+ *       anterior, esa línea sobra y solo se pierde el corte por distancia.
+ * @see @ref bib_vientovegetacion
  */
 void UTreeLibrary::ConfigureWind(UHierarchicalInstancedStaticMeshComponent* Comp, bool bImpostor) const
 {
@@ -412,8 +417,8 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
         return nullptr;
     }
 
-    // Configuracion comun de todo componente de instancing del proyecto
-    // (movilidad, colision, navmesh, sombra): la comparte con la capa de suelo.
+    // Configuración común a todo componente de instancing del proyecto —movilidad, colisión,
+    // navegación y sombra—, compartida con la capa de suelo.
     const FName CompName(*FString::Printf(TEXT("ISM_%s%s"),
         *Key.ToString(), bImpostor ? TEXT("_Imp") : TEXT("")));
     UHierarchicalInstancedStaticMeshComponent* Comp = ATreeInstanceHost::CreateInstancedComponent(
@@ -425,17 +430,16 @@ UHierarchicalInstancedStaticMeshComponent* UTreeLibrary::GetOrCreateComponent(co
         return nullptr;
     }
 
-    // Y lo especifico de los ARBOLES: viento y cull por distancia.
-    // Fase 6: viento + margen de bounds (ver ConfigureWind).
+    // Y lo específico de los árboles: viento, margen de la caja envolvente y cull.
     ConfigureWind(Comp, bImpostor);
 
     const float EndCull = bImpostor ? Config.ImpostorEndCullDistanceCm : Config.InstanceEndCullDistanceCm;
     if (EndCull > 0.f)
     {
-        // El fade del ISM debe ser un backstop ESTRECHO justo antes del corte, no
-        // repartirse por todo el rango: con StartCull=0 las instancias se
-        // difuminan desde la distancia 0 (el bosque "ralea"). Arrancamos el fade
-        // en el 90% del cull para que no compita con la conmutacion de nivel.
+        // El desvanecido del componente es una red de seguridad estrecha justo antes del
+        // corte, no un degradado repartido por todo el rango: con la distancia de inicio a 0
+        // las instancias se difuminan desde el observador y el bosque ralea. Arrancarlo en el
+        // 90 % del cull evita además que compita con la conmutación de nivel.
         const int32 End = FMath::RoundToInt(EndCull);
         const int32 Start = FMath::RoundToInt(EndCull * 0.9f);
         Comp->SetCullDistances(Start, End);

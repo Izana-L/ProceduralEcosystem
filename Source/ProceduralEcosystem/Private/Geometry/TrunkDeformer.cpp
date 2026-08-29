@@ -1,3 +1,20 @@
+/**
+ * @file TrunkDeformer.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación del doblado de tronco: ángulo por tipo de capa, composición en
+ *        rotation-vector y re-encadenado isométrico del esqueleto.
+ *
+ * Contiene la función de ángulo de cada tipo de capa (inclinación constante, arco
+ * @f$\theta t^{k}@f$ y onda @f$\theta\sin(2\pi k t+\varphi)@f$), la composición de las
+ * capas activas sumando rotation-vectors —eje horizontal por ángulo— con un recorte de
+ * magnitud que preserva la dirección de la suma, la conversión a cuaternión con guarda de
+ * degeneración, el sorteo por capa que fija la curvatura de un árbol concreto y la pasada
+ * única que recoloca todos los nodos conservando la longitud de cada internodo.
+ *
+ * @ingroup eco_geometry
+ * @see @ref bib_barr1984
+ */
+
 #include "Geometry/TrunkDeformer.h"
 #include "Geometry/TreeSkeleton.h"
 #include "Species/SpeciesData.h"
@@ -6,22 +23,19 @@
 namespace
 {
     /**
-     * Angulo de la capa a la altura normalizada t (0 = base del tronco, 1 =
-     * punta del arbol sin deformar). Es LA funcion que define como se lee cada
-     * tipo, y esta sola en su sitio para poder anadir tipos nuevos sin tocar el
-     * re-encadenado:
+     * Ángulo de la capa a la altura normalizada t, con 0 en la base del tronco y 1 en la
+     * punta del árbol sin deformar:
      *
-     *   Lean   -> constante: TODO el arbol gira el mismo angulo alrededor de su
-     *             pie. Se lee como "plantado torcido" (o crecido en ladera), no
-     *             como arqueado: usalo con angulos pequenos (<=10 grados) o
-     *             parecera que se cae.
-     *   Arc    -> Angle * t^Param: el fuste sale vertical del suelo y se va
-     *             tumbando con la altura. ES el arbol arqueado, y el unico tipo
-     *             cuya lectura mejora con angulos grandes. Param < 1 arquea
-     *             desde abajo; Param > 1 mantiene el pie recto y vuelca arriba.
-     *   SCurve -> Angle * sin(2*PI*Param*t + Phase): el tronco serpentea. Param
-     *             es el nº de ondas en toda la altura; con 1.5-2 se lee como
-     *             madera de ribera, con mas se lee como ruido.
+     * @li Lean: @f$\theta@f$ constante, el árbol entero gira alrededor de su pie.
+     * @li Arc: @f$\theta\,t^{k}@f$, el fuste sale vertical y se tumba con la altura;
+     *     @f$k<1@f$ arquea desde abajo y @f$k>1@f$ mantiene el pie recto.
+     * @li SCurve: @f$\theta\sin(2\pi k t+\varphi)@f$, el tronco serpentea con @f$k@f$
+     *     ondas en toda la altura.
+     *
+     * Es la única pieza que depende del tipo de capa: añadir un tipo nuevo no toca el
+     * re-encadenado.
+     *
+     * @see ETrunkDeformType
      */
     FORCEINLINE float LayerAngleAt(const TrunkDeformer::FTrunkDeformLayerState& L, float t)
     {
@@ -31,7 +45,7 @@ namespace
             return L.AngleRad;
 
         case ETrunkDeformType::Arc:
-            // Pow con exponente fraccionario sobre t >= 0: seguro.
+            // t nunca es negativo, así que el exponente fraccionario es seguro.
             return L.AngleRad * FMath::Pow(t, FMath::Max(L.Param, 0.01f));
 
         case ETrunkDeformType::SCurve:
@@ -43,14 +57,14 @@ namespace
     }
 
     /**
-     * Vector de doblado a la altura t: suma de las capas, cada una como
-     * "eje de rotacion horizontal x angulo" (representacion rotation-vector).
+     * Vector de doblado a la altura t: suma de las capas, cada una como eje de rotación
+     * horizontal por ángulo (representación rotation-vector).
      *
-     * El eje de una capa que inclina el arbol HACIA el azimut A es el horizontal
-     * perpendicular a A, o sea (-sin A, cos A, 0): rotar la vertical alrededor
-     * de el la lleva a (cos A * sin O, sin A * sin O, cos O). Sumar en forma de
-     * rotation-vector (y no componer cuaterniones) es lo que permite que dos
-     * capas con azimuts distintos se combinen en una sola rotacion suave.
+     * El eje de una capa que inclina el árbol HACIA el azimut @f$A@f$ es el horizontal
+     * perpendicular a él, @f$(-\sin A,\ \cos A,\ 0)@f$: rotar la vertical alrededor de ese
+     * eje la lleva a @f$(\cos A\sin\Theta,\ \sin A\sin\Theta,\ \cos\Theta)@f$. Sumar en
+     * forma de rotation-vector, en vez de componer cuaterniones, es lo que permite que dos
+     * capas con azimuts distintos se combinen en una sola rotación suave.
      */
     FORCEINLINE FVector BendVectorAt(const TrunkDeformer::FTrunkDeformState& State, float t)
     {
@@ -61,9 +75,9 @@ namespace
             Bend += FVector(-FMath::Sin(L.AzimuthRad), FMath::Cos(L.AzimuthRad), 0.f) * Angle;
         }
 
-        // Tope del doblado acumulado: preserva la DIRECCION de la suma y solo
-        // recorta su magnitud, asi que dos capas que se cancelan siguen
-        // cancelandose (a diferencia de clampar cada capa por separado).
+        // Tope del doblado acumulado: preserva la DIRECCIÓN de la suma y solo recorta su
+        // magnitud, así que dos capas que se cancelan siguen cancelándose, a diferencia
+        // de lo que ocurriría recortando cada capa por separado.
         const FVector::FReal Mag = Bend.Size();
         if (Mag > TrunkDeformer::MaxTrunkBendRad)
         {
@@ -72,10 +86,14 @@ namespace
         return Bend;
     }
 
-    /** Rotacion a partir del rotation-vector, con identidad para |v| ~ 0.
-        Nunca GetSafeNormal a un eje arbitrario: con angulo ~0 el eje es ruido
-        numerico puro y una rotacion de 0 radianes alrededor de un eje aleatorio
-        es identidad de todos modos, pero la de 1e-8 radianes NO es reproducible. */
+    /**
+     * Rotación a partir del rotation-vector, con identidad para @f$|v|\approx 0@f$.
+     *
+     * @warning No sustituir la guarda por un GetSafeNormal con eje arbitrario: con ángulo
+     *          casi nulo el eje es ruido numérico puro, y aunque una rotación de 0
+     *          radianes alrededor de cualquier eje sea la identidad, una de 1e-8 radianes
+     *          no es reproducible entre ejecuciones.
+     */
     FORCEINLINE FQuat QuatFromBendVector(const FVector& Bend)
     {
         const FVector::FReal Mag = Bend.Size();
@@ -91,15 +109,15 @@ TrunkDeformer::FTrunkDeformState TrunkDeformer::Sample(const USpeciesData& Speci
 {
     FTrunkDeformState State;
 
-    // Copia local del estado: esta funcion no puede tener efectos sobre ningun
-    // stream del llamante (ver la nota de determinismo del header).
+    // Copia local del estado del generador: esta función no puede tener efectos sobre
+    // ningún stream del llamante.
     uint32 Rng = DeformSeed;
 
     for (const FTrunkDeformLayerSpec& Spec : Species.TrunkDeformLayers)
     {
-        // --- 4 extracciones SIEMPRE, en orden fijo, ANTES de la puerta ---
-        // Es el contrato de muestreo del header: cambiar Probability no puede
-        // desplazar las muestras de las capas siguientes.
+        // Cuatro extracciones SIEMPRE, en orden fijo y ANTES de la puerta: es el contrato
+        // de muestreo, y garantiza que cambiar Probability no desplaza las muestras de
+        // las capas siguientes.
         const float Gate = EcoRand::NextUnit(Rng);
         const float AngleU = EcoRand::NextUnit(Rng);
         const float AzimuthU = EcoRand::NextUnit(Rng);
@@ -107,11 +125,11 @@ TrunkDeformer::FTrunkDeformState TrunkDeformer::Sample(const USpeciesData& Speci
 
         if (Gate >= FMath::Clamp(Spec.Probability, 0.f, 1.f))
         {
-            continue; // a este arbol no le toca esta capa
+            continue; // a este árbol no le toca esta capa
         }
 
-        // Min > Max en el asset no es fatal: se ordena y se sigue (IsDataValid
-        // ya avisa en el editor).
+        // Un Min mayor que Max en el asset no es fatal: se ordenan y se sigue, que
+        // IsDataValid ya avisa en el editor.
         const float MinDeg = FMath::Min(Spec.MinAngleDeg, Spec.MaxAngleDeg);
         const float MaxDeg = FMath::Max(Spec.MinAngleDeg, Spec.MaxAngleDeg);
 
@@ -122,11 +140,10 @@ TrunkDeformer::FTrunkDeformState TrunkDeformer::Sample(const USpeciesData& Speci
         L.Phase = PhaseU * 2.f * PI;
         L.Param = FMath::Max(Spec.ShapeParam, 0.01f);
 
-        // No hace falta sortear ademas el SIGNO del angulo: el azimut ya recorre
-        // la circunferencia entera, y "angulo negativo hacia A" es exactamente
-        // "angulo positivo hacia A + PI". En SCurve lo cubre igualmente la fase
-        // (sin(x + PI) = -sin(x)). Anadir un sorteo de signo solo correlacionaria
-        // dos muestras que deben ser independientes.
+        // El signo del ángulo no se sortea: el azimut ya recorre la circunferencia
+        // entera, y un ángulo negativo hacia A es exactamente uno positivo hacia A + PI.
+        // En SCurve lo cubre igualmente la fase, con sin(x + PI) = -sin(x). Un sorteo de
+        // signo adicional solo correlacionaría dos muestras que deben ser independientes.
         State.Layers.Add(L);
     }
 
@@ -140,8 +157,8 @@ float TrunkDeformer::MaxLateralReachCm(const USpeciesData& Species, float TotalH
         return 0.f;
     }
 
-    // Peor caso: todas las capas activas, todas a su angulo maximo y todas
-    // apuntando al mismo azimut.
+    // Peor caso: todas las capas activas, cada una a su ángulo máximo y todas apuntando
+    // al mismo azimut.
     float SumRad = 0.f;
     for (const FTrunkDeformLayerSpec& Spec : Species.TrunkDeformLayers)
     {
@@ -165,7 +182,7 @@ void TrunkDeformer::ApplyToSkeleton(FTreeSkeleton& Skeleton, const FTrunkDeformS
     const double BaseZ = TrunkBaseWorld.Z;
 
     // Posiciones ORIGINALES: el re-encadenado necesita el vector padre->hijo sin
-    // deformar, y para cuando le toca al hijo su padre ya se ha movido.
+    // deformar, y cuando le llega el turno al hijo su padre ya se ha movido.
     TArray<FVector> OldPos;
     OldPos.SetNumUninitialized(NumNodes);
     for (int32 i = 0; i < NumNodes; ++i)
@@ -173,13 +190,13 @@ void TrunkDeformer::ApplyToSkeleton(FTreeSkeleton& Skeleton, const FTrunkDeformS
         OldPos[i] = Skeleton.Nodes[i].Pos;
     }
 
-    // La raiz NO se mueve (el arbol sigue plantado donde estaba), pero su
-    // direccion si rota: la consume el primer anillo de seccion del mallador.
+    // La raíz NO se mueve, porque el árbol sigue plantado donde estaba, pero su dirección
+    // sí rota: la consume el primer anillo de sección del mallador.
     Skeleton.Nodes[0].Dir = QuatFromBendVector(BendVectorAt(State, 0.f))
         .RotateVector(Skeleton.Nodes[0].Dir).GetSafeNormal(SMALL_NUMBER, FVector::UpVector);
 
-    // Una pasada en orden de indice CRECIENTE: la invariante Parent < indice
-    // garantiza que el padre ya esta en su sitio nuevo.
+    // Una pasada en orden de índice CRECIENTE: la invariante Parent < índice garantiza
+    // que el padre ya está en su sitio nuevo.
     for (int32 i = 1; i < NumNodes; ++i)
     {
         FBranchNode& Node = Skeleton.Nodes[i];
@@ -189,10 +206,10 @@ void TrunkDeformer::ApplyToSkeleton(FTreeSkeleton& Skeleton, const FTrunkDeformS
             continue; // esqueleto malformado: no es asunto de este paso
         }
 
-        // Altura normalizada del PADRE en el arbol SIN deformar. Del padre y no
-        // del propio nodo para que todos los hijos de un mismo nodo reciban la
-        // MISMA rotacion: si cada hijo usara su altura, una rama horizontal y su
-        // continuacion vertical se separarian en el nacimiento.
+        // Altura normalizada del PADRE en el árbol SIN deformar. Del padre y no del
+        // propio nodo para que todos los hijos de un mismo nodo reciban la MISMA
+        // rotación: con la altura de cada hijo, una rama horizontal y su continuación
+        // vertical se separarían en el nacimiento.
         const float t = FMath::Clamp(static_cast<float>((OldPos[P].Z - BaseZ) * InvTotalH), 0.f, 1.f);
 
         const FQuat R = QuatFromBendVector(BendVectorAt(State, t));

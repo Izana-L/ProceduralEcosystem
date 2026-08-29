@@ -1,102 +1,85 @@
+/**
+ * @file CarbonModel.h
+ * @author Juan Luque Roldán
+ * @brief Multiplicador analítico de CO2 sobre el vigor, sin campo ni estado.
+ *
+ * Recoge el gradiente vertical de CO2 del interior de un dosel —dentro de una masa
+ * densa de follaje el aire se renueva peor y la fotosíntesis del propio dosel deprime
+ * el CO2, mientras que por encima la mezcla con la atmósfera libre lo devuelve al
+ * valor de fondo— sin simularlo: ni rejilla, ni memoria, ni una línea más en el bucle
+ * caliente que una multiplicación. Reutiliza dos números que el tick ya tiene en la
+ * mano, la luz Q como proxy de la densidad de follaje local (la sombra la depositan
+ * las copas) y la altura de copa como proxy de la mezcla, y devuelve un factor que
+ * multiplica al vigor. Es un mecanismo más, pequeño, que favorece a los dominantes.
+ *
+ * @ingroup eco_ecology
+ * @see @ref bib_co2dosel
+ * @see EcoVigor::EvaluateVigor
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 
 /**
- * =============================================================================
- *  CO2 COMO CAPA DE REALISMO BARATA (Fase 6, doc. 6.3)
- * =============================================================================
+ * Factor de CO2 del vigor: funciones puras, inline y sin estado.
  *
- * El documento es explicito en lo que NO hay que hacer: "no una sim volumetrica",
- * "evitar adveccion en octree: cuesta mucho para un efecto imperceptible". Lo que
- * pide es "un multiplicador analitico del vigor que dependa un poco de la altura
- * o de la densidad de follaje local (menos CO2 dentro de una copa muy densa)",
- * con "coste ~0".
+ * @code
+ * Shade = clamp(1 - Q/FullSunlight, 0, 1)       densidad de follaje local
+ * Mix   = clamp(H / FullMixingHeightCm, 0, 1)   fracción de aire bien mezclado
+ * fCO2  = 1 - MaxReduction * Shade * (1 - Mix)  en [1 - MaxReduction, 1]
+ * vigor = min(fL, fW, fN) * fCO2
+ * @endcode
  *
- * Esta cabecera es exactamente eso: una funcion pura, inline, sin estado y sin
- * ninguna estructura de datos nueva. NO hay campo de CO2, no hay rejilla, no hay
- * memoria extra, no hay una sola linea mas en el bucle caliente que una
- * multiplicacion. Reutiliza dos numeros que el tick YA tiene en la mano:
+ * Se aplica multiplicando al mínimo de Liebig y no como cuarto factor del min(): la
+ * ley del mínimo describe recursos que se consumen y se agotan localmente, y aquí el
+ * CO2 no se simula como tal —no hay campo, ni consumo, ni agotamiento— sino como una
+ * modulación suave de la eficiencia fotosintética. Dentro del min() pasaría a decidir
+ * el crecimiento en cuanto bajara de los otros tres; como multiplicador afina y nunca
+ * decide.
  *
- *   - Q  : la luz disponible en el punto, que ya se muestreo para f_luz. Como la
- *          sombra de la rejilla de luz la depositan las COPAS, (1 - Q) es un
- *          proxy directo y gratis de la densidad de follaje local. Ecologicamente
- *          se sostiene: dentro de un dosel cerrado el aire se renueva peor y la
- *          fotosintesis del propio dosel deprime el CO2 (es un efecto real y
- *          medido en bosques densos, el llamado gradiente vertical de CO2).
- *
- *   - H  : la altura de la copa del arbol, que ya esta cacheada en la poblacion.
- *          Por encima del dosel el aire esta bien MEZCLADO con la atmosfera libre
- *          y el CO2 vuelve al valor de fondo. Por eso un arbol dominante casi no
- *          nota la penalizacion y una plantula del sotobosque si: es otro
- *          mecanismo mas -pequeno- que favorece a los dominantes, en la misma
- *          direccion que la competencia por luz.
- *
- * FORMULA
- *
- *     Shade = clamp(1 - Q, 0, 1)                        densidad de follaje local
- *     Mix   = clamp(H / FullMixingHeightCm, 0, 1)       fraccion de "aire libre"
- *     fCO2  = 1 - MaxReduction * Shade * (1 - Mix)
- *
- * Rango: [1 - MaxReduction, 1]. Con MaxReduction = 0.15 el efecto tope es un
- * -15% de vigor para una plantula bajo dosel cerrado, y practicamente 0 para un
- * arbol adulto o en un claro. Es "leve", como pide el Apendice A.
- *
- * ACOPLAMIENTO AL VIGOR
- *
- * Se aplica como MULTIPLICADOR sobre el minimo de Liebig, no como un cuarto
- * factor del min():
- *
- *     vigor = min(fL, fW, fN) * fCO2
- *
- * Es deliberado y conviene poder defenderlo: la ley del minimo describe recursos
- * que se CONSUMEN y se agotan localmente (agua, nutrientes, luz interceptada).
- * El CO2 aqui no se simula como recurso consumible -no hay campo, no hay
- * consumo, no hay agotamiento-, sino como una modulacion suave de la eficiencia
- * fotosintetica. Meterlo en el min() lo convertiria en limitante en cuanto
- * bajara de los otros tres y cambiaria el balance ecologico que se ajusto en la
- * Fase 2; como multiplicador solo "afina" y nunca decide.
- *
- * REPRODUCIBILIDAD
- *
- * Es determinista (no consume RNG) pero SI cambia el resultado de la simulacion:
- * un bosque con CO2 activado y otro sin el divergen. Para comparar corridas de la
- * memoria con las de la Fase 5, o para la ablacion de la Fase 7, se apaga con
- * la consola (Eco.CO2.Enable 0) o con bEnableCO2Factor en Project Settings, y
- * entonces la funcion devuelve 1.0 EXACTO -> resultados identicos bit a bit a
- * los de antes de la Fase 6.
+ * @note Con MaxReduction = 0.15 el efecto tope es un -15% de vigor para una plántula
+ *       bajo dosel cerrado y prácticamente nulo para un adulto o en un claro.
+ * @warning No consume RNG, pero sí cambia el resultado de la simulación: dos corridas
+ *          con la misma semilla y distinto bEnabled divergen. Apagado desde la consola
+ *          (Eco.CO2.Enable 0) o con bEnableCO2Factor devuelve 1.0 exacto, que es la
+ *          condición para que la ablación sea bit a bit idéntica.
  */
 namespace EcoCarbon
 {
-    /** Parametros del multiplicador (se rellenan desde UEcosystemSettings). */
+    /** Parámetros del multiplicador; se rellenan desde UEcosystemSettings. */
     struct FCO2Params
     {
-        /** false -> CO2Factor devuelve 1.0 exacto (ablacion). */
+        /** false -> CO2Factor devuelve 1.0 exacto (ablación). */
         bool  bEnabled = true;
 
-        /** Reduccion maxima del vigor, en fraccion. 0.15 = hasta -15%. */
+        /** Reducción máxima del vigor, en fracción. 0.15 = hasta -15%. */
         float MaxReduction = 0.15f;
 
-        /** Altura (cm) por encima de la cual se considera aire bien mezclado
-            (tipicamente, la altura del dosel dominante). */
+        /** Altura (cm) por encima de la cual se considera aire bien mezclado;
+            típicamente, la altura del dosel dominante. */
         float FullMixingHeightCm = 2500.f;
 
-        /** Luz plena de referencia (FLightFieldCoarse::FullSunlight). Se pasa
-            explicita para que la cabecera no dependa del grid de luz. */
+        /** Luz plena de referencia (FLightFieldCoarse::FullSunlight). Se pasa explícita
+            para que esta cabecera no dependa de la rejilla de luz. */
         float FullSunlight = 1.f;
     };
 
     /**
-     * Multiplicador de vigor por disponibilidad de CO2 en [1-MaxReduction, 1].
+     * Multiplicador de vigor por disponibilidad de CO2.
      *
-     * @param LightQ         Luz disponible en el punto (la misma que alimenta f_luz).
-     * @param CanopyHeightCm Altura de la copa del arbol (0 para una semilla / punto de suelo).
+     * @param LightQ         Luz disponible en el punto, la misma que alimenta el factor
+     *                       de luz del vigor.
+     * @param CanopyHeightCm Altura de la copa del árbol; 0 para una semilla o para un
+     *                       punto de suelo.
+     * @return Factor en [1 - MaxReduction, 1]. MaxReduction se recorta a 0.9, así que el
+     *         resultado nunca baja de 0.1 por mucho que se configure.
      */
     FORCEINLINE float CO2Factor(float LightQ, float CanopyHeightCm, const FCO2Params& P)
     {
         if (!P.bEnabled || P.MaxReduction <= 0.f)
         {
-            return 1.f; // ablacion: cero efecto y cero coste
+            return 1.f; // ablación: elemento neutro exacto, coste cero
         }
 
         const float Full = FMath::Max(P.FullSunlight, KINDA_SMALL_NUMBER);
@@ -107,7 +90,7 @@ namespace EcoCarbon
         return FMath::Clamp(1.f - Reduction, 0.1f, 1.f);
     }
 
-    /** Atajo: aplica el multiplicador a un vigor de Liebig ya calculado. */
+    /** Atajo: aplica el multiplicador a un vigor ya combinado. */
     FORCEINLINE float ApplyToVigor(float LiebigVigor, float LightQ, float CanopyHeightCm, const FCO2Params& P)
     {
         return LiebigVigor * CO2Factor(LightQ, CanopyHeightCm, P);

@@ -1,3 +1,22 @@
+/**
+ * @file SpeciesAudit.cpp
+ * @author Juan Luque Roldán
+ * @brief Implementación de la auditoría de especies: los cinco bloques del informe, la
+ *        tabla de ejes y el comando de consola que la lanza.
+ *
+ * Contiene la lista de ejes monótonos del modelo con su orientación, el cálculo del soporte
+ * real del kernel radicular y los cinco bloques que se vuelcan al log: estrés a pleno sol
+ * con el despeje de la semisaturación que salvaría a todas las especies, balance de los
+ * pozos de agua y nutrientes, solape entre raíz y copa, dominancia de Pareto por pares y
+ * separación entre nichos. Evalúa las mismas funciones que el tick —@ref EcoVigor y
+ * @ref EcologyRules— para que el informe no pueda divergir de la simulación.
+ *
+ * @ingroup eco_debug
+ * @see @ref bib_pareto1896
+ * @see @ref bib_tilman1982
+ * @see @ref bib_macarthurlevins1967
+ */
+
 #include "Debug/SpeciesAudit.h"
 
 #include "Config/EcosystemSettings.h"
@@ -8,31 +27,31 @@
 
 #include "HAL/IConsoleManager.h"
 
-// Categoria propia: LogEco es file-static de EcosystemSubsystem.cpp (ver la
-// nota de EcoCore.h sobre por que no vive en una cabecera reflejada por UHT).
+// Categoría propia: LogEco es estático de la unidad de traducción del subsistema y no se
+// puede compartir entre ficheros.
 DEFINE_LOG_CATEGORY_STATIC(LogEcoAudit, Log, All);
 
 namespace
 {
-    /** Luz relativa bajo un dosel cerrado, para leer la diferenciacion EN SOMBRA,
-        que es donde la tolerancia deberia decidir algo. Es un valor de lectura,
-        no entra en la simulacion. */
+    /** Luz relativa bajo dosel cerrado, punto de lectura de la diferenciación en sombra,
+        que es donde la tolerancia debería decidir algo. Solo se usa para informar: no entra
+        en la simulación. */
     constexpr float kDeepShadeQ = 0.20f;
 
     /**
-     * Un eje monotono del modelo, ya normalizado a "mas es mejor". Es la lista
-     * que hace falta para la prueba de dominancia: si una especie gana o empata
-     * en todos ellos, gana la simulacion.
+     * Un eje monótono del modelo, con la orientación necesaria para normalizarlo a «más es
+     * mejor». Es la unidad de la prueba de dominancia: si una especie gana o empata en todos
+     * los ejes, gana la simulación.
      *
-     * bHigherIsBetter=false marca los ejes donde el numero pequeno es la ventaja
-     * (demandas de recurso, edad de madurez): se invierten al puntuar para que
-     * la comparacion sea siempre "mayor gana".
+     * @note `bHigherIsBetter = false` marca los ejes donde la ventaja es el número pequeño
+     *       —demandas de recurso, edad de madurez, mortalidades—, que se invierten al
+     *       puntuar para que la comparación sea siempre «mayor gana».
      */
     struct FAxis
     {
-        const TCHAR* Name;
-        bool bHigherIsBetter;
-        float (*Get)(const USpeciesData&);
+        const TCHAR* Name;                   ///< Etiqueta con la que aparece en el informe.
+        bool bHigherIsBetter;                ///< Sentido del rasgo antes de normalizar.
+        float (*Get)(const USpeciesData&);   ///< Lector del rasgo en el asset de especie.
     };
 
     const FAxis kAxes[] =
@@ -47,16 +66,15 @@ namespace
         { TEXT("GerminationRateScale"),true,  [](const USpeciesData& S) { return S.GerminationRateScale; } },
         { TEXT("RootRadius"),          true,  [](const USpeciesData& S) { return S.RootRadius; } },
 
-        // ANCHURA DE CAMPANA COMO EJE MONOTONO. Es contraintuitivo pero se demuestra
-        // en una linea: d/dW exp(-((R-Opt)/W)^2) > 0 para todo R distinto del optimo,
-        // luego ensanchar la campana SUBE la respuesta en todas las celdas menos en
-        // una. Una anchura mayor es ventaja gratuita, y el bloque 5 -que las mira
-        // como "separacion de nichos"- no la ve como tal.
+        // La anchura de la campana es un eje monótono, aunque parezca un rasgo de nicho:
+        // d/dW exp(-((R-Opt)/W)^2) > 0 para todo R distinto del óptimo, luego ensancharla
+        // sube la respuesta en todas las celdas menos en una. Es ventaja gratuita, y el
+        // bloque de separación de nichos, que las mira como anchuras, no la detecta.
         { TEXT("WaterTolerance"),      true,  [](const USpeciesData& S) { return S.WaterTolerance; } },
         { TEXT("NutrientTolerance"),   true,  [](const USpeciesData& S) { return S.NutrientTolerance; } },
 
-        // Un declive que llega mas tarde, frena menos, mata menos y semilla mas es
-        // mejor en todos los casos.
+        // Un declive senescente que llega más tarde, frena menos, mata menos y da más
+        // semilla es mejor en todos los casos.
         { TEXT("SenescenceAgeFrac"),   true,  [](const USpeciesData& S) { return S.SenescenceAgeFraction; } },
         { TEXT("SenescentGrowth"),     true,  [](const USpeciesData& S) { return S.SenescentGrowthScale; } },
         { TEXT("SenescentSeed"),       true,  [](const USpeciesData& S) { return S.SenescentSeedScale; } },
@@ -70,7 +88,7 @@ namespace
     };
     constexpr int32 kNumAxes = UE_ARRAY_COUNT(kAxes);
 
-    /** Valor del eje ya orientado a "mas es mejor". */
+    /** Valor del rasgo ya orientado a «más es mejor», listo para comparar entre especies. */
     float AxisScore(const FAxis& Axis, const USpeciesData& Species)
     {
         const float Raw = Axis.Get(Species);
@@ -78,15 +96,16 @@ namespace
     }
 
     /**
-     * Celdas del campo de recursos que RECIBEN algo del disco radicular de un adulto.
+     * Celdas del campo de recursos que reciben una cantidad no nula del disco radicular de
+     * un adulto: el soporte real del kernel de depósito.
      *
-     * Antes esto devolvia (2*ceil(R/celda)+1)^2, o sea el area de la CAJA recorrida,
-     * y con ella el bloque 2 declaraba nueve celdas donde el kernel escribe una: el
-     * peso lineal 1-d/R vale exactamente 0 en los cuatro vecinos ortogonales cuando
-     * el radio no supera el tamano de celda. La comprobacion de sostenibilidad del
-     * pozo salia asi nueve veces optimista y daba luz verde a demandas que vacian la
-     * celda. Ahora se cuentan las celdas con peso > 0, replicando el mismo peso que
-     * usa EcologyRules.
+     * Recorre la caja envolvente pero cuenta solo donde el peso lineal @f$1 - d/R@f$ es
+     * positivo, replicando el que aplica `EcologyRules`. El área de la caja sobreestima el
+     * soporte hasta nueve veces cuando el radio no supera el tamaño de celda —el peso vale
+     * cero en los cuatro vecinos ortogonales—, y con ella el balance del pozo daría por
+     * sostenibles demandas que en realidad lo vacían.
+     *
+     * @return Número de celdas con peso, nunca menor que 1.
      */
     int32 RootCellsWithWeight(float RootRadiusCm, float CellSizeCm)
     {
@@ -115,8 +134,8 @@ void EcoSpeciesAudit::RunAndLog()
         return;
     }
 
-    // Resolucion de los assets. Se hace aqui y no a traves del subsistema para
-    // que la auditoria funcione sin mundo ni PIE: es una herramienta de datos.
+    // Los assets se resuelven aquí y no a través del subsistema: así la auditoría corre
+    // sin mundo, como la herramienta de datos que es.
     TArray<const USpeciesData*> Sp;
     for (const TSoftObjectPtr<USpeciesData>& Soft : S->Species)
     {
@@ -142,7 +161,7 @@ void EcoSpeciesAudit::RunAndLog()
         Sp.Num(), KlMax, StressThreshold, S->HeightfieldCellSizeCm);
 
     // ------------------------------------------------------------------
-    // 1) Estres a pleno sol
+    // 1) Estrés a pleno sol y señal espacial del eje de luz
     // ------------------------------------------------------------------
     UE_LOG(LogEcoAudit, Log, TEXT("------------------------------------------------------------------------"));
     UE_LOG(LogEcoAudit, Log, TEXT("1) LUZ  (fL a pleno sol debe superar el umbral de estres con margen)"));
@@ -150,9 +169,9 @@ void EcoSpeciesAudit::RunAndLog()
         TEXT("especie"), TEXT("ShadeTol"), TEXT("fL sol"), TEXT("fL sombra"), TEXT("veredicto"));
 
     bool bAnyCondemned = false;
-    // Rango de f_L a pleno sol ENTRE especies, y su recorrido dentro de una misma
-    // especie entre pleno sol y penumbra. La comparacion entre ambos es la que dice
-    // si la luz puede repartir territorio o solo produce un ranking global.
+    // Dos magnitudes que luego se comparan: cuánto separa el rasgo a las especies a pleno
+    // sol, y cuánto puede moverse una misma especie entre pleno sol y penumbra. De su
+    // comparación depende que la luz reparta territorio o solo produzca un ranking global.
     float MinSunAcrossSpecies = TNumericLimits<float>::Max();
     float MaxSunAcrossSpecies = 0.f;
     float MaxSpatialSwing = 0.f;
@@ -175,11 +194,10 @@ void EcoSpeciesAudit::RunAndLog()
             ? TEXT("*** CONDENADA: se estresa a pleno sol y sin vecinos")
             : (fLSun < StressThreshold * 1.3f ? TEXT("margen escaso") : TEXT("ok")));
     }
-    // EL AVISO QUE HABRIA CAZADO SOLO EL PROBLEMA DE FONDO. Si la diferencia de f_L
-    // ENTRE especies supera al recorrido de f_L a lo largo del gradiente de luz, el
-    // eje de luz no puede invertir el orden en ninguna celda: deja de ser un reparto
-    // espacial y se convierte en un ranking global, y como es el que suele imponer
-    // el minimo de Liebig, arrastra con el a los otros dos.
+    // Criterio de cruce de curvas expresado como comparación de rangos: si la diferencia
+    // de fL entre especies supera al recorrido de fL a lo largo del gradiente de luz, el
+    // orden entre especies no se invierte en ninguna celda. La luz deja de repartir
+    // territorio y, al ser normalmente la limitante, arrastra con ella a los otros dos ejes.
     const float SpeciesSpread = MaxSunAcrossSpecies - MinSunAcrossSpecies;
     UE_LOG(LogEcoAudit, Log,
         TEXT("   recorrido de fL con la luz (sol -> sombra): %.3f | diferencia ENTRE especies a pleno sol: %.3f"),
@@ -195,8 +213,10 @@ void EcoSpeciesAudit::RunAndLog()
 
     if (bAnyCondemned)
     {
-        // Kl < Q*(1-U)/U con Q = FullSunlight es la condicion para que fL supere
-        // el umbral; despejando el KlMax que la cumple para TODAS las especies.
+        // Kl < Q*(1-U)/U, con Q la luz plena y U el umbral, es la condición para que fL lo
+        // supere; se despeja el KlMax que la cumple para todas las especies a la vez.
+        // El despeje ignora el techo de asimilación, así que el valor sugerido es optimista
+        // cuando la tolerancia a la sombra tiene coste.
         float NeededKlMax = TNumericLimits<float>::Max();
         for (const USpeciesData* Species : Sp)
         {
@@ -211,7 +231,7 @@ void EcoSpeciesAudit::RunAndLog()
     }
 
     // ------------------------------------------------------------------
-    // 2) Sostenibilidad del pozo de agua y de nutrientes
+    // 2) Sostenibilidad de los pozos de agua y de nutrientes
     // ------------------------------------------------------------------
     UE_LOG(LogEcoAudit, Log, TEXT("------------------------------------------------------------------------"));
     UE_LOG(LogEcoAudit, Log, TEXT("2) POZOS  (demanda anual de un adulto frente a la recarga DONDE VIVE)"));
@@ -222,7 +242,7 @@ void EcoSpeciesAudit::RunAndLog()
 
     for (const USpeciesData* Species : Sp)
     {
-        // Radio EFECTIVO de un adulto, con el minimo en celdas que aplica el tick.
+        // Radio radicular efectivo de un adulto, con el mínimo en celdas que aplica el tick.
         const float AdultRadiusCm = EcologyRules::EffectiveRootRadiusCm(
             Species->RootRadius, 1.f, 1.f, S->MinRootRadiusCells * S->HeightfieldCellSizeCm);
         const int32 Cells = RootCellsWithWeight(AdultRadiusCm, S->HeightfieldCellSizeCm);
@@ -235,19 +255,13 @@ void EcoSpeciesAudit::RunAndLog()
                 *Species->SpeciesName.ToString(), AdultRadiusCm, S->HeightfieldCellSizeCm);
         }
 
-        // BASE LOCAL REPRESENTATIVA, no el maximo del campo.
-        //
-        // Esta cuenta usaba WaterOutputMax, o sea el valor de la celda MAS
-        // humeda del mapa, y eso es un suministro que casi ningun arbol ve. Con
-        // un campo muy sesgado -y el TWI lo esta siempre: su mediana suele caer
-        // por debajo del 20% del rango- el error es de un orden de magnitud, y
-        // hacia el lado peligroso: daba por sostenibles demandas que en realidad
-        // vacian el pozo bajo cada adulto.
-        //
-        // Con la respuesta de nicho activa hay un valor mucho mejor y ya
-        // disponible: el OPTIMO de la especie, que es justo la humedad del sitio
-        // donde esa especie vive. Sin nicho no hay tal referencia y se cae al
-        // comportamiento anterior.
+        // La referencia es la base local representativa, no el máximo del campo: el máximo
+        // es el valor de la celda más húmeda o más fértil del mapa, un suministro que casi
+        // ningún árbol ve. Con un campo tan sesgado como el TWI -su mediana suele quedar por
+        // debajo del 20% del rango- el error llega a un orden de magnitud, y hacia el lado
+        // peligroso. Con la respuesta de nicho activa, el óptimo de la especie es justo la
+        // humedad o la fertilidad del sitio donde esa especie vive; sin ella no existe tal
+        // referencia y solo queda el máximo.
         const float WaterBaseLocal = S->bUseNicheResponse
             ? Species->WaterOptimum * S->WaterOutputMax
             : S->WaterOutputMax;
@@ -255,6 +269,8 @@ void EcoSpeciesAudit::RunAndLog()
             ? Species->NutrientOptimum * S->NutrientOutputMax
             : S->NutrientOutputMax;
 
+        // El suministro es la cota superior de la recarga, tasa por base, que solo se
+        // alcanza con la celda a cero; la demanda tiene la misma forma que en el tick.
         const float WaterDemandYear = Species->MaxBiomass * Species->WaterDemand;
         const float WaterSupplyYear = Cells * S->WaterRechargeRate * WaterBaseLocal;
         const float WaterRatio = WaterDemandYear / FMath::Max(WaterSupplyYear, KINDA_SMALL_NUMBER);
@@ -277,7 +293,7 @@ void EcoSpeciesAudit::RunAndLog()
         TEXT("    asi que el reparto uniforme que supone esta cuenta es optimista.)"));
 
     // ------------------------------------------------------------------
-    // 3) Solape raiz / copa
+    // 3) Solape raíz / copa
     // ------------------------------------------------------------------
     UE_LOG(LogEcoAudit, Log, TEXT("------------------------------------------------------------------------"));
     UE_LOG(LogEcoAudit, Log, TEXT("3) GEOMETRIA  (la raiz deberia competir en un radio comparable al de la copa)"));
@@ -307,12 +323,9 @@ void EcoSpeciesAudit::RunAndLog()
         {
             if (a == b) { continue; }
 
-            // SIN break: hay que contar los ejes, no salir al primero perdido.
-            //
-            // La prueba de todo-o-nada solo cazaba la dominancia PERFECTA, asi que
-            // imprimia "ninguna especie domina a otra" sobre un conjunto donde una
-            // gana en once de doce ejes -que en la practica es lo mismo-. Contando,
-            // la dominancia casi-total tambien salta.
+            // Se cuentan todos los ejes, sin salir al primero perdido: la prueba de
+            // todo-o-nada solo vería la dominancia estricta y daría por bueno un conjunto
+            // donde una especie gana en todos menos uno, que en la práctica es lo mismo.
             int32 Wins = 0, Ties = 0, Losses = 0;
             for (int32 k = 0; k < kNumAxes; ++k)
             {
@@ -350,12 +363,12 @@ void EcoSpeciesAudit::RunAndLog()
     }
 
     // ------------------------------------------------------------------
-    // 5) Separacion de nichos (solo si la respuesta unimodal esta activa)
+    // 5) Separación de nichos (solo con la respuesta unimodal activa)
     // ------------------------------------------------------------------
-    // WaterOptimum y NutrientOptimum NO son ejes monotonos -no hay un "mejor
-    // optimo"-, asi que quedan deliberadamente fuera de la prueba de dominancia.
-    // Lo que hay que medir en ellos es otra cosa: si las campanas de dos especies
-    // estan lo bastante SEPARADAS como para que cada una tenga su zona del mapa.
+    // Los óptimos de agua y de nutrientes quedan deliberadamente fuera de la prueba de
+    // dominancia porque no son ejes monótonos: no existe un «mejor óptimo». Lo que hay que
+    // medir en ellos es otra cosa, si las campanas de dos especies están lo bastante
+    // separadas como para que cada una tenga su zona ganadora del mapa.
     if (S->bUseNicheResponse)
     {
         UE_LOG(LogEcoAudit, Log, TEXT("------------------------------------------------------------------------"));
@@ -363,8 +376,9 @@ void EcoSpeciesAudit::RunAndLog()
 
         auto Separation = [](float OptA, float WidA, float OptB, float WidB)
             {
-                // Distancia entre optimos medida en anchuras: es la forma estandar
-                // de decir si dos campanas se distinguen o son la misma.
+                // Distancia entre óptimos medida en anchuras de campana: la medida canónica
+                // de diferenciación de nicho. Se evalúa sobre las fracciones del asset, y
+                // el cociente es invariante de escala, así que da igual la unidad de campo.
                 return FMath::Abs(OptA - OptB) / FMath::Max(0.5f * (WidA + WidB), KINDA_SMALL_NUMBER);
             };
 
@@ -378,6 +392,10 @@ void EcoSpeciesAudit::RunAndLog()
                     Sp[b]->NutrientOptimum, Sp[b]->NutrientTolerance);
                 const float Best = FMath::Max(SepWater, SepNutrient);
 
+                // Fallo de forma previo a la separación: sin penalización por exceso la
+                // campana deja de ser unimodal y la mitad rica del gradiente se aplana, con
+                // lo que la separación no significa nada ahí. La comprobación cubre el eje
+                // de nutrientes; el mismo razonamiento vale para el de agua.
                 if (!Sp[a]->bNutrientExcessPenalty && !Sp[b]->bNutrientExcessPenalty
                     && S->NicheExcessWidthScale <= 0.f)
                 {
@@ -403,7 +421,8 @@ void EcoSpeciesAudit::RunAndLog()
                 "asi que NO pueden repartir nicho por mucho que ajustes las demandas)"));
     }
 
-    // Tabla completa de ejes, para ver de un vistazo donde estan los empates.
+    // Tabla completa de ejes, para ver de un vistazo dónde están los empates y qué rasgo
+    // sostiene cada dominancia de las anteriores.
     UE_LOG(LogEcoAudit, Log, TEXT("   --- valores por eje (orientados a 'mas es mejor') ---"));
     {
         FString Header = FString::Printf(TEXT("   %-20s"), TEXT(""));
@@ -427,6 +446,10 @@ void EcoSpeciesAudit::RunAndLog()
     UE_LOG(LogEcoAudit, Log, TEXT("========================================================================"));
 }
 
+// ---------------------------------------------------------------------------
+//  Comando de consola
+// ---------------------------------------------------------------------------
+// Sin mundo asociado: la auditoría no lo necesita y así también corre fuera del juego.
 static FAutoConsoleCommand GEcoAuditSpecies(
     TEXT("Eco.AuditarEspecies"),
     TEXT("Audita los assets de especie: estres a pleno sol, sostenibilidad de los pozos, "
