@@ -313,13 +313,19 @@ public:
      * Percentiles de los campos de agua y nutrientes, en absoluto y en fracción del máximo
      * de salida (consola: Eco.PercentilesCampos).
      *
-     * Es lo que permite colocar los óptimos de nicho de las especies sin adivinar. El TWI
-     * del agua sale muy sesgado hacia valores bajos —la mayor parte del mapa está seca y
-     * solo unos pocos fondos de barranco llegan arriba—, así que fijar el óptimo de una
-     * especie en una fracción elegida a ojo puede dejarla sin un solo sitio donde ganar y
-     * extinguirla por una razón ajena a la competencia. Los óptimos van en los percentiles
-     * 25 / 50 / 75 que imprime este comando.
+     * Es lo que permite colocar los óptimos de nicho de las especies sin adivinar. Con la
+     * normalización lineal antigua (bWaterRankNormalization a false) el TWI del agua sale
+     * muy sesgado hacia valores bajos —la mayor parte del mapa está seca y solo unos pocos
+     * fondos de barranco llegan arriba—, así que fijar el óptimo de una especie en una
+     * fracción elegida a ojo puede dejarla sin un solo sitio donde ganar y extinguirla por
+     * una razón ajena a la competencia. Los óptimos van en los percentiles 25 / 50 / 75
+     * que imprime este comando.
      *
+     * @note Con la normalización por rango (la actual por defecto) el campo de agua es
+     *       uniforme por construcción y sus percentiles caen en p25≈0.25, p50≈0.50,
+     *       p75≈0.75 del máximo: la fracción del asset ya ES el percentil, y la anchura
+     *       sugerida ronda 0.25. El comando sigue siendo la referencia para los nutrientes
+     *       y para corridas con la normalización lineal.
      * @note La anchura sugerida es min(p50-p25, p75-p50) y no la semidistancia
      *       intercuartílica, porque con un campo sesgado la fórmula simétrica solapa entre
      *       sí a las especies del extremo seco.

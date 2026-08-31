@@ -152,7 +152,8 @@ namespace
     }
 }
 
-void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMax, bool bFillSinks)
+void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMax, bool bFillSinks,
+    bool bRankNormalize)
 {
     if (!Height.IsValid()) return;
 
@@ -289,10 +290,30 @@ void FWaterField::BakeFromHeightField(const FHeightField& Height, float OutputMa
         });
 
     // -----------------------------------------------------------------
-    // 5) Normalización lineal a [0, OutputMax]: deja el campo listo para la
-    //    función de vigor sin reescalados ahí. Destruye la escala física del
-    //    índice, lo que es deliberado: agua y nutrientes deben entrar en el
-    //    vigor con rangos comparables.
+    // 5) Normalización a [0, OutputMax]: deja el campo listo para la función de
+    //    vigor sin reescalados ahí. Destruye la escala física del índice, lo que
+    //    es deliberado: agua y nutrientes deben entrar en el vigor con rangos
+    //    comparables.
+    //
+    //    Por defecto se normaliza POR RANGO y no linealmente. La distribución del
+    //    TWI es patológica para una normalización lineal: las celdas llanas
+    //    cobran ln(1/tan(MinSlopeRad)) ≈ 6,9 unidades solo por ser llanas —tanto
+    //    como multiplicar por mil su área drenante— y la salida de la cuenca
+    //    mayor, con la pendiente clavada al mínimo y toda la acumulación del
+    //    mapa, fija un máximo que ningún otro punto roza. El resultado lineal
+    //    deja el 96% del mapa por debajo de 0,3·OutputMax y a las llanuras
+    //    aisladas en 0,5-0,7: más lejos de cualquier ladera, en unidades de
+    //    anchura de nicho, de lo que ninguna campana de especie puede cubrir, con
+    //    lo que ningún árbol germina allí y las llanuras quedan sistemáticamente
+    //    vacías. El rango disuelve esa isla conservando la ordenación espacial
+    //    exacta, que es lo único que el índice reescalado significa.
     // -----------------------------------------------------------------
-    Field.FillNormalizedFrom(TwiRaw, OutputMax);
+    if (bRankNormalize)
+    {
+        Field.FillRankNormalizedFrom(TwiRaw, OutputMax);
+    }
+    else
+    {
+        Field.FillNormalizedFrom(TwiRaw, OutputMax);
+    }
 }

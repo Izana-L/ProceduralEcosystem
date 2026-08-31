@@ -39,7 +39,7 @@
 #include "Species/SpeciesData.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
-/** Flags comunes a los 31 casos: corren en el proceso del editor y aparecen bajo el filtro
+/** Flags comunes a los 32 casos: corren en el proceso del editor y aparecen bajo el filtro
     «Engine» del Session Frontend. */
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
 
@@ -1566,6 +1566,81 @@ bool FEcoDeformClamp::RunTest(const FString&) {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Campos escalares: normalización por rango
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalización por rango de FField2D, la que corrige el vacío de árboles en las llanuras:
+ * el TWI del agua tiene cola larga y, normalizado linealmente, un solo valor extremo (la
+ * salida de la cuenca) comprime el resto del mapa contra cero y deja a las zonas llanas en
+ * una isla de valores que ninguna campana de nicho alcanza.
+ *
+ * Se fijan las cuatro propiedades de las que depende la corrección: la salida es uniforme
+ * por área (valores distintos quedan equiespaciados), es invariante ante transformaciones
+ * monótonas del crudo (solo la ordenación espacial significa algo), los empates comparten
+ * el rango medio de su bloque (un llano uniforme no gana gradientes internos), y un valor
+ * extremo aislado deja de arrastrar al resto: el segundo mayor queda pegado al máximo, no
+ * comprimido contra el mínimo como con min-max.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoFieldRankNormalization, "Eco.Campos.NormalizacionPorRango", EcoTestFlags)
+bool FEcoFieldRankNormalization::RunTest(const FString&)
+{
+    constexpr float Max = 10.f;
+
+    // Cola larga artificial, como el TWI: quince valores contiguos y un extremo aislado.
+    TArray<float> Raw;
+    for (int32 i = 0; i < 15; ++i) { Raw.Add(static_cast<float>(i)); }
+    Raw.Add(1000.f);
+
+    FField2D FRank;
+    FRank.Init(4, 4, 100.0, FVector2D::ZeroVector);
+    FRank.FillRankNormalizedFrom(Raw, Max);
+
+    // 1) Uniforme por área: el valor de rango k vale exactamente k/(N-1)*Max.
+    for (int32 i = 0; i < 16; ++i)
+    {
+        TestTrue(TEXT("rango equiespaciado"),
+            FMath::IsNearlyEqual(FRank.Data[i], (i / 15.f) * Max, 1e-4f));
+    }
+
+    // 2) El extremo aislado ya no arrastra: el segundo mayor queda pegado al máximo.
+    //    Con min-max ese mismo valor queda comprimido contra el mínimo, que es el
+    //    mecanismo por el que las llanuras quedaban fuera del alcance de toda especie.
+    FField2D FLinear;
+    FLinear.Init(4, 4, 100.0, FVector2D::ZeroVector);
+    FLinear.FillNormalizedFrom(Raw, Max);
+    TestTrue(TEXT("rango: el 2o mayor queda junto al maximo"), FRank.Data[14] > 0.9f * Max);
+    TestTrue(TEXT("min-max: el 2o mayor queda comprimido abajo"), FLinear.Data[14] < 0.2f * Max);
+
+    // 3) Invariancia monótona: exp(x/100) conserva la ordenación, luego el resultado es
+    //    bit a bit el mismo.
+    TArray<float> Mono;
+    for (const float V : Raw) { Mono.Add(FMath::Exp(V / 100.f)); }
+    FField2D FMono;
+    FMono.Init(4, 4, 100.0, FVector2D::ZeroVector);
+    FMono.FillRankNormalizedFrom(Mono, Max);
+    TestTrue(TEXT("invariante ante transformacion monotona"), FMono.Data == FRank.Data);
+
+    // 4) Empates al rango medio del bloque: bloques de 4, 8 y 4 celdas iguales salen a
+    //    0.1, 0.5 y 0.9 del maximo, y todas las celdas de un bloque comparten valor.
+    TArray<float> Ties;
+    for (int32 i = 0; i < 4; ++i) { Ties.Add(1.f); }
+    for (int32 i = 0; i < 8; ++i) { Ties.Add(2.f); }
+    for (int32 i = 0; i < 4; ++i) { Ties.Add(3.f); }
+    FField2D FTies;
+    FTies.Init(4, 4, 100.0, FVector2D::ZeroVector);
+    FTies.FillRankNormalizedFrom(Ties, Max);
+    TestTrue(TEXT("bloque bajo al rango medio"), FMath::IsNearlyEqual(FTies.Data[0], 1.f, 1e-4f));
+    TestTrue(TEXT("bloque central al rango medio"), FMath::IsNearlyEqual(FTies.Data[7], 5.f, 1e-4f));
+    TestTrue(TEXT("bloque alto al rango medio"), FMath::IsNearlyEqual(FTies.Data[15], 9.f, 1e-4f));
+    for (int32 i = 1; i < 4; ++i)
+    {
+        TestEqual(TEXT("empate -> mismo valor"), FTies.Data[i], FTies.Data[0]);
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Relieve: síntesis por ruido reparametrizado y erosión

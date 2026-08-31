@@ -62,11 +62,27 @@ struct PROCEDURALECOSYSTEM_API FWaterField
      * @param bFillSinks  Rellena las depresiones antes del D8. A false se enruta
      *                    sobre el relieve crudo, lo que permite comparar la red de
      *                    drenaje con y sin rellenado.
-     * @note Coste O(N log N), dominado por el priority-flood y la ordenación por
-     *       cota; se paga una sola vez.
+     * @param bRankNormalize Normaliza el TWI por RANGO (percentil espacial) en vez
+     *                    de por min-max lineal. El TWI tiene cola larga: en las
+     *                    zonas llanas la pendiente del enlace D8 se clava en el
+     *                    mínimo numérico y el índice gana ln(1/tan(min)) ≈ 6,9
+     *                    unidades de golpe, con lo que llanuras y fondos forman
+     *                    una isla de valores extremos separada del cuerpo del
+     *                    campo. Con min-max, esa isla se queda sola la mitad alta
+     *                    del rango, el 96% del mapa se comprime bajo 0,3·OutputMax
+     *                    y ningún óptimo de especie puede alcanzar las llanuras
+     *                    sin abandonar el resto del mapa: quedan sin árboles por
+     *                    construcción. El rango conserva exacta la ordenación
+     *                    espacial —lo único con significado del índice reescalado
+     *                    (ver la nota de la clase)— y hace el campo uniforme por
+     *                    área, de modo que WaterOptimum = f significa «más húmedo
+     *                    que el f por ciento del mapa». A false se conserva la
+     *                    normalización lineal para reproducir corridas antiguas.
+     * @note Coste O(N log N), dominado por el priority-flood y las ordenaciones
+     *       por cota y por rango; se paga una sola vez.
      */
     void BakeFromHeightField(const FHeightField& Height, float OutputMax = 10.f,
-        bool bFillSinks = true);
+        bool bFillSinks = true, bool bRankNormalize = true);
 
     /** Disponibilidad de agua en el punto de mundo (Xcm, Ycm), por bilineal. */
     FORCEINLINE float SampleWater(double Xcm, double Ycm) const

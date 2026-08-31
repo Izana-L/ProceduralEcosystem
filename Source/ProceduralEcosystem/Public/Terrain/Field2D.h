@@ -120,6 +120,34 @@ struct PROCEDURALECOSYSTEM_API FField2D
     void FillNormalizedFrom(const TArray<float>& Raw, float OutputMax);
 
     /**
+     * Escribe en Data la normalización POR RANGO de Raw a [0, OutputMax]: cada
+     * celda recibe su percentil espacial —la fracción de celdas del mapa con
+     * valor crudo menor— en vez de su valor reescalado linealmente.
+     *
+     * Existe porque la normalización lineal traslada al campo la forma de la
+     * distribución del buffer crudo, y un índice con cola larga (el TWI del agua)
+     * queda con el grueso del mapa comprimido abajo y unos pocos valores extremos
+     * ocupando solos la mitad alta del rango: ninguna especie puede calibrar su
+     * óptimo sobre esa zona sin salirse de la distribución real. Con el rango, el
+     * campo resultante es uniforme por construcción —una fracción f de OutputMax
+     * corresponde exactamente al f por ciento más seco del mapa— y la ordenación
+     * espacial, que es lo único con significado en un índice reescalado, se
+     * conserva EXACTA.
+     *
+     * Los empates reciben todos el rango medio de su bloque, de modo que dos
+     * celdas con el mismo valor crudo salen con el mismo valor normalizado; el
+     * desempate del orden interno es por índice y el resultado no depende de él.
+     *
+     * @param Raw       Buffer crudo; debe tener tantas celdas como la rejilla o
+     *                  la llamada no hace nada.
+     * @param OutputMax Valor que toma la celda de rango máximo.
+     * @note Serial (ordena N celdas, O(N log N)): es una rutina de bake, no de
+     *       tick, y el orden fijo con desempate por índice la hace reproducible
+     *       bit a bit.
+     */
+    void FillRankNormalizedFrom(const TArray<float>& Raw, float OutputMax);
+
+    /**
      * Genera el campo entero a partir de una función de rejilla y lo normaliza a
      * [0, OutputMax].
      *

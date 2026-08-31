@@ -5,9 +5,10 @@
  *
  * Contiene las operaciones de la rejilla que no son ni triviales ni plantilla:
  * la reserva del almacenamiento con las guardas de geometría, el muestreo
- * bilineal con extensión de bordes, el barrido min-max y la escritura
- * normalizada en paralelo por filas. Los accesos inline y el bake genérico
- * GenerateNormalized viven en la cabecera.
+ * bilineal con extensión de bordes, el barrido min-max, la escritura
+ * normalizada en paralelo por filas y la normalización por rango (percentil
+ * espacial con empates al rango medio, serial y de orden fijo). Los accesos
+ * inline y el bake genérico GenerateNormalized viven en la cabecera.
  *
  * @ingroup eco_terrain
  */
@@ -108,4 +109,54 @@ void FField2D::FillNormalizedFrom(const TArray<float>& Raw, float OutputMax)
                 Data[i] = t * OutputMax;
             }
         });
+}
+
+void FField2D::FillRankNormalizedFrom(const TArray<float>& Raw, float OutputMax)
+{
+    if (!IsValid() || Raw.Num() != Data.Num())
+    {
+        return;
+    }
+
+    const int32 N = Raw.Num();
+
+    // Orden ascendente por valor crudo con desempate por índice: el mismo patrón
+    // que la ordenación por cota del bake hidrológico, y por el mismo motivo, que
+    // el resultado sea reproducible bit a bit.
+    TArray<int32> Order;
+    Order.SetNumUninitialized(N);
+    for (int32 i = 0; i < N; ++i)
+    {
+        Order[i] = i;
+    }
+    Order.Sort([&Raw](int32 A, int32 B)
+        {
+            const float Va = Raw[A];
+            const float Vb = Raw[B];
+            if (Va != Vb) return Va < Vb;
+            return A < B; // desempate determinista
+        });
+
+    // Rango fraccional con empates al punto medio del bloque: dos celdas con el
+    // mismo valor crudo tienen que salir con el mismo valor normalizado, o un
+    // llano perfectamente uniforme quedaría con un gradiente interno dictado por
+    // el orden de recorrido, que no significa nada.
+    const float Scale = OutputMax / static_cast<float>(FMath::Max(N - 1, 1));
+    int32 BlockStart = 0;
+    while (BlockStart < N)
+    {
+        int32 BlockEnd = BlockStart + 1;
+        while (BlockEnd < N && Raw[Order[BlockEnd]] == Raw[Order[BlockStart]])
+        {
+            ++BlockEnd;
+        }
+
+        const float MidRank = 0.5f * static_cast<float>(BlockStart + BlockEnd - 1);
+        const float Value = MidRank * Scale;
+        for (int32 k = BlockStart; k < BlockEnd; ++k)
+        {
+            Data[Order[k]] = Value;
+        }
+        BlockStart = BlockEnd;
+    }
 }

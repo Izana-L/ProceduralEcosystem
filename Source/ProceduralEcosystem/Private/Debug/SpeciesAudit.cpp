@@ -33,11 +33,6 @@ DEFINE_LOG_CATEGORY_STATIC(LogEcoAudit, Log, All);
 
 namespace
 {
-    /** Luz relativa bajo dosel cerrado, punto de lectura de la diferenciación en sombra,
-        que es donde la tolerancia debería decidir algo. Solo se usa para informar: no entra
-        en la simulación. */
-    constexpr float kDeepShadeQ = 0.20f;
-
     /**
      * Un eje monótono del modelo, con la orientación necesaria para normalizarlo a «más es
      * mejor». Es la unidad de la prueba de dominancia: si una especie gana o empata en todos
@@ -155,6 +150,13 @@ void EcoSpeciesAudit::RunAndLog()
     const float KlMax = S->LightHalfSaturationMax;
     const float StressThreshold = S->StressVigorThreshold;
     const float FullSun = EcoGrid::FullSunlight;
+
+    // Luz relativa bajo dosel cerrado, punto de lectura de la diferenciación en sombra,
+    // que es donde la tolerancia debería decidir algo. Solo se usa para informar: no entra
+    // en la simulación. Es local a la función y no de ámbito de fichero: con la compilación
+    // unity varios .cpp del módulo comparten unidad de traducción, y un nombre de ámbito de
+    // fichero ocultaría a los homónimos locales de los demás (C4459, que UBT trata como error).
+    constexpr float kDeepShadeQ = 0.20f;
 
     UE_LOG(LogEcoAudit, Log, TEXT("========================================================================"));
     UE_LOG(LogEcoAudit, Log, TEXT("[Auditoria] %d especies | KlMax=%.3f | umbral de estres=%.3f | celda=%.0f cm"),

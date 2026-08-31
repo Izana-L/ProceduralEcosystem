@@ -243,6 +243,37 @@ public:
     UPROPERTY(EditAnywhere, config, Category = "Recursos|Agua")
     bool bFillWaterSinks = true;
 
+    /**
+     * Normaliza el TWI por RANGO (percentil espacial) en lugar de linealmente.
+     *
+     * Es la corrección del vacío de árboles en las llanuras. El TWI vale
+     * ln(acumulación/tan(pendiente)) con la pendiente acotada por debajo, así que toda
+     * celda llana cobra ln(1/tan(mín)) ≈ 6,9 unidades solo por ser llana: llanuras y
+     * fondos forman una isla de valores extremos, y la salida de la cuenca mayor estira
+     * el máximo aún más. Normalizado linealmente, el 96% del mapa queda por debajo de
+     * 0,3·WaterOutputMax y las llanuras aisladas en 0,5-0,7: a más anchuras de campana de
+     * cualquier óptimo de especie de las que la respuesta de nicho puede salvar, con lo
+     * que allí el factor de agua es ~0, no germina nada y las llanuras quedan sin bosque
+     * por construcción —el heatmap de idoneidad las muestra en negro para todas las
+     * especies a la vez—.
+     *
+     * Con el rango, el campo es uniforme por área y WaterOptimum pasa a leerse como
+     * percentil: 0,25 es «más húmedo que el cuarto más seco del mapa», la anchura
+     * sugerida por Eco.PercentilesCampos pasa a ser 0,25 en vez de ~0,05, y las llanuras
+     * ocupan el tramo alto (≈0,85-0,95) CONTIGUO al resto, alcanzable por cualquier
+     * especie de óptimo húmedo. La ordenación espacial —lo único con significado en un
+     * índice reescalado— se conserva exacta.
+     *
+     * @warning Cambia la distribución del campo, no su ordenación: tras activarlo o
+     *          desactivarlo conviene revisar los óptimos de nicho de las especies con
+     *          Eco.PercentilesCampos. A false se conserva la normalización lineal
+     *          antigua, para reproducir corridas ya calibradas con ella.
+     * @see FField2D::FillRankNormalizedFrom
+     * @see @ref bib_beven1979
+     */
+    UPROPERTY(EditAnywhere, config, Category = "Recursos|Agua")
+    bool bWaterRankNormalization = true;
+
     // ==== Recursos: campo base de nutrientes ====
 
     /** Cota superior a la que se remapea el ruido de nutrientes; debe casar con

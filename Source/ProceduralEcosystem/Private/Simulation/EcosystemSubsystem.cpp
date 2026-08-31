@@ -432,7 +432,8 @@ void UEcosystemSubsystem::OnWorldBeginPlay(UWorld& InWorld)
     // 2) Campos base: el potencial del terreno, calculado una sola vez y congelado. Ambos
     //    comparten geometría con HeightField (mismo Width/Height/CellSize/Origin), así que
     //    WaterPool y NutrientPool acaban con el mismo número de celdas.
-    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks);
+    WaterBase.BakeFromHeightField(HeightField, S->WaterOutputMax, S->bFillWaterSinks,
+        S->bWaterRankNormalization);
 
     NutrientBase.GeneratePatchyBase(HeightField.Field.Width, HeightField.Field.Height, HeightField.Field.CellSize,
         HeightField.Field.Origin, static_cast<uint32>(S->MasterSeed), S->NutrientOutputMax, S->NutrientPatchFrequency, S->NutrientOctaves);
