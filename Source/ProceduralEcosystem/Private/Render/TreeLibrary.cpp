@@ -144,6 +144,11 @@ const USpeciesData* UTreeLibrary::GetArchetypeSpecies(const FArchetypeKey& Key)
     // Hoja relativamente mayor de joven, y por tanto también más junta.
     Sp->LeafSizeCm = Base->LeafSizeCm * FMath::Lerp(0.55f, 1.f, S);
     Sp->LeafSpacingCm = Base->LeafSpacingCm * FMath::Lerp(0.55f, 1.f, S);
+    // Talla del arquetipo para el follaje: con ella TreeFoliage acorta el paso entre hojas
+    // en los buckets altos (AdultLeafMultiplier) sin tocar el de la plántula, que es el
+    // que acaba de fijar la línea anterior. En el asset base vale 1, así que un hero
+    // suelto en el editor se ve como el adulto de la librería.
+    Sp->ArchetypeSizeRatio = S;
 
     // --- Un árbol joven es más flexible que uno adulto ---
     // Un tronco de 2 m se dobla con el viento; uno de 20 m con 60 cm de diámetro apenas. Como

@@ -34,12 +34,13 @@
 #include "Geometry/AttractorCloud.h"
 #include "Geometry/TreeLightGridFine.h"
 #include "Geometry/TreeMeshBuilder.h"
+#include "Geometry/TreeFoliage.h"       // AgeLeafMultiplier: rampa de hojas por edad
 #include "Geometry/TrunkDeformer.h"     // deformación de tronco por árbol
 #include "Render/TreeLibrary.h"         // VariantDeformSeed (identidad de curvatura)
 #include "Species/SpeciesData.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
-/** Flags comunes a los 32 casos: corren en el proceso del editor y aparecen bajo el filtro
+/** Flags comunes a los 33 casos: corren en el proceso del editor y aparecen bajo el filtro
     «Engine» del Session Frontend. */
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
 
@@ -1041,6 +1042,169 @@ bool FEcoSectionSeam::RunTest(const FString&) {
             bSame = (Mesh2.Wood.Vertices[v] == W.Vertices[v]);
         }
         TestTrue(TEXT("misma semilla -> misma geometria"), bSame);
+    }
+
+    return true;
+}
+
+/**
+ * Hace crecer y malla un árbol de prueba y devuelve cuántas tarjetas de hoja salieron.
+ *
+ * Los rasgos de follaje no entran en el crecimiento, así que dos llamadas con la misma
+ * semilla y distinto follaje mallan exactamente el mismo esqueleto y sus recuentos se
+ * comparan uno a uno.
+ *
+ * @param OutMesh Si no es nulo, recibe la malla completa para inspeccionar el reparto.
+ */
+static int32 EcoCountLeaves(const USpeciesData& Sp, uint32 Seed, FTreeMeshData* OutMesh = nullptr)
+{
+    uint32 Rng = Seed;
+    FTreeSkeleton Sk;
+    FTreeLightGridFine Light;
+    FAttractorCloud Cloud;
+    const FSpaceColonizationConfig Cfg;
+    SpaceColonization::GrowTree(Sp, Rng, FVector::ZeroVector, nullptr, Cfg, Sk, Light, Cloud);
+
+    FTreeMeshData Local;
+    FTreeMeshData& Mesh = OutMesh ? *OutMesh : Local;
+    TreeMeshBuilder::BuildMesh(Sk, Sp, Seed, Mesh, &Light);
+    return Mesh.Leaves.Vertices.Num() / 4;
+}
+
+/**
+ * El follaje se espesa con la edad sin tocar a la plántula, y el tope de hojas por árbol se
+ * cumple aclarando toda la copa por igual.
+ *
+ * Con el multiplicador a 1 la edad no cambia nada: es la garantía de que un asset sin editar
+ * sigue dando lo de siempre. Con el multiplicador activo, el arquetipo más joven conserva
+ * (casi exactamente) sus hojas, el adulto se acerca al múltiplo pedido y ningún bucket
+ * intermedio tiene menos hojas que el anterior. Del tope se comprueba lo que promete: nunca
+ * se supera, se alcanza exactamente cuando el reparto lo desborda, no desplaza el centro de
+ * masas del follaje -que es lo que pasaría si cortase la emisión por el final en vez de
+ * aclarar por hash-, un tope holgado no toca nada y subirlo solo añade hojas. Cierra con
+ * determinismo bit a bit.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLeavesByAge, "Eco.Arbol.HojasPorEdad", EcoTestFlags)
+bool FEcoLeavesByAge::RunTest(const FString&) {
+    // 0) La rampa: exacta en los extremos, neutra con multiplicador 1 y acotada fuera de rango.
+    TestEqual(TEXT("rampa: talla 0 -> 1.0 exacto"), TreeFoliage::AgeLeafMultiplier(0.f, 3.f), 1.f);
+    TestEqual(TEXT("rampa: talla 1 -> multiplicador exacto"), TreeFoliage::AgeLeafMultiplier(1.f, 3.f), 3.f);
+    TestEqual(TEXT("rampa: multiplicador 1 -> neutra a cualquier talla"), TreeFoliage::AgeLeafMultiplier(0.7f, 1.f), 1.f);
+    TestTrue(TEXT("rampa: el bucket mas joven queda casi intacto"), TreeFoliage::AgeLeafMultiplier(0.2f, 3.f) < 1.1f);
+    TestTrue(TEXT("rampa: talla fuera de rango se recorta"),
+        FMath::IsNearlyEqual(TreeFoliage::AgeLeafMultiplier(5.f, 3.f), 3.f, 1e-5f));
+    TestTrue(TEXT("rampa: multiplicador < 1 no aclara"),
+        FMath::IsNearlyEqual(TreeFoliage::AgeLeafMultiplier(1.f, 0.5f), 1.f, 1e-5f));
+
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    constexpr uint32 Seed = 7777u;
+    Sp->MaxLeavesPerTree = 0;
+
+    // 1) Línea base: con el multiplicador a 1 la talla del arquetipo no cambia nada.
+    Sp->AdultLeafMultiplier = 1.f;
+    Sp->ArchetypeSizeRatio = 0.2f;
+    const int32 Baseline = EcoCountLeaves(*Sp, Seed);
+    if (Baseline < 50)
+    {
+        AddError(FString::Printf(TEXT("Muy pocas hojas para medir (%d)."), Baseline));
+        return false;
+    }
+    Sp->ArchetypeSizeRatio = 1.f;
+    TestEqual(TEXT("con multiplicador 1 la edad no cambia el recuento"), EcoCountLeaves(*Sp, Seed), Baseline);
+
+    // 2) Con el efecto activo la plántula conserva sus hojas...
+    Sp->AdultLeafMultiplier = 3.f;
+    Sp->ArchetypeSizeRatio = 0.2f;
+    const int32 Young = EcoCountLeaves(*Sp, Seed);
+    TestTrue(FString::Printf(TEXT("la plantula no pierde hojas (%d frente a %d)"), Young, Baseline),
+        Young >= FMath::RoundToInt(Baseline * 0.95f));
+    TestTrue(FString::Printf(TEXT("la plantula apenas cambia (%d frente a %d)"), Young, Baseline),
+        Young <= FMath::RoundToInt(Baseline * 1.20f));
+
+    // 3) ...el adulto se acerca al múltiplo pedido...
+    Sp->ArchetypeSizeRatio = 1.f;
+    const int32 Adult = EcoCountLeaves(*Sp, Seed);
+    TestTrue(FString::Printf(TEXT("el adulto se espesa hacia x3 (%d frente a %d)"), Adult, Baseline),
+        Adult >= Baseline * 2 && Adult <= Baseline * 4);
+
+    // 4) ...y por el camino ningún bucket tiene menos hojas que el anterior.
+    {
+        int32 Prev = 0;
+        bool bMonotone = true;
+        for (int32 Bucket = 1; Bucket <= 5 && bMonotone; ++Bucket)
+        {
+            Sp->ArchetypeSizeRatio = static_cast<float>(Bucket) / 5.f;
+            const int32 Count = EcoCountLeaves(*Sp, Seed);
+            bMonotone = (Count >= FMath::RoundToInt(Prev * 0.98f));
+            Prev = Count;
+        }
+        TestTrue(TEXT("mas edad nunca da menos hojas"), bMonotone);
+    }
+
+    // 5) El tope.
+    {
+        Sp->ArchetypeSizeRatio = 1.f;
+        Sp->MaxLeavesPerTree = 0;
+        FTreeMeshData Free;
+        const int32 Uncapped = EcoCountLeaves(*Sp, Seed, &Free);
+
+        // Se cumple y se alcanza: con el reparto desbordado quedan exactamente Cap hojas.
+        const int32 Cap = Uncapped / 2;
+        Sp->MaxLeavesPerTree = Cap;
+        FTreeMeshData Capped;
+        const int32 Limited = EcoCountLeaves(*Sp, Seed, &Capped);
+        TestTrue(FString::Printf(TEXT("nunca por encima del tope (%d <= %d)"), Limited, Cap), Limited <= Cap);
+        TestEqual(TEXT("el tope se alcanza exactamente"), Limited, Cap);
+
+        // Aclara toda la copa por igual: el centro de masas del follaje no se mueve.
+        auto MeanZ = [](const FTreeMeshBuffers& B)
+        {
+            double Sum = 0.0;
+            for (const FVector& V : B.Vertices) { Sum += V.Z; }
+            return B.Vertices.Num() > 0 ? Sum / B.Vertices.Num() : 0.0;
+        };
+        double MinZ = TNumericLimits<double>::Max();
+        double MaxZ = -TNumericLimits<double>::Max();
+        for (const FVector& V : Free.Leaves.Vertices)
+        {
+            MinZ = FMath::Min(MinZ, V.Z);
+            MaxZ = FMath::Max(MaxZ, V.Z);
+        }
+        const double Span = FMath::Max(MaxZ - MinZ, 1.0);
+        TestTrue(TEXT("el tope aclara toda la copa por igual"),
+            FMath::Abs(MeanZ(Free.Leaves) - MeanZ(Capped.Leaves)) < 0.10 * Span);
+
+        // Determinismo con tope: misma ficha y semilla, mismas hojas bit a bit.
+        FTreeMeshData Again;
+        EcoCountLeaves(*Sp, Seed, &Again);
+        bool bSame = (Again.Leaves.Vertices.Num() == Capped.Leaves.Vertices.Num());
+        for (int32 v = 0; bSame && v < Capped.Leaves.Vertices.Num(); ++v)
+        {
+            bSame = (Again.Leaves.Vertices[v] == Capped.Leaves.Vertices[v]);
+        }
+        TestTrue(TEXT("con tope, misma semilla -> mismas hojas exactas"), bSame);
+
+        // Subir el tope solo añade hojas: cada hoja del árbol acotado sigue, en su sitio
+        // exacto, en el árbol con el tope más alto.
+        Sp->MaxLeavesPerTree = Cap + Cap / 2;
+        FTreeMeshData Wider;
+        const int32 WiderCount = EcoCountLeaves(*Sp, Seed, &Wider);
+        TSet<FVector> WiderAnchors;
+        for (int32 v = 0; v < Wider.Leaves.Vertices.Num(); v += 4)
+        {
+            WiderAnchors.Add(Wider.Leaves.Vertices[v]);
+        }
+        bool bSuperset = (WiderCount >= Limited);
+        for (int32 v = 0; bSuperset && v < Capped.Leaves.Vertices.Num(); v += 4)
+        {
+            bSuperset = WiderAnchors.Contains(Capped.Leaves.Vertices[v]);
+        }
+        TestTrue(TEXT("subir el tope solo anade hojas, no mueve las que habia"), bSuperset);
+
+        // Un tope holgado no toca nada.
+        Sp->MaxLeavesPerTree = Uncapped * 2;
+        TestEqual(TEXT("un tope holgado no cambia el recuento"), EcoCountLeaves(*Sp, Seed), Uncapped);
     }
 
     return true;

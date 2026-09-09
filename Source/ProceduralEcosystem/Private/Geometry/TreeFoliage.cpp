@@ -9,7 +9,9 @@
  * ángulo de inserción sobre la perpendicular, la orientación de la lámina interpolada
  * entre el cielo y el gradiente de luz local, y el giro, el tamaño, el desfase de aleteo y
  * el descarte de ranuras, todo por hash salado de la terna (semilla, rama, ranura). Antes
- * del bucle estima la longitud portadora total para reservar los buffers de una vez.
+ * del bucle cuenta las ranuras portadoras, para reservar los buffers de una vez y para
+ * resolver el tope de hojas por árbol: si el reparto lo desborda, el umbral de descarte
+ * baja hasta que quedan exactamente las que caben, repartidas por toda la copa.
  *
  * @ingroup eco_geometry
  * @see @ref bib_vogel1979
@@ -42,6 +44,7 @@ namespace
     constexpr float MinSizeScale = 0.80f;      ///< Escala mínima de una hoja frente a la nominal.
     constexpr float MaxSizeScale = 1.25f;      ///< Escala máxima.
     constexpr float MinAttachRadiusCm = 0.05f; ///< Suelo del radio de ramilla al insertar.
+    constexpr int32 MaxReservedLeaves = 200000;///< Tope de la reserva previa de buffers, no de la emisión.
 
     /**
      * Valor estable en [0,1) para la terna (árbol, rama, ranura).
@@ -84,7 +87,12 @@ namespace TreeFoliage
             return;
         }
 
-        const float Spacing = FMath::Max(Species.LeafSpacingCm, 0.5f);
+        // Espesado por edad: el paso efectivo entre hojas se acorta con la fracción de
+        // talla adulta del arquetipo, así que un adulto lleva AdultLeafMultiplier veces
+        // más hojas por centímetro de ramilla que la plántula, y la plántula conserva el
+        // paso de la ficha. La forma de la rampa está en AgeLeafMultiplier.
+        const float AgeMult = AgeLeafMultiplier(Species.ArchetypeSizeRatio, Species.AdultLeafMultiplier);
+        const float Spacing = FMath::Max(Species.LeafSpacingCm / AgeMult, 0.5f);
         const float Divergence = FMath::DegreesToRadians(Species.PhyllotaxisAngleDeg);
         const float Insertion = FMath::DegreesToRadians(Species.LeafInsertionAngleDeg);
         const float MaxRadius = FMath::Max(Species.TipRadiusCm, KINDA_SMALL_NUMBER)
@@ -93,54 +101,118 @@ namespace TreeFoliage
         const float HalfWidth = FMath::Max(Length * Species.LeafWidthRatio * 0.5f, 0.25f);
         const float Petiole = FMath::Max(Species.PetioleLengthCm, 0.f);
         const float Helio = FMath::Clamp(Species.LeafHeliotropism, 0.f, 1.f);
-        const float Fill = FMath::Clamp(Species.LeafDensity, 0.f, 1.f);
         const float Flutter = FMath::Clamp(Species.LeafFlutterScale, 0.f, 2.f);
         const float CosI = FMath::Cos(Insertion);
         const float SinI = FMath::Sin(Insertion);
         const bool bHasLight = (FineLight != nullptr) && FineLight->IsValid();
 
-        // Longitud total de madera portadora de hoja. Sirve para reservar los buffers de
-        // una vez: sin esta pasada previa el follaje de un árbol grande obliga a decenas
-        // de realojos mientras crece vértice a vértice.
-        float BearingLength = 0.f;
-        for (int32 i = 1; i < N; ++i)
-        {
-            const int32 P = Skeleton.Nodes[i].Parent;
-            if (P >= 0 && Skeleton.Nodes[i].Radius <= MaxRadius)
-            {
-                BearingLength += Wind.AlongLen[i] - Wind.AlongLen[P];
-            }
-        }
+        // Umbral de descarte de ranuras: una ranura produce hoja si su hash queda por
+        // debajo. Arranca en LeafDensity y el tope de hojas puede bajarlo todavía más:
+        // aclarar por densidad y aclarar por tope son la misma palanca.
+        float Fill = FMath::Clamp(Species.LeafDensity, 0.f, 1.f);
+        const int32 MaxLeaves = FMath::Max(Species.MaxLeavesPerTree, 0);
 
-        const int32 Expected = FMath::Clamp(FMath::RoundToInt(BearingLength / Spacing * Fill), 0, 200000);
-        OutLeaves.ReserveVertices(Expected * 4);
-        OutLeaves.Triangles.Reserve(Expected * 6);
-
-        for (int32 i = 1; i < N; ++i)
+        // Ranuras de hoja que caen dentro del internodo i, o false si no lleva ninguna. Es
+        // la única copia de la aritmética de ranuras: la pasada previa y la de emisión
+        // tienen que contar exactamente lo mismo. Las ranuras son globales sobre la
+        // longitud acumulada, no locales al internodo: por eso la espiral no se reinicia en
+        // cada bifurcación y no depende de en cuántos nodos haya troceado la rama la
+        // colonización.
+        auto SlotRange = [&](int32 i, int32& OutFirst, int32& OutLast) -> bool
         {
             const FBranchNode& Node = Skeleton.Nodes[i];
             const int32 P = Node.Parent;
             if (P < 0 || Node.Radius > MaxRadius)
             {
+                return false;
+            }
+            const float Start = Wind.AlongLen[P];
+            if (Wind.AlongLen[i] - Start <= KINDA_SMALL_NUMBER)
+            {
+                return false;
+            }
+            OutFirst = FMath::FloorToInt32(Start / Spacing) + 1;
+            OutLast = FMath::FloorToInt32(Wind.AlongLen[i] / Spacing);
+            return OutLast >= OutFirst;
+        };
+
+        // Pasada previa: cuenta exacta de ranuras portadoras. Sirve para reservar los
+        // buffers de una vez —sin ella el follaje de un árbol grande obliga a decenas de
+        // realojos mientras crece vértice a vértice— y para saber si el tope puede llegar
+        // a superarse, que solo ocurre si hay más ranuras que hojas permitidas.
+        int32 TotalSlots = 0;
+        for (int32 i = 1; i < N; ++i)
+        {
+            int32 FirstSlot = 0, LastSlot = -1;
+            if (SlotRange(i, FirstSlot, LastSlot))
+            {
+                TotalSlots += LastSlot - FirstSlot + 1;
+            }
+        }
+
+        // Tope de hojas por árbol: se cumple bajando el umbral de descarte, no cortando la
+        // emisión. Se reúnen los hashes de descarte de las ranuras que pasan LeafDensity y
+        // el umbral se fija en el MaxLeaves-ésimo más bajo, con lo que sobreviven
+        // exactamente las que caben, repartidas por toda la copa igual que las reparte
+        // LeafDensity. Cortar la emisión al llegar al tope dejaría calvas las ramillas del
+        // final del esqueleto, que son las últimas en crecer: las puntas. Como el hash de
+        // cada ranura es estable, subir el tope solo añade hojas y nunca mueve las que ya
+        // estaban.
+        if (MaxLeaves > 0 && TotalSlots > MaxLeaves)
+        {
+            TArray<float> Candidates;
+            Candidates.Reserve(FMath::Min(FMath::RoundToInt(TotalSlots * Fill) + 16, MaxReservedLeaves));
+            for (int32 i = 1; i < N; ++i)
+            {
+                int32 FirstSlot = 0, LastSlot = -1;
+                if (!SlotRange(i, FirstSlot, LastSlot))
+                {
+                    continue;
+                }
+                const int32 Root = Wind.BranchRoot[i];
+                for (int32 Slot = FirstSlot; Slot <= LastSlot; ++Slot)
+                {
+                    const float U = LeafUnit(Seed, Root, Slot, SaltSkip);
+                    if (U <= Fill)
+                    {
+                        Candidates.Add(U);
+                    }
+                }
+            }
+            if (Candidates.Num() > MaxLeaves)
+            {
+                Candidates.Sort();
+                Fill = Candidates[MaxLeaves - 1];
+            }
+        }
+
+        int32 Expected = FMath::RoundToInt(TotalSlots * Fill);
+        if (MaxLeaves > 0)
+        {
+            Expected = FMath::Min(Expected, MaxLeaves);
+        }
+        Expected = FMath::Clamp(Expected, 0, MaxReservedLeaves);
+        OutLeaves.ReserveVertices(Expected * 4);
+        OutLeaves.Triangles.Reserve(Expected * 6);
+
+        // Guarda dura del tope. El umbral ya deja exactamente MaxLeaves ranuras salvo que
+        // dos compartan hash justo en el corte, que es el único caso en que actúa este
+        // contador.
+        const int32 LeafBudget = (MaxLeaves > 0) ? MaxLeaves : MAX_int32;
+        int32 Emitted = 0;
+
+        for (int32 i = 1; i < N && Emitted < LeafBudget; ++i)
+        {
+            int32 FirstSlot = 0, LastSlot = -1;
+            if (!SlotRange(i, FirstSlot, LastSlot))
+            {
                 continue;
             }
 
+            const FBranchNode& Node = Skeleton.Nodes[i];
+            const int32 P = Node.Parent;
             const float Start = Wind.AlongLen[P];
             const float SegLen = Wind.AlongLen[i] - Start;
-            if (SegLen <= KINDA_SMALL_NUMBER)
-            {
-                continue;
-            }
-
-            // Las ranuras son globales sobre la longitud acumulada, no locales al
-            // internodo: por eso la espiral no se reinicia en cada bifurcación y no
-            // depende de en cuántos nodos haya troceado la rama la colonización.
-            const int32 FirstSlot = FMath::FloorToInt32(Start / Spacing) + 1;
-            const int32 LastSlot = FMath::FloorToInt32(Wind.AlongLen[i] / Spacing);
-            if (LastSlot < FirstSlot)
-            {
-                continue;
-            }
 
             const FVector Anchor = Skeleton.Nodes[P].Pos;
             const FVector Seg = Node.Pos - Anchor;
@@ -156,7 +228,7 @@ namespace TreeFoliage
             // quieta: de ahí el suelo del 35 % antes de escalar por el aleteo de especie.
             const float Sway = FMath::Clamp((0.35f + 0.65f * Wn.SwayWeight) * Flutter, 0.f, 1.f);
 
-            for (int32 Slot = FirstSlot; Slot <= LastSlot; ++Slot)
+            for (int32 Slot = FirstSlot; Slot <= LastSlot && Emitted < LeafBudget; ++Slot)
             {
                 // Aclarar el follaje se hace descartando ranuras, no acortando la espiral:
                 // las hojas que quedan siguen en el sitio exacto que les tocaba.
@@ -230,6 +302,8 @@ namespace TreeFoliage
                 OutLeaves.Triangles.Add(Base + 0);
                 OutLeaves.Triangles.Add(Base + 2);
                 OutLeaves.Triangles.Add(Base + 3);
+
+                ++Emitted;
             }
         }
     }

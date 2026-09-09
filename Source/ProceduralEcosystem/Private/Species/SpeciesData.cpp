@@ -249,6 +249,18 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             LeafSpacingCm, LeafSizeCm)));
     }
 
+    // El espesado por edad acorta el paso del adulto a LeafSpacingCm / AdultLeafMultiplier.
+    // Ir más denso que la plántula es justo lo que se busca con esa palanca, así que aquí
+    // el umbral de solape es la mitad del de arriba: solo avisa de multiplicadores
+    // realmente extremos, no de los valores por defecto.
+    if (AdultLeafMultiplier > 1.f && LeafSpacingCm > 0.f
+        && LeafSpacingCm / AdultLeafMultiplier < LeafSizeCm * 0.125f)
+    {
+        Context.AddWarning(FText::FromString(FString::Printf(
+            TEXT("AdultLeafMultiplier %.1f deja al adulto un paso efectivo de %.1f cm, muy por debajo de LeafSizeCm (%.1f): sus hojas se solaparan mucho y el overdraw se dispara. Bajalo, sube LeafSpacingCm o acota con MaxLeavesPerTree."),
+            AdultLeafMultiplier, LeafSpacingCm / AdultLeafMultiplier, LeafSizeCm)));
+    }
+
     if (LeafBearingRadiusScale < 1.f)
     {
         Context.AddWarning(FText::FromString(

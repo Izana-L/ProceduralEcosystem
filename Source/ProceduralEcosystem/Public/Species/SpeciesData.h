@@ -637,7 +637,9 @@ public:
     // Las hojas se reparten a lo largo de las ramillas, una por ranura cada LeafSpacingCm de
     // longitud de rama, girando PhyllotaxisAngleDeg entre ranuras consecutivas.
     // LeafSpacingCm es por tanto la palanca de densidad y de coste: la mitad de separación
-    // es el doble de hojas.
+    // es el doble de hojas. Ese reparto es el de la plántula: el follaje se espesa además
+    // con la edad (AdultLeafMultiplier) y tiene un tope absoluto por árbol
+    // (MaxLeavesPerTree). Ver TreeFoliage::Build.
 
     /** Largo de la hoja, del pecíolo a la punta, en cm. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1"))
@@ -691,6 +693,46 @@ public:
         cambiar su reparto; para más follaje se baja LeafSpacingCm. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0", ClampMax = "1"))
     float LeafDensity = 0.8f;
+
+    /**
+     * Cuántas veces más hojas por centímetro de ramilla lleva el árbol ADULTO respecto al
+     * reparto base que fijan LeafSpacingCm y LeafDensity. El follaje se espesa con la edad:
+     * el bucket más joven conserva su reparto de siempre, los intermedios suben con el
+     * cuadrado de la fracción de talla adulta y el adulto llega a este valor. Es lo que
+     * evita que un adulto, cuya copa es mucho mayor, salga ralo con las mismas hojas por
+     * ramilla que una plántula. 1 desactiva el efecto.
+     *
+     * Es la palanca de espesor: con ella se sube o baja el follaje del adulto sin tocar
+     * las plántulas. El coste crece con ella; MaxLeavesPerTree lo acota.
+     *
+     * @see TreeFoliage::AgeLeafMultiplier
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1", ClampMax = "8"))
+    float AdultLeafMultiplier = 2.f;
+
+    /**
+     * Tope de tarjetas de hoja por árbol; 0 = sin tope. Cuando el reparto pide más hojas
+     * de las que caben, el follaje se aclara uniformemente —descartando ranuras por hash,
+     * igual que hace LeafDensity— hasta quedarse exactamente en el tope, de modo que toda
+     * la copa pierde por igual y ninguna zona se queda calva. Subir el tope solo añade
+     * hojas; las que ya estaban no se mueven.
+     *
+     * Es la palanca de coste y la de prueba: fija cuántas hojas puede tener como mucho un
+     * árbol de esta especie, sea cual sea su edad, y permite probar a mano cuántas quedan
+     * bien. Cada hoja son 4 vértices y 2 triángulos.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0"))
+    int32 MaxLeavesPerTree = 0;
+
+    /**
+     * Fracción de talla adulta del arquetipo, en (0..1]: la «edad» con la que escala el
+     * follaje. La rellena UTreeLibrary::GetArchetypeSpecies en el duplicado de cada bucket;
+     * en el asset base vale 1, así que un hero tree suelto en el editor se ve como el
+     * adulto. No es un rasgo de diseño sino una conexión entre capas, y por eso no es
+     * editable ni se guarda.
+     */
+    UPROPERTY(Transient)
+    float ArchetypeSizeRatio = 1.f;
 
     // ================================================================
     // ==== NIVELES DE REPRESENTACIÓN Y MATERIALES ====
