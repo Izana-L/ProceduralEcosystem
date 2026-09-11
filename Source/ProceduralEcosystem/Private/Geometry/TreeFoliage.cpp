@@ -4,14 +4,17 @@
  * @brief Implementación de la colocación de hojas: tarjetas de hoja por ranura filotáctica.
  *
  * Recorre los internodos portadores de hoja, los que ya son madera fina, y emite un quad
- * por cada ranura de la espiral que cae dentro del internodo. Resuelve para cada hoja el
- * punto de inserción —separado del eje por el radio de la ramilla más el pecíolo—, el
- * ángulo de inserción sobre la perpendicular, la orientación de la lámina interpolada
- * entre el cielo y el gradiente de luz local, y el giro, el tamaño, el desfase de aleteo y
- * el descarte de ranuras, todo por hash salado de la terna (semilla, rama, ranura). Antes
- * del bucle cuenta las ranuras portadoras, para reservar los buffers de una vez y para
- * resolver el tope de hojas por árbol: si el reparto lo desborda, el umbral de descarte
- * baja hasta que quedan exactamente las que caben, repartidas por toda la copa.
+ * CUADRADO por cada ranura de la espiral que cae dentro del internodo, de lado LeafSizeCm
+ * y con la UV completa de la textura: la silueta de la hoja —redonda, ovalada, lanceolada—
+ * la dibuja la máscara de opacidad del material, nunca la malla, así que una textura
+ * cuadrada nunca sale estirada. Resuelve para cada hoja el punto de inserción —separado
+ * del eje por el radio de la ramilla más el pecíolo—, el ángulo de inserción sobre la
+ * perpendicular, la orientación de la lámina interpolada entre el cielo y el gradiente de
+ * luz local, y el giro, el tamaño, el desfase de aleteo y el descarte de ranuras, todo por
+ * hash salado de la terna (semilla, rama, ranura). Antes del bucle cuenta las ranuras
+ * portadoras, para reservar los buffers de una vez y para resolver el tope de hojas por
+ * árbol: si el reparto lo desborda, el umbral de descarte baja hasta que quedan
+ * exactamente las que caben, repartidas por toda la copa.
  *
  * @ingroup eco_geometry
  * @see @ref bib_vogel1979
@@ -44,7 +47,8 @@ namespace
     constexpr float MinSizeScale = 0.80f;      ///< Escala mínima de una hoja frente a la nominal.
     constexpr float MaxSizeScale = 1.25f;      ///< Escala máxima.
     constexpr float MinAttachRadiusCm = 0.05f; ///< Suelo del radio de ramilla al insertar.
-    constexpr int32 MaxReservedLeaves = 200000;///< Tope de la reserva previa de buffers, no de la emisión.
+    constexpr float MinSpacingCm = 0.25f;      ///< Suelo del paso efectivo entre ranuras; casa con el ClampMin de LeafSpacingCm.
+    constexpr int32 MaxReservedLeaves = 500000;///< Tope de la reserva previa de buffers, no de la emisión.
 
     /**
      * Valor estable en [0,1) para la terna (árbol, rama, ranura).
@@ -92,13 +96,18 @@ namespace TreeFoliage
         // más hojas por centímetro de ramilla que la plántula, y la plántula conserva el
         // paso de la ficha. La forma de la rampa está en AgeLeafMultiplier.
         const float AgeMult = AgeLeafMultiplier(Species.ArchetypeSizeRatio, Species.AdultLeafMultiplier);
-        const float Spacing = FMath::Max(Species.LeafSpacingCm / AgeMult, 0.5f);
+        const float Spacing = FMath::Max(Species.LeafSpacingCm / AgeMult, MinSpacingCm);
         const float Divergence = FMath::DegreesToRadians(Species.PhyllotaxisAngleDeg);
         const float Insertion = FMath::DegreesToRadians(Species.LeafInsertionAngleDeg);
         const float MaxRadius = FMath::Max(Species.TipRadiusCm, KINDA_SMALL_NUMBER)
             * FMath::Max(Species.LeafBearingRadiusScale, 1.f);
+        // La tarjeta es cuadrada: ancho = largo = LeafSizeCm. La proporción de la hoja no es
+        // cosa de la geometría sino del arte: cada textura dibuja su propia silueta con la
+        // máscara de opacidad y la malla se limita a darle un lienzo sin deformar, de modo
+        // que una hoja alargada y una redonda comparten el mismo quad y solo cambia la
+        // textura.
         const float Length = FMath::Max(Species.LeafSizeCm, 0.5f);
-        const float HalfWidth = FMath::Max(Length * Species.LeafWidthRatio * 0.5f, 0.25f);
+        const float HalfWidth = Length * 0.5f;
         const float Petiole = FMath::Max(Species.PetioleLengthCm, 0.f);
         const float Helio = FMath::Clamp(Species.LeafHeliotropism, 0.f, 1.f);
         const float Flutter = FMath::Clamp(Species.LeafFlutterScale, 0.f, 2.f);
@@ -273,8 +282,10 @@ namespace TreeFoliage
                 const FVector HalfSpan = Side * (HalfWidth * Scale);
                 const FVector Blade = Along * (Length * Scale);
 
-                // Tarjeta de hoja: quad de cuatro vértices anclado en el punto de inserción y
-                // extendido a lo largo de la lámina, con la UV completa de la textura.
+                // Tarjeta de hoja: quad cuadrado de cuatro vértices anclado en el punto de
+                // inserción y extendido a lo largo de la lámina, con la UV completa de la
+                // textura. Como la UV cubre (0,0)-(1,1) sobre un lienzo cuadrado, un texel
+                // mide lo mismo en U que en V y la textura nunca sale estirada.
                 const int32 Base = OutLeaves.Vertices.Num();
                 OutLeaves.Vertices.Add(Attach - HalfSpan);
                 OutLeaves.Vertices.Add(Attach + HalfSpan);

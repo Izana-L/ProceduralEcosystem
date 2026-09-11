@@ -32,8 +32,11 @@ struct FTreeLightGridFine; // Geometry/TreeLightGridFine.h
  *
  * Solo llevan hoja los nodos cuyo radio queda por debajo de
  * `TipRadiusCm * LeafBearingRadiusScale`: la hoja sale de la madera del año, no del
- * tronco. Cada hoja es una tarjeta de hoja, un quad de cuatro vértices con su propia
- * orientación, tamaño y desfase de aleteo.
+ * tronco. Cada hoja es una tarjeta de hoja, un quad CUADRADO de cuatro vértices, de lado
+ * USpeciesData::LeafSizeCm y con la UV completa de la textura, con su propia orientación,
+ * tamaño y desfase de aleteo. La silueta de la hoja la recorta la máscara de opacidad de
+ * la textura, no la malla: así una textura cuadrada nunca sale estirada y cada especie
+ * pone su forma de hoja en el arte.
  *
  * Cuántas hojas salen lo deciden tres palancas de la especie. LeafSpacingCm y LeafDensity
  * fijan el reparto base, el de la plántula. AdultLeafMultiplier lo espesa con la edad: el

@@ -640,19 +640,24 @@ public:
     // es el doble de hojas. Ese reparto es el de la plántula: el follaje se espesa además
     // con la edad (AdultLeafMultiplier) y tiene un tope absoluto por árbol
     // (MaxLeavesPerTree). Ver TreeFoliage::Build.
+    //
+    // Cada hoja es una tarjeta CUADRADA de lado LeafSizeCm con la UV completa de la
+    // textura. La proporción de la hoja —redonda, ovalada, lanceolada— no la fija la
+    // geometría sino el arte: cada textura de hoja dibuja su propia silueta con la máscara
+    // de opacidad sobre ese lienzo cuadrado, y la malla nunca la deforma. Una textura
+    // cuadrada se ve siempre con sus proporciones.
 
-    /** Largo de la hoja, del pecíolo a la punta, en cm. */
+    /** Lado de la tarjeta de hoja, en cm. El quad es cuadrado, así que es a la vez el largo
+        de la hoja —del pecíolo a la punta— y su ancho; la silueta real la recorta la
+        máscara de opacidad de la textura, no la malla. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1"))
     float LeafSizeCm = 20.f;
 
-    /** Ancho de la hoja como fracción de su largo: 1 la deja cuadrada y por debajo de 1,
-        lanceolada. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0.05", ClampMax = "2"))
-    float LeafWidthRatio = 0.45f;
-
     /** Paso longitudinal entre ranuras de hoja consecutivas a lo largo de la ramilla, en cm.
+        Es también el suelo del paso efectivo tras el espesado por edad: por debajo de 0.25
+        cm TreeFoliage no baja aunque AdultLeafMultiplier lo pida.
         @warning Divisor de la espiral filotáctica: debe ser > 0. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0.5"))
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "0.25"))
     float LeafSpacingCm = 8.f;
 
     /**
@@ -703,11 +708,13 @@ public:
      * ramilla que una plántula. 1 desactiva el efecto.
      *
      * Es la palanca de espesor: con ella se sube o baja el follaje del adulto sin tocar
-     * las plántulas. El coste crece con ella; MaxLeavesPerTree lo acota.
+     * las plántulas. El coste crece con ella; MaxLeavesPerTree lo acota. El techo de 16
+     * deja al adulto, con el paso por defecto de 8 cm, una hoja cada 0.5 cm de ramilla;
+     * el suelo absoluto del paso efectivo es el ClampMin de LeafSpacingCm.
      *
      * @see TreeFoliage::AgeLeafMultiplier
      */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1", ClampMax = "8"))
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SCA|Follaje", meta = (ClampMin = "1", ClampMax = "16"))
     float AdultLeafMultiplier = 2.f;
 
     /**
@@ -757,7 +764,10 @@ public:
     TObjectPtr<UMaterialInterface> BarkMaterial;
 
     /** Material del follaje: sección 1 de la malla. La tarjeta de hoja pide un material de
-        dos caras, con máscara de opacidad y dispersión subsuperficial. */
+        dos caras, con máscara de opacidad y dispersión subsuperficial. La tarjeta es un
+        cuadrado de lado LeafSizeCm con la UV completa, así que la textura debe ser cuadrada
+        y llevar la silueta de la hoja en su máscara: es ella la que decide si la hoja es
+        redonda o alargada. */
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "LOD")
     TObjectPtr<UMaterialInterface> LeafMaterial;
 

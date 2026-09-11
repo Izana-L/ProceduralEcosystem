@@ -242,22 +242,30 @@ EDataValidationResult USpeciesData::IsDataValid(FDataValidationContext& Context)
             TEXT("LeafSpacingCm debe ser > 0: es el paso de la espiral filotáctica (divisor en TreeFoliage).")));
         Fail();
     }
+    // La tarjeta de hoja es un cuadrado de lado LeafSizeCm, sea cual sea la silueta que
+    // recorte la textura: el material enmascarado rasteriza el quad entero y descarta
+    // después, así que el solape que se paga es el de cuadrados de LeafSizeCm de lado, no el
+    // de la hoja dibujada. Por eso la medida de solape se toma contra LeafSizeCm a secas: ya
+    // no hay un ancho aparte. El umbral es holgado a propósito —más de cuatro tarjetas por
+    // lado de tarjeta— porque un follaje denso solapa por naturaleza y solo se avisa del
+    // caso en que el overdraw se dispara.
     else if (LeafSpacingCm < LeafSizeCm * 0.25f)
     {
         Context.AddWarning(FText::FromString(FString::Printf(
-            TEXT("LeafSpacingCm (%.1f) muy por debajo de LeafSizeCm (%.1f): las hojas se solaparán mucho y el coste de overdraw se dispara."),
+            TEXT("LeafSpacingCm (%.1f) muy por debajo del lado de la tarjeta de hoja, LeafSizeCm (%.1f): las tarjetas son cuadradas y se solaparan mucho, y el coste de overdraw se dispara."),
             LeafSpacingCm, LeafSizeCm)));
     }
 
     // El espesado por edad acorta el paso del adulto a LeafSpacingCm / AdultLeafMultiplier.
     // Ir más denso que la plántula es justo lo que se busca con esa palanca, así que aquí
     // el umbral de solape es la mitad del de arriba: solo avisa de multiplicadores
-    // realmente extremos, no de los valores por defecto.
+    // realmente extremos, no de los valores por defecto. Se mide igual que arriba, contra
+    // el lado de la tarjeta cuadrada.
     if (AdultLeafMultiplier > 1.f && LeafSpacingCm > 0.f
         && LeafSpacingCm / AdultLeafMultiplier < LeafSizeCm * 0.125f)
     {
         Context.AddWarning(FText::FromString(FString::Printf(
-            TEXT("AdultLeafMultiplier %.1f deja al adulto un paso efectivo de %.1f cm, muy por debajo de LeafSizeCm (%.1f): sus hojas se solaparan mucho y el overdraw se dispara. Bajalo, sube LeafSpacingCm o acota con MaxLeavesPerTree."),
+            TEXT("AdultLeafMultiplier %.1f deja al adulto un paso efectivo de %.1f cm, muy por debajo del lado de la tarjeta de hoja, LeafSizeCm (%.1f): sus tarjetas cuadradas se solaparan mucho y el overdraw se dispara. Bajalo, sube LeafSpacingCm o acota con MaxLeavesPerTree."),
             AdultLeafMultiplier, LeafSpacingCm / AdultLeafMultiplier, LeafSizeCm)));
     }
 

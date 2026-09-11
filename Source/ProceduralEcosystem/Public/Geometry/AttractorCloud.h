@@ -87,6 +87,12 @@ struct PROCEDURALECOSYSTEM_API FAttractorCloud
      *                 reproducibilidad de la nube.
      * @note Reemplaza el contenido previo. El índice queda obsoleto: hay que volver a
      *       llamar a @ref BuildIndex después.
+     * @note La copa columnar se siembra estratificada: las alturas se reparten en
+     *       franjas, una por atractor, y los azimuts siguen una espiral áurea, ambos
+     *       con jitter, para que ninguna cota concentre un corro de atractores, que en
+     *       una copa estrecha se lee como un verticilo de ramas. Las demás formas usan
+     *       muestreo blanco. Todas consumen los mismos valores del generador por
+     *       atractor.
      */
     void SampleCrownEnvelope(const USpeciesData& Species, const FVector& TrunkBaseWorld, uint32& RngState);
 

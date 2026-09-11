@@ -40,7 +40,7 @@
 #include "Species/SpeciesData.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
-/** Flags comunes a los 33 casos: corren en el proceso del editor y aparecen bajo el filtro
+/** Flags comunes a los 34 casos: corren en el proceso del editor y aparecen bajo el filtro
     «Engine» del Session Frontend. */
 static constexpr EAutomationTestFlags EcoTestFlags = EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter;
 
@@ -1206,6 +1206,86 @@ bool FEcoLeavesByAge::RunTest(const FString&) {
         Sp->MaxLeavesPerTree = Uncapped * 2;
         TestEqual(TEXT("un tope holgado no cambia el recuento"), EcoCountLeaves(*Sp, Seed), Uncapped);
     }
+
+    return true;
+}
+
+/**
+ * La tarjeta de hoja es un cuadrado de lado LeafSizeCm con la UV completa de la textura.
+ *
+ * La silueta de la hoja la dibuja la máscara de opacidad de la textura, no la malla: para que
+ * una textura cuadrada no salga estirada, el quad tiene que ser cuadrado -ancho igual a
+ * largo- y la UV tiene que cubrir (0,0)-(1,1) sobre él. Se comprueba en cada tarjeta que los
+ * dos lados que salen del primer vértice miden lo mismo y son perpendiculares, que el lado
+ * queda dentro de la variación por hoja alrededor de LeafSizeCm y que las cuatro UV son las
+ * esquinas de la textura. Cierra doblando LeafSizeCm sobre el mismo esqueleto: cada tarjeta
+ * dobla su lado y sigue cuadrada, y ninguna cambia de sitio ni desaparece.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FEcoLeafCardSquare, "Eco.Arbol.TarjetaDeHojaCuadrada", EcoTestFlags)
+bool FEcoLeafCardSquare::RunTest(const FString&) {
+    USpeciesData* Sp = EcoTestSpecies(GetTransientPackage());
+    if (!Sp) { AddError(TEXT("No se pudo crear la especie de prueba.")); return false; }
+    constexpr uint32 Seed = 4242u;
+    Sp->LeafSizeCm = 20.f;
+
+    FTreeMeshData Mesh;
+    const int32 Leaves = EcoCountLeaves(*Sp, Seed, &Mesh);
+    if (Leaves < 20)
+    {
+        AddError(FString::Printf(TEXT("Muy pocas hojas para medir (%d)."), Leaves));
+        return false;
+    }
+    const FTreeMeshBuffers& B = Mesh.Leaves;
+    TestEqual(TEXT("cuatro UV por tarjeta, en lockstep con los vertices"), B.UVs.Num(), B.Vertices.Num());
+    TestEqual(TEXT("dos triangulos por tarjeta"), B.Triangles.Num(), Leaves * 6);
+
+    // TreeFoliage reparte la escala por hoja en [0.8, 1.25] de la nominal.
+    const float MinSide = Sp->LeafSizeCm * 0.80f * 0.999f;
+    const float MaxSide = Sp->LeafSizeCm * 1.25f * 1.001f;
+
+    bool bSquare = true, bPerpendicular = true, bScaled = true, bUVs = true;
+    for (int32 v = 0; v + 3 < B.Vertices.Num() && v + 3 < B.UVs.Num(); v += 4)
+    {
+        // Vértices 0-1 son el ancho y 0-3 el largo; ver el orden de emisión en TreeFoliage.
+        const FVector Width = B.Vertices[v + 1] - B.Vertices[v];
+        const FVector Length = B.Vertices[v + 3] - B.Vertices[v];
+        const float W = static_cast<float>(Width.Size());
+        const float L = static_cast<float>(Length.Size());
+        bSquare = bSquare && FMath::IsNearlyEqual(W, L, FMath::Max(L, 1.f) * 1e-3f);
+        bPerpendicular = bPerpendicular
+            && FMath::Abs(static_cast<float>(FVector::DotProduct(Width, Length))) < FMath::Max(W * L, 1e-6f) * 1e-3f;
+        bScaled = bScaled && L >= MinSide && L <= MaxSide;
+        bUVs = bUVs
+            && B.UVs[v + 0].Equals(FVector2D(0.0, 0.0))
+            && B.UVs[v + 1].Equals(FVector2D(1.0, 0.0))
+            && B.UVs[v + 2].Equals(FVector2D(1.0, 1.0))
+            && B.UVs[v + 3].Equals(FVector2D(0.0, 1.0));
+    }
+    TestTrue(TEXT("ancho = largo en todas las tarjetas"), bSquare);
+    TestTrue(TEXT("los dos lados del quad son perpendiculares"), bPerpendicular);
+    TestTrue(TEXT("el lado queda en [0.8, 1.25] x LeafSizeCm"), bScaled);
+    TestTrue(TEXT("la UV cubre la textura entera, (0,0)-(1,1)"), bUVs);
+
+    // Doblar LeafSizeCm dobla el lado de cada tarjeta sin mover su anclaje ni cambiar cuántas
+    // hay: el tamaño de hoja no entra ni en el crecimiento ni en el reparto de ranuras.
+    Sp->LeafSizeCm = 40.f;
+    FTreeMeshData Big;
+    const int32 BigLeaves = EcoCountLeaves(*Sp, Seed, &Big);
+    TestEqual(TEXT("el tamano de hoja no cambia el recuento"), BigLeaves, Leaves);
+    bool bDoubles = (Big.Leaves.Vertices.Num() == B.Vertices.Num());
+    for (int32 v = 0; bDoubles && v + 3 < B.Vertices.Num(); v += 4)
+    {
+        const float L1 = static_cast<float>((B.Vertices[v + 3] - B.Vertices[v]).Size());
+        const float L2 = static_cast<float>((Big.Leaves.Vertices[v + 3] - Big.Leaves.Vertices[v]).Size());
+        const float W2 = static_cast<float>((Big.Leaves.Vertices[v + 1] - Big.Leaves.Vertices[v]).Size());
+        // Centro del lado de anclaje: es el punto de inserción y no depende del tamaño.
+        const FVector Anchor1 = (B.Vertices[v] + B.Vertices[v + 1]) * 0.5;
+        const FVector Anchor2 = (Big.Leaves.Vertices[v] + Big.Leaves.Vertices[v + 1]) * 0.5;
+        bDoubles = FMath::IsNearlyEqual(L2, 2.f * L1, FMath::Max(L1, 1.f) * 1e-3f)
+            && FMath::IsNearlyEqual(W2, L2, FMath::Max(L2, 1.f) * 1e-3f)
+            && Anchor1.Equals(Anchor2, 1e-2);
+    }
+    TestTrue(TEXT("doblar LeafSizeCm dobla el lado, la tarjeta sigue cuadrada y no se mueve"), bDoubles);
 
     return true;
 }

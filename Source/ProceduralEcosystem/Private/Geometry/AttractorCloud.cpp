@@ -9,8 +9,11 @@
  * el fuste, un ruido de contorno coherente en azimut y altura, y el muestreo
  * area-uniforme del disco horizontal; los dos caminos —copa y falda— consumen el mismo
  * número de valores del generador para que la secuencia no dependa de cuántos puntos
- * caen en cada uno. El índice es un counting sort en tres pasadas sobre la celda de
- * cada atractor. La poda marca muertos los atractores por debajo del umbral de luz.
+ * caen en cada uno. La copa columnar es un cilindro de extremos recogidos con la panza
+ * en el tercio bajo, y se siembra estratificada en altura y en espiral áurea en azimut
+ * para que ninguna cota concentre un corro de atractores. El índice es un counting sort
+ * en tres pasadas sobre la celda de cada atractor. La poda marca muertos los atractores
+ * por debajo del umbral de luz.
  *
  * @ingroup eco_geometry
  * @see @ref bib_weberpenn1995
@@ -23,6 +26,70 @@
 #include "Geometry/TreeLightGridFine.h"
 #include "Species/SpeciesData.h"
 #include "Core/EcoCore.h" // EcoRand: generador determinista por árbol
+
+namespace
+{
+    // ==== Perfil de la copa columnar ====
+    //
+    // No es un cilindro recto ni un ovoide, sino un cilindro con los dos extremos
+    // recogidos y la panza en el tercio bajo: la copa arranca estrecha en su base, se
+    // hincha hasta el radio máximo en ColumnarPeakT, se mantiene casi cilíndrica por la
+    // mitad de la copa y se va cerrando hacia el ápice, que queda más estrecho que la
+    // base. Es la silueta del ciprés o del chopo lombardo: la masa cuelga del tercio
+    // bajo y la punta afila sin llegar a cero.
+    //
+    // El perfil anterior era casi recto con el radio máximo en la base de copa: el
+    // anillo más ancho caía a una sola cota, justo donde el tronco desnudo entra en la
+    // copa, y de ese anillo salía un verticilo de ramas horizontales en todas
+    // direcciones.
+
+    /** Radio en la base de copa, como fracción de CrownRadiusCm. */
+    constexpr float ColumnarBaseR = 0.45f;
+
+    /** Radio en el ápice, como fracción de CrownRadiusCm. */
+    constexpr float ColumnarApexR = 0.25f;
+
+    /** Altura normalizada de la panza, donde la envolvente alcanza CrownRadiusCm entero. */
+    constexpr float ColumnarPeakT = 0.35f;
+
+    /**
+     * Radio de la envolvente columnar a la altura normalizada T (0 = base de copa,
+     * 1 = ápice), como fracción de CrownRadiusCm.
+     *
+     * Dos tramos que empalman en la panza con tangente horizontal, para que el radio
+     * máximo sea una zona y no un anillo a una sola cota. Por debajo, una rampa suave
+     * (smoothstep) de ColumnarBaseR a 1: la base es un tramo estrecho que se hincha.
+     * Por encima, @f$(1 - u^2)^{0.75}@f$ de 1 a ColumnarApexR: conserva el radio casi
+     * entero hasta dos tercios de la copa —el tramo cilíndrico— y lo recoge en el
+     * último tercio hacia la punta.
+     */
+    float ColumnarProfile(float T)
+    {
+        T = FMath::Clamp(T, 0.f, 1.f);
+        if (T < ColumnarPeakT)
+        {
+            const float U = T / ColumnarPeakT;                          // 0 en la base, 1 en la panza
+            return FMath::Lerp(ColumnarBaseR, 1.f, U * U * (3.f - 2.f * U));
+        }
+        const float U = (T - ColumnarPeakT) / (1.f - ColumnarPeakT);   // 0 en la panza, 1 en el ápice
+        return FMath::Lerp(ColumnarApexR, 1.f, FMath::Pow(1.f - U * U, 0.75f));
+    }
+
+    /**
+     * Ángulo áureo, @f$2\pi(1 - 1/\varphi) \approx 137{,}5^\circ@f$: el giro entre dos
+     * atractores consecutivos de la copa columnar. Es el reparto más uniforme posible
+     * alrededor de un eje para cualquier número de puntos (la espiral de Vogel del
+     * girasol), y con él dos atractores contiguos en altura nunca caen del mismo lado.
+     */
+    constexpr float GoldenAngleRad = 2.39996323f;
+
+    /**
+     * Anchura del jitter de azimut de la espiral, como fracción del ángulo áureo. Con
+     * 0,6 el giro entre vecinos queda en 137,5 ± 41 grados: rompe la regularidad de la
+     * espiral sin que dos vecinos lleguen a coincidir de lado.
+     */
+    constexpr float ColumnarAzimuthJitter = 0.6f;
+}
 
 int32 FAttractorCloud::CountAlive() const
 {
@@ -64,6 +131,24 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
     const float Gamma = FMath::Clamp(Species.CrownVerticalBias, 0.25f, 4.f);
     const float SkirtFrac = FMath::Clamp(Species.SubCrownFraction, 0.f, 0.4f);
     const int32 NumSkirt = FMath::Clamp(FMath::RoundToInt(N * SkirtFrac), 0, N - 1);
+    const int32 NumCrown = N - NumSkirt;               // >= 1
+
+    // Muestreo estratificado, solo en la copa columnar. Con muestreo blanco la altura
+    // de cada atractor es independiente de las demás y salen corros de varios a la
+    // misma cota; en una copa ancha el corro se reparte por un disco grande y pasa
+    // desapercibido, pero en la columnar, estrecha, cada corro se convierte en un
+    // verticilo de ramas que salen del mismo tramo de fuste en todas direcciones. La
+    // columnar reparte por eso las alturas en franjas —una por atractor, con jitter
+    // dentro de ella— y los azimuts en espiral áurea con jitter, de modo que ningún
+    // tramo del eje ve más atractores que otro y dos contiguos en altura nunca caen
+    // del mismo lado. Las otras dos formas conservan el muestreo blanco: cambiarlo
+    // movería todos los arquetipos ya calibrados.
+    const bool bStratified = (Species.CrownShape == ECrownShape::Columnar);
+
+    // Radio con el que arranca la falda justo bajo la base de copa, como fracción de
+    // CrownR. En la columnar continúa el perfil, que ahí es estrecho: un escalón hacia
+    // fuera dejaría el faldón más ancho que la base de la propia copa.
+    const float SkirtTopR = bStratified ? ColumnarBaseR : 0.55f;
 
     // Offsets del ruido de envolvente, desde un sub-stream derivado por hash del
     // estado de entrada: así el contorno blando no consume del stream principal y
@@ -77,7 +162,7 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
     for (int32 i = 0; i < N; ++i)
     {
         // Los últimos NumSkirt van a la falda de sub-copa, bajo la base de copa.
-        const bool bSkirt = (i >= N - NumSkirt);
+        const bool bSkirt = (i >= NumCrown);
 
         // Altura normalizada y radio de la envolvente a esa altura. Los dos
         // caminos consumen el MISMO número de valores del generador (3), para que
@@ -87,6 +172,11 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
         float Z = 0.f;
         float NoiseT = 0.f;   // coordenada vertical del ruido de contorno
 
+        // Primera extracción: la coordenada vertical. Estratificada, es el jitter
+        // dentro de la franja que le toca al atractor por su índice; blanca, es la
+        // altura misma.
+        const float U = EcoRand::NextUnit(RngState);
+
         if (bSkirt)
         {
             // Falda: unas pocas ramas bajas dispersas por el fuste, con la
@@ -94,18 +184,20 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
             // muestras hacia la copa). Sin ella el tronco desnudo es una zona
             // vedada para las ramas, la copa arranca de golpe en un plano y toda
             // la ramificación se concentra en la punta del fuste.
-            const float S = EcoRand::NextUnit(RngState);
+            const float S = bStratified ? ((float)(i - NumCrown) + U) / (float)NumSkirt : U;
             const float Down = S * S;
             T = 0.f;
             NoiseT = -0.6f * Down; // el ruido de contorno continúa por debajo de la copa
             Z = CrownBaseZ - Down * TrunkH * 0.85f;
-            RadiusAtT = CrownR * FMath::Lerp(0.55f, 0.12f, Down);
+            RadiusAtT = CrownR * FMath::Lerp(SkirtTopR, 0.12f, Down);
         }
         else
         {
             // T = altura normalizada dentro de la copa: 0 = base de copa, 1 = ápice.
-            // El exponente Gamma sesga la densidad en vertical sin cambiar la forma.
-            T = FMath::Pow(EcoRand::NextUnit(RngState), Gamma);
+            // El exponente Gamma sesga la densidad en vertical sin cambiar la forma;
+            // aplicado sobre franjas estratificadas las deforma pero no las solapa.
+            const float Unit = bStratified ? ((float)i + U) / (float)NumCrown : U;
+            T = FMath::Pow(Unit, Gamma);
             NoiseT = T;
             Z = CrownBaseZ + T * CrownH;
 
@@ -117,21 +209,27 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
                 break;
 
             case ECrownShape::Columnar:
-                RadiusAtT = CrownR * (1.f - 0.15f * T);         // casi recta, leve estrechamiento
+                RadiusAtT = CrownR * ColumnarProfile(T);        // estrecha abajo, panza en el tercio bajo, cierra arriba
                 break;
 
             case ECrownShape::Spherical:
             default:
             {
-                const float U = 2.f * T - 1.f;                  // -1..1 (centro de copa en T=0.5)
-                RadiusAtT = CrownR * FMath::Sqrt(FMath::Max(0.f, 1.f - U * U)); // elipsoide
+                const float U2 = 2.f * T - 1.f;                 // -1..1 (centro de copa en T=0.5)
+                RadiusAtT = CrownR * FMath::Sqrt(FMath::Max(0.f, 1.f - U2 * U2)); // elipsoide
                 break;
             }
             }
         }
 
-        // Azimut del disco horizontal; el radio se sortea más abajo.
-        const float Angle = EcoRand::NextRange(RngState, 0.f, 2.f * PI);
+        // Azimut del disco horizontal; el radio se sortea más abajo. Segunda
+        // extracción: en la copa columnar es el jitter alrededor de la espiral áurea
+        // —cada atractor gira 137,5 grados respecto al anterior—; en las demás formas,
+        // el azimut mismo, uniforme en la vuelta completa.
+        const float AzimuthU = EcoRand::NextUnit(RngState);
+        const float Angle = bStratified
+            ? (float)i * GoldenAngleRad + (AzimuthU - 0.5f) * (GoldenAngleRad * ColumnarAzimuthJitter)
+            : (2.f * PI) * AzimuthU;
 
         // Ruido de contorno. Tiene que ser COHERENTE en azimut y altura, no
         // blanco: con ruido blanco la silueta no cambia, porque el máximo
@@ -148,9 +246,10 @@ void FAttractorCloud::SampleCrownEnvelope(const USpeciesData& Species, const FVe
         }
 
         // Radio con la corrección r = R*sqrt(U), que hace la densidad uniforme por
-        // ÁREA y evita el apelmazamiento junto al eje. Se llama al helper de radio y
-        // no al de disco completo porque el ruido de contorno se intercala entre el
-        // azimut y el radio; la fórmula sigue teniendo una única copia.
+        // ÁREA y evita el apelmazamiento junto al eje. Tercera extracción. Se llama al
+        // helper de radio y no al de disco completo porque el ruido de contorno se
+        // intercala entre el azimut y el radio; la fórmula sigue teniendo una única
+        // copia.
         const float Rr = EcoRand::SampleDispersalDistance(RngState, RadiusAtT);
 
         FAttractor A;
