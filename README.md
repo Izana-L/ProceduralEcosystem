@@ -133,9 +133,8 @@ La calibración de la simulación (más de 130 parámetros) se edita desde **Edi
 
 ## Créditos
 
-- **Autor/a:** _(añadir nombre)_
-- **Tutor/a:** _(añadir nombre)_
-- **Contexto:** _(añadir: TFG / TFM / asignatura, centro y curso)_
+- **Autor/a: Juan Luque Roldan
+
 
 Recursos de terceros:
 
@@ -145,6 +144,6 @@ Recursos de terceros:
 
 ## Licencia
 
-_(Pendiente: elegir una licencia para el código, por ejemplo MIT, y añadir un fichero `LICENSE`.)_
+_MIT
 
 Los recursos de terceros de `Content/` mantienen sus licencias originales y no pueden relicenciarse.
