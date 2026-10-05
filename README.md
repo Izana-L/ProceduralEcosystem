@@ -140,7 +140,7 @@ Recursos de terceros:
 
 - [Unreal Engine 5.7](https://www.unrealengine.com/) y el plugin `ProceduralMeshComponent`.
 - Texturas y materiales de **Quixel Megascans** a través de Fab (`Content/Fab`, `Content/MSPresets`), sujetos a su licencia.
-- _(añadir el origen de `Content/Materials_TreeBark`, si procede)_
+
 
 ## Licencia
 
